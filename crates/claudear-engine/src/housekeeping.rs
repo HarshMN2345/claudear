@@ -30,13 +30,14 @@ impl HousekeepingWorker {
     /// Run the housekeeping loop until the watcher is stopped.
     ///
     /// 1. Warm-start (clone repos, sync DB, load feedback).
-    /// 2. Mark the watcher as running.
+    /// 2. Mark the watcher as running, or return if it was stopped meanwhile.
     /// 3. On every tick: retries, cascades, auto-close, reviews, metrics,
     ///    periodic learning and report-gen
     pub async fn start(&self) -> anyhow::Result<()> {
-        // Warm-start: clone repos, sync to DB, index code, load feedback
         self.watcher.warm_start().await?;
-        self.watcher.set_running(true);
+        if !self.watcher.mark_running() {
+            return Ok(());
+        }
 
         self.run_loop().await
     }

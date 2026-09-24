@@ -292,6 +292,9 @@ pub struct Watcher {
     qa_agent: Option<Arc<dyn AgentRunner>>,
     dry_run: bool,
     is_running: AtomicBool,
+    /// Set for good by [`Self::stop`] before it clears `is_running`, so a
+    /// concurrent [`Self::mark_running`] cannot leave a stopped watcher running.
+    stopped: AtomicBool,
     /// Keys of the issues being processed. Each key is held by a
     /// [`ProcessingClaim`], whose `Drop` needs a synchronous lock.
     processing: Mutex<ProcessingState>,
@@ -398,6 +401,7 @@ impl Watcher {
             user_registry: options.user_registry,
             dry_run: options.dry_run,
             is_running: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             processing: Mutex::new(ProcessingState::new()),
             active_processing: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
@@ -1032,6 +1036,19 @@ impl Watcher {
         self.is_running.store(running, Ordering::SeqCst);
     }
 
+    /// Mark the watcher as running, unless it has been stopped.
+    ///
+    /// Returns `false`, leaving the watcher stopped, when [`Self::stop`] came
+    /// first, such as a stop requested while warm start was still running.
+    pub(crate) fn mark_running(&self) -> bool {
+        self.is_running.store(true, Ordering::SeqCst);
+        if self.stopped.load(Ordering::SeqCst) {
+            self.is_running.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
     /// Start the watcher with polling.
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
@@ -1126,9 +1143,10 @@ impl Watcher {
         tracing::info!("");
 
         self.warm_start().await?;
-        self.is_running.store(true, Ordering::SeqCst);
+        if !self.mark_running() {
+            return Ok(());
+        }
 
-        // Initial poll of all sources
         self.poll().await?;
 
         // Source polling loop
@@ -1208,17 +1226,22 @@ impl Watcher {
         Ok(())
     }
 
-    /// Stop the watcher.
+    /// Stop the watcher for good.
     ///
-    /// This sets the running flag to false, which will cause the polling loop to exit
-    /// after the current cycle completes. The poll() method already waits for active
-    /// processing to complete before returning.
+    /// Stops taking new work: the polling and housekeeping loops exit after
+    /// their current cycle, and a `start` still warming up returns without
+    /// polling. Runs already in flight carry on; [`Self::stop_and_drain`] waits
+    /// for them. Safe to call more than once.
     pub fn stop(&self) {
+        let already_stopped = self.stopped.swap(true, Ordering::SeqCst);
+        self.is_running.store(false, Ordering::SeqCst);
+        if already_stopped {
+            return;
+        }
         tracing::info!(
             active_count = self.active_processing.load(Ordering::SeqCst),
             "Stopping Claude Watcher, waiting for active tasks to complete..."
         );
-        self.is_running.store(false, Ordering::SeqCst);
         // Wake any tasks blocked on slot_available so they re-check is_running and exit.
         self.slot_available.notify_waiters();
     }
@@ -5484,25 +5507,16 @@ mod tests {
         issues: Vec<Issue>,
         match_priority: MatchPriority,
         issue_status_calls: AtomicUsize,
+        fetch_calls: AtomicUsize,
     }
 
     impl MockSource {
         fn new(name: &str) -> Self {
-            Self {
-                name: name.to_string(),
-                issues: vec![],
-                match_priority: MatchPriority::Normal,
-                issue_status_calls: AtomicUsize::new(0),
-            }
+            Self::with_issues(name, vec![])
         }
 
         fn with_issues(name: &str, issues: Vec<Issue>) -> Self {
-            Self {
-                name: name.to_string(),
-                issues,
-                match_priority: MatchPriority::Normal,
-                issue_status_calls: AtomicUsize::new(0),
-            }
+            Self::with_priority(name, issues, MatchPriority::Normal)
         }
 
         fn with_priority(name: &str, issues: Vec<Issue>, match_priority: MatchPriority) -> Self {
@@ -5511,11 +5525,16 @@ mod tests {
                 issues,
                 match_priority,
                 issue_status_calls: AtomicUsize::new(0),
+                fetch_calls: AtomicUsize::new(0),
             }
         }
 
         fn issue_status_call_count(&self) -> usize {
             self.issue_status_calls.load(AtomicOrdering::SeqCst)
+        }
+
+        fn fetch_call_count(&self) -> usize {
+            self.fetch_calls.load(AtomicOrdering::SeqCst)
         }
     }
 
@@ -5528,6 +5547,7 @@ mod tests {
             &self.name
         }
         async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            self.fetch_calls.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(self.issues.clone())
         }
         fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
@@ -6889,6 +6909,65 @@ mod tests {
         assert!(
             joined.unwrap().expect("task join failed").is_ok(),
             "watcher returned an error with zero interval"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_start_after_stop_stays_stopped_without_polling() {
+        let source = Arc::new(MockSource::new("mock"));
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            vec![Arc::clone(&source) as Arc<dyn IssueSource>],
+            false,
+        );
+
+        watcher.stop();
+        let started = tokio::time::timeout(Duration::from_secs(5), watcher.start(Some(50))).await;
+
+        assert!(
+            matches!(started, Ok(Ok(()))),
+            "start after a stop must return instead of polling: {started:?}"
+        );
+        assert!(
+            !watcher.is_running(),
+            "a stop that came first must keep the watcher stopped"
+        );
+        assert_eq!(
+            source.fetch_call_count(),
+            0,
+            "a stopped watcher must not poll its sources"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_housekeeping_start_after_stop_stays_stopped_without_a_cycle() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            tracker.clone(),
+            vec![],
+            false,
+        );
+        let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(&watcher), 50);
+
+        worker.stop();
+        let started = tokio::time::timeout(Duration::from_secs(5), worker.start()).await;
+
+        assert!(
+            matches!(started, Ok(Ok(()))),
+            "housekeeping start after a stop must return instead of looping: {started:?}"
+        );
+        assert!(
+            !watcher.is_running(),
+            "a stop that came first must keep the watcher stopped"
+        );
+        assert!(
+            tracker
+                .get_metrics("housekeeping_cycle_duration_secs", None, 10)
+                .unwrap()
+                .is_empty(),
+            "a stopped watcher must not run a housekeeping cycle"
         );
     }
 
