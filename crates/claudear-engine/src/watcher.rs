@@ -3261,6 +3261,10 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
                 }
                 Ok(PrStatus::Closed) => {
+                    let _claim = self.claim_run();
+                    if !self.is_running() {
+                        break;
+                    }
                     pr_status_closed += 1;
                     if attempt.cascade_repo.is_some() {
                         self.tracker.mark_cascade_pr_outcome(attempt.id, false)?;
@@ -5378,17 +5382,26 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Check for PRs that should be auto-closed due to issue state changes.
     ///
     /// This checks all pending PRs and closes any whose source issue has been
-    /// resolved, cancelled, or otherwise moved to a terminal state.
+    /// resolved, cancelled, or otherwise moved to a terminal state. Once
+    /// [`Self::stop`] has been called, the remaining PRs are left for the next
+    /// start.
     pub async fn check_and_auto_close_prs(&self) -> Result<Vec<String>> {
         let pending_prs = self.tracker.get_pending_prs()?;
         let mut auto_closed = Vec::new();
 
         for attempt in pending_prs {
+            if self.is_stopped() {
+                break;
+            }
             // Find the source for this attempt
             if let Some(source) = self.sources.iter().find(|s| s.name() == attempt.source) {
                 // Check if issue is still active
                 match source.get_issue_status(&attempt.issue_id).await {
                     Ok(status) if source.is_terminal_status(&status) => {
+                        let _claim = self.claim_run();
+                        if self.is_stopped() {
+                            break;
+                        }
                         tracing::info!(
                             source = %attempt.source,
                             issue_id = %attempt.issue_id,
@@ -7454,15 +7467,19 @@ mod tests {
         )))
     }
 
-    /// Record `issue`'s successful attempt as the author of [`PR_URL`], and
-    /// have `watcher` follow the PR's reviews.
-    fn open_pr(watcher: &Watcher, tracker: &SqliteTracker, issue: &Issue) {
+    /// Record `issue`'s successful attempt as the author of [`PR_URL`].
+    fn record_pr(tracker: &SqliteTracker, issue: &Issue) {
         tracker
             .record_attempt(&issue.source, &issue.id, &issue.short_id)
             .unwrap();
         tracker
             .mark_success(&issue.source, &issue.id, PR_URL)
             .unwrap();
+    }
+
+    /// [Record](record_pr) `issue`'s PR, and have `watcher` follow its reviews.
+    fn open_pr(watcher: &Watcher, tracker: &SqliteTracker, issue: &Issue) {
+        record_pr(tracker, issue);
         watcher
             .review_watcher
             .as_ref()
@@ -7689,6 +7706,225 @@ mod tests {
             attempt_for(&tracker, &issue).status,
             FixAttemptStatus::Success,
             "a PR found merged after the stop must be left for the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_merges_stopped_while_checking_leaves_the_pr_open() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::gated(PrStatus::Closed));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        scm.gate.arrival_during(&mut merges).await;
+        watcher.stop();
+        scm.gate.open();
+        let checked = merges.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a PR found closed after the stop must be left for the next start"
+        );
+    }
+
+    /// Wait until `issue`'s attempt is closed, failing instead of hanging when
+    /// `task` ends first.
+    async fn closed_during<T: std::fmt::Debug>(
+        tracker: &SqliteTracker,
+        issue: &Issue,
+        task: &mut tokio::task::JoinHandle<T>,
+    ) {
+        let closed = async {
+            while attempt_for(tracker, issue).status != FixAttemptStatus::Closed {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            () = closed => {}
+            ended = task => panic!("the task ended before closing the PR: {ended:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_the_follow_up_to_a_closed_pr() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Closed)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+        let feedback = watcher.feedback_analyzer.lock().await;
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        closed_during(&tracker, &issue, &mut merges).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_following_up =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_following_up.is_err(),
+            "the drain must wait while the closed PR's follow-up is in flight"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "the closed PR's follow-up must count as a run in flight"
+        );
+
+        drop(feedback);
+
+        assert!(
+            drain.await,
+            "the drain must end once the closed PR's follow-up finishes"
+        );
+        let checked = merges.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+    }
+
+    fn resolved_issue(source: &str) -> Issue {
+        let mut issue = fixed_issue(source);
+        issue.status = claudear_core::types::IssueStatus::Resolved;
+        issue
+    }
+
+    #[tokio::test]
+    async fn test_auto_close_on_a_stopped_watcher_checks_no_issue() {
+        let issue = resolved_issue("mock");
+        let source = Arc::new(MockSource::with_issues("mock", vec![issue.clone()]));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_pr(&tracker, &issue);
+        watcher.stop();
+
+        let closed = watcher.check_and_auto_close_prs().await.unwrap();
+
+        assert!(closed.is_empty(), "a stopped watcher must not close PRs");
+        assert_eq!(
+            source.issue_status_call_count(),
+            0,
+            "a stopped watcher must not check issue statuses"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_close_stopped_while_checking_leaves_the_pr_open() {
+        let issue = resolved_issue(GATED_SOURCE);
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_pr(&tracker, &issue);
+        watcher.set_running(true);
+
+        let mut closing = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_and_auto_close_prs().await }
+        });
+        source.gate.arrival_during(&mut closing).await;
+        watcher.stop();
+        source.gate.open();
+        let closed = closing.await;
+
+        assert!(
+            matches!(&closed, Ok(Ok(urls)) if urls.is_empty()),
+            "no PR must be auto-closed after the stop: {closed:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a PR whose issue is found terminal after the stop must be left for the next start"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_the_follow_up_to_an_auto_closed_pr() {
+        let issue = resolved_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_pr(&tracker, &issue);
+        watcher.set_running(true);
+        let feedback = watcher.feedback_analyzer.lock().await;
+        let mut closing = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_and_auto_close_prs().await }
+        });
+        closed_during(&tracker, &issue, &mut closing).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_following_up =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_following_up.is_err(),
+            "the drain must wait while the auto-closed PR's follow-up is in flight"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "the auto-closed PR's follow-up must count as a run in flight"
+        );
+
+        drop(feedback);
+
+        assert!(
+            drain.await,
+            "the drain must end once the auto-closed PR's follow-up finishes"
+        );
+        let closed = closing.await;
+        assert!(
+            matches!(&closed, Ok(Ok(urls)) if *urls == [PR_URL]),
+            "the auto-close should finish closing the PR: {closed:?}"
         );
     }
 
