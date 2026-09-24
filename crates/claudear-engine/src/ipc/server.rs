@@ -7,8 +7,8 @@ use super::{
     cleanup_stale_files, default_pid_path, default_socket_path, read_pid_file, write_pid_file,
 };
 use crate::watcher::Watcher;
-use claudear_core::error::Result;
-use claudear_core::types::{ActivityLogEntry, FixAttemptStatus};
+use claudear_core::error::{Error, Result};
+use claudear_core::types::{ActivityLogEntry, FixAttempt, FixAttemptStatus};
 use claudear_integrations::notifier::Notifier;
 use claudear_integrations::source::IssueSource;
 use claudear_storage::FixAttemptTracker;
@@ -32,6 +32,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const SHUTDOWN_INITIATED: &str = "Shutdown initiated";
 const SHUTDOWN_IN_PROGRESS: &str = "Shutdown already in progress";
 const NEW_RUNS_REFUSED: &str = "Daemon is shutting down; not starting new runs";
+const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";
 
 /// IPC server that listens on a Unix socket.
 pub struct IpcServer {
@@ -498,47 +499,10 @@ async fn handle_command(
             }
         }
 
-        IpcCommand::ProcessRetries => {
-            if let Some(watcher) = watcher {
-                match tracker.get_retryable_issues(state.max_retries) {
-                    Ok(attempts) => {
-                        let mut count = 0;
-                        for attempt in attempts {
-                            // Check if ready for retry (simplified check)
-                            if attempt.status == FixAttemptStatus::Failed {
-                                if let Err(e) =
-                                    tracker.prepare_for_retry(&attempt.source, &attempt.issue_id)
-                                {
-                                    tracing::warn!(
-                                        "Failed to prepare retry for {}: {}",
-                                        attempt.short_id,
-                                        e
-                                    );
-                                    continue;
-                                }
-
-                                if let Err(e) = watcher
-                                    .trigger_issue(&attempt.source, &attempt.issue_id)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "Failed to trigger retry for {}: {}",
-                                        attempt.short_id,
-                                        e
-                                    );
-                                } else {
-                                    count += 1;
-                                }
-                            }
-                        }
-                        IpcResponse::ok_with(IpcData::RetriesProcessed { count })
-                    }
-                    Err(e) => IpcResponse::error(format!("Failed to get retryable issues: {}", e)),
-                }
-            } else {
-                IpcResponse::error("Watcher not available for processing retries")
-            }
-        }
+        IpcCommand::ProcessRetries => match watcher {
+            Some(watcher) => process_retries(tracker.as_ref(), watcher, state).await,
+            None => IpcResponse::error("Watcher not available for processing retries"),
+        },
 
         IpcCommand::Activity { limit } => {
             let activity = state.activity.lock().await;
@@ -554,6 +518,65 @@ async fn handle_command(
             };
             IpcResponse::ok_with(IpcData::Message(message.to_string()))
         }
+    }
+}
+
+/// Retry each failed attempt that has retries left, until the daemon starts shutting down.
+async fn process_retries(
+    tracker: &dyn FixAttemptTracker,
+    watcher: &Watcher,
+    state: &ServerState,
+) -> IpcResponse {
+    let attempts = match tracker.get_retryable_issues(state.max_retries) {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            return IpcResponse::error(format!("Failed to get retryable issues: {}", error))
+        }
+    };
+
+    let mut count = 0;
+    for attempt in attempts
+        .iter()
+        .filter(|attempt| attempt.status == FixAttemptStatus::Failed)
+    {
+        if state.stopping.load(Ordering::SeqCst) {
+            tracing::info!("Daemon is shutting down; not retrying the remaining attempts");
+            break;
+        }
+        if let Err(error) = tracker.prepare_for_retry(&attempt.source, &attempt.issue_id) {
+            tracing::warn!(
+                "Failed to prepare retry for {}: {}",
+                attempt.short_id,
+                error
+            );
+            continue;
+        }
+        match watcher
+            .trigger_issue(&attempt.source, &attempt.issue_id)
+            .await
+        {
+            Ok(()) => count += 1,
+            Err(error) => restore_failed_retry(tracker, attempt, &error),
+        }
+    }
+    IpcResponse::ok_with(IpcData::RetriesProcessed { count })
+}
+
+/// Mark an attempt whose retry could not be triggered as failed again: retries only pick up
+/// failed or closed attempts, so it would otherwise stay pending for good.
+fn restore_failed_retry(tracker: &dyn FixAttemptTracker, attempt: &FixAttempt, error: &Error) {
+    tracing::warn!(
+        "Failed to trigger retry for {}: {}",
+        attempt.short_id,
+        error
+    );
+    let message = format!("{RETRY_TRIGGER_FAILED}: {error}");
+    if let Err(restore_error) = tracker.mark_failed(&attempt.source, &attempt.issue_id, &message) {
+        tracing::warn!(
+            short_id = %attempt.short_id,
+            error = %restore_error,
+            "Failed to restore retry attempt state after trigger error"
+        );
     }
 }
 
@@ -712,23 +735,38 @@ mod tests {
         assert_eq!(state.issues_processed.load(Ordering::SeqCst), 0);
     }
 
+    use crate::watcher::WatcherOptions;
     use async_trait::async_trait;
+    use claudear_config::config::Config;
+    use claudear_config::users::UserRegistry;
     use claudear_core::error::Result as CrateResult;
     use claudear_core::types::{Issue, MatchPriority, MatchResult};
     use claudear_integrations::notifier::Notifier;
+    use claudear_integrations::runner::{ClaudeAgentRunner, ClaudeRunnerConfig};
     use claudear_integrations::source::IssueSource;
     use claudear_storage::SqliteTracker;
+    use std::collections::HashMap;
 
-    /// Minimal mock for `IssueSource`.
+    /// Minimal mock for `IssueSource`, which fails every issue fetch.
     struct MockSource {
         source_name: String,
+        fetches: AtomicUsize,
+        stopping: Option<Arc<ServerState>>,
     }
 
     impl MockSource {
         fn new(name: &str) -> Self {
             Self {
                 source_name: name.to_string(),
+                fetches: AtomicUsize::new(0),
+                stopping: None,
             }
+        }
+
+        /// Make each issue fetch start `state`'s shutdown, as a stop landing mid-fetch would.
+        fn stopping(mut self, state: Arc<ServerState>) -> Self {
+            self.stopping = Some(state);
+            self
         }
     }
 
@@ -750,6 +788,10 @@ mod tests {
             Ok(String::new())
         }
         async fn get_issue(&self, _id: &str) -> CrateResult<Issue> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if let Some(state) = &self.stopping {
+                state.stopping.store(true, Ordering::SeqCst);
+            }
             Err(claudear_core::error::Error::issue_not_found(
                 &self.source_name,
                 "mock",
@@ -817,6 +859,52 @@ mod tests {
 
     fn mock_notifier() -> Arc<dyn Notifier> {
         Arc::new(MockNotifier)
+    }
+
+    /// A dry-run watcher over `source`, marked as running as it is while the daemon serves
+    /// IPC requests.
+    fn running_watcher(
+        tracker: Arc<dyn FixAttemptTracker>,
+        source: Arc<dyn IssueSource>,
+    ) -> Arc<Watcher> {
+        let agent = Arc::new(ClaudeAgentRunner::new(
+            ClaudeRunnerConfig::default(),
+            tracker.clone(),
+        ));
+        let watcher = Watcher::new(WatcherOptions {
+            config: Config::default(),
+            sources: vec![source],
+            notifier: mock_notifier(),
+            tracker,
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            agent,
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: true,
+            llm_engine: None,
+        });
+        watcher.set_running(true);
+        Arc::new(watcher)
+    }
+
+    fn record_failed_attempt(tracker: &dyn FixAttemptTracker, issue_id: &str) {
+        tracker
+            .record_attempt("linear", issue_id, issue_id)
+            .unwrap();
+        tracker
+            .mark_failed("linear", issue_id, "build error")
+            .unwrap();
     }
 
     async fn handle(
@@ -2275,6 +2363,95 @@ mod tests {
                 other => panic!("Expected refusal, got {:?}", other),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_retries_stops_at_the_attempt_where_shutdown_begins() {
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let tracker = mock_tracker();
+        let issue_ids = ["LIN-1", "LIN-2"];
+        for issue_id in issue_ids {
+            record_failed_attempt(tracker.as_ref(), issue_id);
+        }
+        let source = Arc::new(MockSource::new("linear").stopping(state.clone()));
+        let watcher = running_watcher(tracker.clone(), source.clone());
+
+        let response = handle_command(
+            IpcCommand::ProcessRetries,
+            &tracker,
+            &mock_sources(),
+            &mock_notifier(),
+            &Some(watcher),
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            IpcResponse::Ok(IpcData::RetriesProcessed { count: 0 })
+        ));
+        assert_eq!(
+            source.fetches.load(Ordering::SeqCst),
+            1,
+            "no retry should be triggered once the shutdown began"
+        );
+        let untouched = issue_ids
+            .into_iter()
+            .filter(|issue_id| {
+                tracker
+                    .get_attempt("linear", issue_id)
+                    .unwrap()
+                    .is_some_and(|attempt| attempt.retry_count == 0)
+            })
+            .count();
+        assert_eq!(
+            untouched, 1,
+            "the attempt after the stop should keep its retry budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_retries_leaves_an_attempt_whose_trigger_fails_retryable() {
+        let state = test_state(100, 2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let tracker = mock_tracker();
+        record_failed_attempt(tracker.as_ref(), "LIN-1");
+        let watcher = running_watcher(tracker.clone(), Arc::new(MockSource::new("linear")));
+
+        let response = handle_command(
+            IpcCommand::ProcessRetries,
+            &tracker,
+            &mock_sources(),
+            &mock_notifier(),
+            &Some(watcher),
+            &state,
+            &shutdown_tx,
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            IpcResponse::Ok(IpcData::RetriesProcessed { count: 0 })
+        ));
+        let attempt = tracker
+            .get_attempt("linear", "LIN-1")
+            .unwrap()
+            .expect("the attempt should still be tracked");
+        assert_eq!(
+            attempt.status,
+            FixAttemptStatus::Failed,
+            "a retry that never started must not stay pending"
+        );
+        assert!(
+            attempt
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with(RETRY_TRIGGER_FAILED)),
+            "unexpected error message: {:?}",
+            attempt.error_message
+        );
     }
 
     #[tokio::test]
