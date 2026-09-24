@@ -8,6 +8,7 @@ pub struct Summary {
     pub reason: Reason,
     /// How the drain ended.
     pub outcome: Outcome,
-    /// The error of the service whose failure started the shutdown.
+    /// Why the service whose end started the shutdown ended: its error, or, when it returned
+    /// `Ok`, that it stopped unexpectedly.
     pub error: Option<anyhow::Error>,
 }

@@ -39,7 +39,9 @@ const FORCE_QUIT_HINT: &str = "Press Ctrl+C again to force quit.";
 /// in-flight runs finished, while the remaining services keep running.
 ///
 /// Another signal during the drain forces the shutdown, and a signal stream that ends counts as
-/// silence. `run` never exits the process: the caller picks the exit from the [`Summary`].
+/// silence. A service that ends before anything asked the daemon to stop fails the shutdown even
+/// when it returns `Ok`, since services only return on their own when something broke. `run`
+/// never exits the process: the caller picks the exit from the [`Summary`].
 pub async fn run<'a>(
     services: impl IntoIterator<Item = Service<'a>>,
     request: impl Future<Output = ()>,
@@ -70,7 +72,7 @@ async fn serve(
         Some(reason) = signals.next() => (reason, None),
         () = request => (Reason::Requested, None),
         Some((name, result)) = services.next(), if !services.is_empty() => {
-            (Reason::ServiceEnded(name), ended_early(name, result))
+            (Reason::ServiceEnded(name), Some(ended_early(name, result)))
         }
     }
 }
@@ -109,15 +111,16 @@ fn notice(reason: Reason) -> String {
     }
 }
 
-fn ended_early(name: &'static str, result: anyhow::Result<()>) -> Option<anyhow::Error> {
+fn ended_early(name: &'static str, result: anyhow::Result<()>) -> anyhow::Error {
     match result {
         Ok(()) => {
-            tracing::warn!(service = name, "The {name} service stopped unexpectedly");
-            None
+            let error = anyhow::anyhow!("The {name} service stopped unexpectedly");
+            tracing::error!(service = name, "{error}");
+            error
         }
         Err(error) => {
             tracing::error!(service = name, "The {name} service failed: {error:#}");
-            Some(error)
+            error
         }
     }
 }
@@ -243,6 +246,33 @@ mod tests {
         assert!(drained.get(), "the drain must still be awaited");
         let error = summary.error.expect("the service error is reported");
         assert_eq!(error.to_string(), "address in use");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn service_stopping_on_its_own_starts_the_shutdown_and_is_reported_as_an_error() {
+        let (_sender, mut signals) = unbounded::<Reason>();
+        let drained = Cell::new(false);
+
+        let summary = run(
+            [Service::new("poll", async { Ok(()) }), idle("ipc")],
+            pending(),
+            &mut signals,
+            |_| {},
+            async {
+                sleep(RUN_TIME).await;
+                drained.set(true);
+                true
+            },
+        )
+        .await;
+
+        assert_eq!(summary.reason, Reason::ServiceEnded("poll"));
+        assert_eq!(summary.outcome, Outcome::Drained);
+        assert!(drained.get(), "the drain must still run to completion");
+        let error = summary
+            .error
+            .expect("a service that stops on its own fails the shutdown");
+        assert_eq!(error.to_string(), "The poll service stopped unexpectedly");
     }
 
     #[tokio::test(start_paused = true)]
