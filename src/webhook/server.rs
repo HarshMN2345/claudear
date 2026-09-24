@@ -6924,10 +6924,6 @@ mod tests {
         assert!(state.code_search_service.is_none());
     }
 
-    // -------------------------------------------------------------------
-    // webhook_verify_handler tests
-    // -------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_webhook_verify_handler_non_whatsapp_source_returns_method_not_allowed() {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -7059,10 +7055,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // -------------------------------------------------------------------
-    // Slack URL verification challenge
-    // -------------------------------------------------------------------
-
     /// Mock handler for Slack source that passes signature validation
     struct SlackMockHandler;
 
@@ -7185,10 +7177,6 @@ mod tests {
         assert!(response["error"].as_str().unwrap().contains("Invalid JSON"));
     }
 
-    // -------------------------------------------------------------------
-    // WebhookServer setter coverage
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_webhook_server_set_embedding_client_none() {
         let config = test_config();
@@ -7229,10 +7217,6 @@ mod tests {
         assert!(server.code_search_service.is_none());
     }
 
-    // -------------------------------------------------------------------
-    // WebhookVerifyQuery deserialization
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_webhook_verify_query_default() {
         let query = WebhookVerifyQuery::default();
@@ -7258,10 +7242,6 @@ mod tests {
         assert!(query.hub_verify_token.is_none());
         assert!(query.hub_challenge.is_none());
     }
-
-    // -------------------------------------------------------------------
-    // record_feedback_outcome tests
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_record_feedback_outcome_success() {
