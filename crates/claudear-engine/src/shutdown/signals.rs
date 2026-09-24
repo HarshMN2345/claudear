@@ -1,7 +1,6 @@
 use super::Reason;
 use futures::Stream;
 use std::io;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::signal::unix::{self, Signal, SignalKind};
@@ -84,13 +83,15 @@ fn heeded(
 
 /// Reads the handler currently installed for `signal` without changing it.
 fn disposition(signal: libc::c_int) -> io::Result<libc::sighandler_t> {
-    let mut action = MaybeUninit::<libc::sigaction>::uninit();
-    // SAFETY: with a null new action, sigaction only writes the current action into `action`.
-    if unsafe { libc::sigaction(signal, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+    // SAFETY: every field of `sigaction` is an integer, a pointer or an optional function
+    // pointer, so all-zero bytes are a valid value.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: with a null new action, sigaction changes nothing and only writes the current
+    // action into `action`.
+    if unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the successful sigaction call above initialised `action`.
-    Ok(unsafe { action.assume_init() }.sa_sigaction)
+    Ok(action.sa_sigaction)
 }
 
 #[cfg(test)]
