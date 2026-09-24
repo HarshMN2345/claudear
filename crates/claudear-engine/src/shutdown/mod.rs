@@ -24,6 +24,14 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// before the process exits anyway.
 pub const RUNTIME_GRACE: Duration = Duration::from_secs(5);
 
+/// How long `claudear stop` waits for the daemon to exit: the drain and the runtime grace,
+/// plus a margin for the process to finish exiting.
+pub const EXIT_TIMEOUT: Duration = DRAIN_TIMEOUT
+    .saturating_add(RUNTIME_GRACE)
+    .saturating_add(EXIT_MARGIN);
+
+const EXIT_MARGIN: Duration = Duration::from_secs(5);
+
 const FORCE_QUIT_HINT: &str = "Press Ctrl+C again to force quit.";
 
 /// Runs `services` until a signal, `request` or the end of a service starts the shutdown, then

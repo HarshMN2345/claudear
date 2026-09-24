@@ -8,7 +8,10 @@ use claudear::{
     feedback::{EmbeddingClient, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
-    ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
+    ipc::{
+        default_socket_path, get_daemon_pid, is_daemon_running, print_response, IpcClient,
+        IpcServer,
+    },
     notifier::{
         CompositeNotifier, ConsoleNotifier, DiscordNotifier, EmailNotifier, Notifier, PushNotifier,
         SlackNotifier, SmsNotifier, TelegramNotifier, WhatsAppNotifier,
@@ -46,7 +49,7 @@ use claudear::{
 use serde_json::json;
 use std::future::{pending, Future};
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 use tokio_util::task::TaskTracker;
 use tracing_subscriber::{
     filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
@@ -1769,6 +1772,9 @@ async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
 /// Exit code for a shutdown forced by a second signal, as for any interrupted process.
 const FORCED_EXIT_CODE: i32 = 130;
 
+/// How often `claudear stop` reports that it is still waiting for the daemon to exit.
+const STOP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
 /// The HTTP server a `start` daemon runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpMode {
@@ -1860,6 +1866,31 @@ impl Daemon<'_> {
 
     fn webhook_runs(&self) -> usize {
         self.runs.map_or(0, TaskTracker::len)
+    }
+}
+
+/// Wait up to [`shutdown::EXIT_TIMEOUT`] for the daemon to exit, reporting progress every
+/// [`STOP_PROGRESS_INTERVAL`].
+async fn wait_for_exit(client: &IpcClient, pid: Option<u32>) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        let remaining = shutdown::EXIT_TIMEOUT.saturating_sub(started.elapsed());
+        if client
+            .wait_until_stopped(pid, STOP_PROGRESS_INTERVAL.min(remaining))
+            .await
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= shutdown::EXIT_TIMEOUT {
+            anyhow::bail!(
+                "The daemon did not exit within {}s; it may still be finishing in-flight runs",
+                shutdown::EXIT_TIMEOUT.as_secs()
+            );
+        }
+        println!(
+            "Still waiting for the daemon to exit ({}s)...",
+            started.elapsed().as_secs()
+        );
     }
 }
 
@@ -2049,6 +2080,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            let pid = get_daemon_pid();
             let client = IpcClient::new();
             match client.shutdown().await {
                 Ok(response) => {
@@ -2059,6 +2091,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+            println!(
+                "Waiting up to {}s for in-flight runs to finish and the daemon to exit...",
+                shutdown::EXIT_TIMEOUT.as_secs()
+            );
+            wait_for_exit(&client, pid).await?;
+            println!("Daemon stopped.");
             return Ok(());
         }
 
