@@ -4,6 +4,7 @@ use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
+use crate::shutdown::DRAIN_TIMEOUT;
 use chrono::{DateTime, Utc};
 use claudear_analysis::deploy_qa::DEPLOY_QA_SOURCE;
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
@@ -1229,10 +1230,9 @@ impl Watcher {
     pub async fn stop_and_drain(&self) {
         self.stop();
 
-        // Wait for any active processing to complete (up to 30 seconds).
+        // Wait for any active processing to complete (up to DRAIN_TIMEOUT).
         // Uses slot_available to wake immediately when a task finishes rather
         // than polling on a fixed interval.
-        let max_wait = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
 
         loop {
@@ -1240,7 +1240,7 @@ impl Watcher {
             if self.active_processing.load(Ordering::SeqCst) == 0 {
                 break;
             }
-            if start.elapsed() > max_wait {
+            if start.elapsed() > DRAIN_TIMEOUT {
                 tracing::warn!(
                     remaining = self.active_processing.load(Ordering::SeqCst),
                     "Graceful shutdown timeout reached, some tasks may not have completed"
@@ -1251,7 +1251,7 @@ impl Watcher {
                 active_count = self.active_processing.load(Ordering::SeqCst),
                 "Waiting for active tasks to complete..."
             );
-            let remaining = max_wait.saturating_sub(start.elapsed());
+            let remaining = DRAIN_TIMEOUT.saturating_sub(start.elapsed());
             let _ = tokio::time::timeout(remaining, released).await;
         }
 
