@@ -15,8 +15,8 @@ use crate::users::UserRegistry;
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Json},
+    http::{header::RETRY_AFTER, HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -24,7 +24,7 @@ use sentry::integrations::tower::{NewSentryLayer, SentryHttpLayer};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_util::task::TaskTracker;
 use tower::limit::ConcurrencyLimitLayer;
@@ -38,6 +38,10 @@ const PROCESSING_ENTRY_TTL_SECS: u64 = 3600;
 
 /// Maximum number of entries in the processing set before forced cleanup.
 const MAX_PROCESSING_ENTRIES: usize = 1000;
+
+/// How long a sender should wait before redelivering a webhook refused during shutdown: long
+/// enough for the old daemon to finish exiting and a restarted one to take the delivery.
+const SHUTDOWN_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// State shared across handlers.
 struct AppState {
@@ -279,7 +283,7 @@ impl WebhookServer {
             .route(
                 "/webhook/{source}",
                 get(webhook_verify_handler)
-                    .post(webhook_handler)
+                    .post(serve_webhook)
                     .layer(concurrency_layer),
             )
             .layer(DefaultBodyLimit::max(512 * 1024)) // 512 KB body size limit
@@ -440,6 +444,26 @@ async fn webhook_verify_handler(
     }
 
     (StatusCode::OK, query.hub_challenge.unwrap_or_default()).into_response()
+}
+
+/// Answer a webhook with [`webhook_handler`]'s reply. The handler answers 503 only when it
+/// refuses a webhook during shutdown, so that reply also tells the sender when to retry.
+async fn serve_webhook(
+    state: State<Arc<AppState>>,
+    source: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (status, reply) = webhook_handler(state, source, headers, body).await;
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        return (
+            status,
+            [(RETRY_AFTER, SHUTDOWN_RETRY_AFTER.as_secs())],
+            reply,
+        )
+            .into_response();
+    }
+    (status, reply).into_response()
 }
 
 async fn webhook_handler(
@@ -1127,9 +1151,9 @@ mod tests {
     use crate::types::Outcome;
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
+    use axum::http::HeaderValue;
     use futures::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     // Mock notifier for testing
     struct MockNotifier {
@@ -2883,7 +2907,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("linear-delivery", "delivery-refused".parse().unwrap());
 
-        let (status, Json(response)) = webhook_handler(
+        let response = serve_webhook(
             State(state.clone()),
             Path("test".to_string()),
             headers,
@@ -2891,7 +2915,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from(SHUTDOWN_RETRY_AFTER.as_secs())),
+            "the refusal should tell the sender when to deliver again"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(response["status"], "unavailable");
         assert_eq!(response["reason"], "Shutting down");
         assert!(state.runs.is_empty());
@@ -2901,6 +2932,31 @@ mod tests {
                 .check_and_record_delivery("delivery-refused", "test")
                 .unwrap(),
             "a refused delivery must stay unrecorded so the sender's retry is processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_webhook_sends_no_retry_after_unless_shutting_down() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let state = make_app_state(WebhookHandlerRegistry::new(), tracker, None);
+
+        let response = serve_webhook(
+            State(state),
+            Path("unknown".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers().get(RETRY_AFTER), None);
+    }
+
+    #[test]
+    fn test_shutdown_retry_after_outlasts_the_daemon_exit() {
+        assert!(
+            SHUTDOWN_RETRY_AFTER > crate::shutdown::EXIT_TIMEOUT,
+            "a sender retrying sooner would reach the daemon that is still exiting"
         );
     }
 
@@ -3183,7 +3239,7 @@ mod tests {
             .route("/health", get(health_handler))
             .route(
                 "/webhook/{source}",
-                post(webhook_handler).layer(concurrency_layer),
+                post(serve_webhook).layer(concurrency_layer),
             )
             .with_state(state)
     }
