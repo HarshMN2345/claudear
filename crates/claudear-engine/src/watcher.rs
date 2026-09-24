@@ -13572,12 +13572,6 @@ mod tests {
         assert!(watcher.config.workspace.to_str().is_some());
     }
 
-    // ========================================================================
-    // Additional coverage tests
-    // ========================================================================
-
-    // --- source_from_processing_key ---
-
     #[test]
     fn test_source_from_processing_key_with_colon() {
         assert_eq!(source_from_processing_key("sentry:ISSUE-42"), "sentry");
@@ -13609,8 +13603,6 @@ mod tests {
     fn test_source_from_processing_key_colon_at_end() {
         assert_eq!(source_from_processing_key("source:"), "source");
     }
-
-    // --- ProcessingState ---
 
     #[test]
     fn test_processing_state_new() {
@@ -13782,8 +13774,6 @@ mod tests {
         assert!(state.contains("nocolon"));
     }
 
-    // --- is_dry_run accessor ---
-
     #[test]
     fn test_is_dry_run_true() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -13799,8 +13789,6 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, vec![], false);
         assert!(!watcher.is_dry_run());
     }
-
-    // --- set_running ---
 
     #[test]
     fn test_set_running_true() {
@@ -13821,8 +13809,6 @@ mod tests {
         watcher.set_running(false);
         assert!(!watcher.is_running());
     }
-
-    // --- reindex_interval ---
 
     #[test]
     fn test_reindex_interval_disabled() {
@@ -14016,8 +14002,6 @@ mod tests {
         assert_eq!(interval, std::time::Duration::from_secs(1800));
     }
 
-    // --- Rate limit extraction: banner with PM ---
-
     #[test]
     fn test_extract_rate_limit_reset_from_banner_utc_pm() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
@@ -14110,8 +14094,6 @@ mod tests {
         assert!(parsed.is_none());
     }
 
-    // --- Rate limit extraction: retry-after ---
-
     #[test]
     fn test_extract_rate_limit_reset_from_retry_after() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
@@ -14153,8 +14135,6 @@ mod tests {
         assert!(parsed.is_none());
     }
 
-    // --- extract_rate_limit_reset_time combined ---
-
     #[test]
     fn test_extract_rate_limit_reset_time_prefers_resets_at() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-02-23T10:00:00Z")
@@ -14195,8 +14175,6 @@ mod tests {
         let parsed = Watcher::extract_rate_limit_reset_time(msg, now);
         assert!(parsed.is_none());
     }
-
-    // --- is_rate_limit_paused / clear_rate_limit_pause ---
 
     #[tokio::test]
     async fn test_is_rate_limit_paused_when_not_paused() {
@@ -14280,8 +14258,6 @@ mod tests {
         assert!(pauses.is_empty());
     }
 
-    // --- pause_until_rate_limit_reset ---
-
     #[tokio::test]
     async fn test_pause_until_rate_limit_reset_sets_pause() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14338,8 +14314,6 @@ mod tests {
         let pauses = watcher.rate_limit_pause_until.read().await;
         assert!(*pauses.get("claude").unwrap() >= far_future);
     }
-
-    // --- check_releases_and_cascade early returns ---
 
     #[tokio::test]
     async fn test_check_releases_and_cascade_disabled() {
@@ -14425,8 +14399,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- discover_dependencies early returns ---
-
     #[tokio::test]
     async fn test_discover_dependencies_no_inferrer() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14437,8 +14409,6 @@ mod tests {
         watcher.discover_dependencies().await;
     }
 
-    // --- pull_and_reindex_all_repos no inferrer ---
-
     #[tokio::test]
     async fn test_pull_and_reindex_all_repos_no_inferrer() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14448,8 +14418,6 @@ mod tests {
         // Should return early without panicking
         watcher.pull_and_reindex_all_repos().await;
     }
-
-    // --- reindex_repo early returns ---
 
     #[tokio::test]
     async fn test_reindex_repo_disabled() {
@@ -14531,8 +14499,6 @@ mod tests {
             .await;
     }
 
-    // --- build_inferrer_with_embeddings early returns ---
-
     #[tokio::test]
     async fn test_build_inferrer_with_embeddings_no_known_orgs() {
         let mut config = test_config();
@@ -14557,8 +14523,6 @@ mod tests {
         assert!(result.0.is_none());
         assert!(result.1.is_none());
     }
-
-    // --- poll paused by rate limit ---
 
     #[tokio::test]
     async fn test_poll_returns_early_when_rate_limited() {
@@ -14585,8 +14549,6 @@ mod tests {
         assert!(poll_cycle.is_empty());
     }
 
-    // --- run_housekeeping_cycle when rate limited ---
-
     #[tokio::test]
     async fn test_run_housekeeping_cycle_runs_even_when_provider_rate_limited() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14610,8 +14572,6 @@ mod tests {
             .unwrap();
         assert!(!duration.is_empty());
     }
-
-    // --- poll_source when rate limited ---
 
     #[tokio::test]
     async fn test_poll_source_returns_early_when_rate_limited() {
@@ -14645,8 +14605,6 @@ mod tests {
         assert!(fetched.is_empty());
     }
 
-    // --- process_issue when rate limited ---
-
     #[tokio::test]
     async fn test_process_issue_returns_false_when_rate_limited() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14674,8 +14632,6 @@ mod tests {
             "process_issue should return false when rate limited"
         );
     }
-
-    // --- process_ready_retries closed PR trigger reason ---
 
     #[tokio::test]
     async fn test_process_ready_retries_skips_human_closed_pr() {
@@ -14738,8 +14694,6 @@ mod tests {
         );
     }
 
-    // --- Resolved status in fix attempt ---
-
     #[test]
     fn test_is_terminal_attempt_status_exhaustive() {
         // Verify we haven't missed any variants
@@ -14768,8 +14722,6 @@ mod tests {
         );
     }
 
-    // --- refresh_repos when one of the two optionals is None ---
-
     #[tokio::test]
     async fn test_refresh_repos_no_embedding_client() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -14779,8 +14731,6 @@ mod tests {
         let result = watcher.refresh_repos().await.unwrap();
         assert_eq!(result, 0);
     }
-
-    // --- ProcessingState with many sources ---
 
     #[test]
     fn test_processing_state_multiple_sources() {
@@ -14810,8 +14760,6 @@ mod tests {
         assert_eq!(state.source_count("sentry"), 5);
         assert_eq!(state.len(), 13);
     }
-
-    // --- Sort stability with mixed priorities ---
 
     #[test]
     fn test_sort_by_priority_mixed_match_and_issue_priority() {
@@ -14846,8 +14794,6 @@ mod tests {
         assert_eq!(issues[2].0.id, "3");
         assert_eq!(issues[2].0.priority, IssuePriority::High);
     }
-
-    // --- parse_approval_reply ---
 
     #[test]
     fn test_parse_approval_reply_multiple_punctuation() {
@@ -14996,8 +14942,6 @@ mod tests {
         );
     }
 
-    // --- parse_approval_reply redirect variants ---
-
     #[test]
     fn test_parse_approval_reply_redirect_use() {
         assert_eq!(
@@ -15056,8 +15000,6 @@ mod tests {
             ApprovalDecision::Unrecognized
         );
     }
-
-    // --- should_request_approval ---
 
     #[test]
     fn test_should_request_approval_require_approval_true() {
@@ -15148,8 +15090,6 @@ mod tests {
         assert!(watcher.should_request_approval(&resolution));
     }
 
-    // --- Confidence ordering and FromStr ---
-
     #[test]
     fn test_confidence_ordering() {
         assert!(Confidence::None < Confidence::Low);
@@ -15166,8 +15106,6 @@ mod tests {
         assert_eq!("HIGH".parse::<Confidence>(), Ok(Confidence::High));
         assert!("invalid".parse::<Confidence>().is_err());
     }
-
-    // --- request_approval integration tests ---
 
     use claudear_core::types::{AskDelivery, AskReply};
     use std::sync::Mutex;
