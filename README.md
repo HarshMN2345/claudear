@@ -543,22 +543,22 @@ The `--setup` flag:
 
 ### Graceful Shutdown
 
-`claudear start`, `claudear poll`, `claudear webhook`, and `claudear dry-run` shut down the same way on SIGTERM, SIGINT, or SIGHUP. SIGHUP counts only if it was not already ignored when Claudear started, so a Claudear started under `nohup` keeps running when its terminal closes. `claudear stop` works only for a daemon started with `claudear start`; stop the other commands with a signal. Claudear then:
+`claudear start`, `claudear poll`, `claudear webhook`, and `claudear dry-run` shut down the same way on SIGTERM, SIGINT, or SIGHUP. Any of these signals that was already ignored when Claudear started stays ignored: a Claudear started under `nohup` keeps running when its terminal closes, and one that a script starts in the background keeps running on Ctrl+C, because the script's shell ignores SIGINT for it. `claudear stop` works only for a daemon started with `claudear start`; stop the other commands with a signal. Claudear then:
 
 1. Stops taking new work:
    - polling and background housekeeping start no new runs
-   - issue webhooks are answered with `503 Service Unavailable` and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)
+   - issue webhooks are answered with `503 Service Unavailable` and `Retry-After: 60`, and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)
    - IPC `Trigger` and `ProcessRetries` commands are refused
 2. Waits up to 30 seconds for in-flight runs to finish.
 3. Exits, even if some runs are still going, in which case it logs `Exiting with runs still in flight after 30s`. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends.
 
-While it drains, `claudear status` reports `Running: false`. `claudear stop` waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints `Daemon stopped.` and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. A signal that reaches Claudear during the drain, including after `claudear stop`, forces an immediate exit.
+While it drains, `claudear status` reports `Running: false`. `claudear stop` waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints `Daemon stopped.` and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. If it cannot read the daemon's PID file, it can only watch the control socket, so once the socket closes it prints `The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed.` instead. A signal that reaches Claudear during the drain, including after `claudear stop`, forces an immediate exit.
 
 Exit codes:
 
 - `0`: graceful shutdown, including when the drain runs out of time
 - `130`: a signal during the drain forced the exit
-- `1`: a service failed, which started the shutdown
+- `1`: a service failed or stopped on its own (`The <name> service stopped unexpectedly`), which started the shutdown
 
 In a terminal, Ctrl+C also interrupts the agent CLIs that Claudear started. To let in-flight runs finish, send SIGTERM instead, or run `claudear stop` for a daemon started with `claudear start`.
 

@@ -119,24 +119,24 @@ claudear resume     # resume issue processing
 claudear stop       # stop after in-flight runs finish (up to 30s)</code></pre>
 
         <h2 id="graceful-shutdown"><a class="anchor-link" href="#graceful-shutdown" aria-label="Link to Graceful shutdown">#</a>Graceful shutdown</h2>
-        <p><code>claudear start</code>, <code>claudear poll</code>, <code>claudear webhook</code>, and <code>claudear dry-run</code> shut down the same way on SIGTERM, SIGINT, or SIGHUP. SIGHUP counts only if it was not already ignored when Claudear started, so a Claudear started under <code>nohup</code> keeps running when its terminal closes. <code>claudear stop</code> works only for a daemon started with <code>claudear start</code>; stop the other commands with a signal. Claudear then:</p>
+        <p><code>claudear start</code>, <code>claudear poll</code>, <code>claudear webhook</code>, and <code>claudear dry-run</code> shut down the same way on SIGTERM, SIGINT, or SIGHUP. Any of these signals that was already ignored when Claudear started stays ignored: a Claudear started under <code>nohup</code> keeps running when its terminal closes, and one that a script starts in the background keeps running on Ctrl+C, because the script&rsquo;s shell ignores SIGINT for it. <code>claudear stop</code> works only for a daemon started with <code>claudear start</code>; stop the other commands with a signal. Claudear then:</p>
         <ol>
           <li>Stops taking new work:
             <ul>
               <li>polling and background housekeeping start no new runs</li>
-              <li>issue webhooks are answered with <code>503 Service Unavailable</code> and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)</li>
+              <li>issue webhooks are answered with <code>503 Service Unavailable</code> and <code>Retry-After: 60</code>, and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)</li>
               <li>IPC <code>Trigger</code> and <code>ProcessRetries</code> commands are refused</li>
             </ul>
           </li>
           <li>Waits up to 30 seconds for in-flight runs to finish.</li>
           <li>Exits, even if some runs are still going, in which case it logs <code>Exiting with runs still in flight after 30s</code>. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends.</li>
         </ol>
-        <p>While it drains, <code>claudear status</code> reports <code>Running: false</code>. <code>claudear stop</code> waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints <code>Daemon stopped.</code> and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. A signal that reaches Claudear during the drain, including after <code>claudear stop</code>, forces an immediate exit.</p>
+        <p>While it drains, <code>claudear status</code> reports <code>Running: false</code>. <code>claudear stop</code> waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints <code>Daemon stopped.</code> and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. If it cannot read the daemon&rsquo;s PID file, it can only watch the control socket, so once the socket closes it prints <code>The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed.</code> instead. A signal that reaches Claudear during the drain, including after <code>claudear stop</code>, forces an immediate exit.</p>
         <p>Exit codes:</p>
         <ul>
           <li><code>0</code> &mdash; graceful shutdown, including when the drain runs out of time</li>
           <li><code>130</code> &mdash; a signal during the drain forced the exit</li>
-          <li><code>1</code> &mdash; a service failed, which started the shutdown</li>
+          <li><code>1</code> &mdash; a service failed or stopped on its own (<code>The &lt;name&gt; service stopped unexpectedly</code>), which started the shutdown</li>
         </ul>
         <p>In a terminal, Ctrl+C also interrupts the agent CLIs that Claudear started. To let in-flight runs finish, send SIGTERM instead, or run <code>claudear stop</code> for a daemon started with <code>claudear start</code>.</p>
         <p>Under launchd, systemd, or Docker, run <code>claudear start --foreground</code> so the manager keeps track of the process, and give Claudear 45 seconds to stop before it is sent SIGKILL: that covers the 30-second drain, up to 5 seconds for blocking work to stop, and a margin. The examples below are set up this way.</p>
