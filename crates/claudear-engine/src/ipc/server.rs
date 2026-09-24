@@ -1516,10 +1516,6 @@ mod tests {
         assert_eq!(server.state.max_retries, 10);
     }
 
-    // -------------------------------------------------------------------
-    // handle_command: ProcessRetries without watcher
-    // -------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_handle_command_process_retries_without_watcher() {
         let tracker = mock_tracker();
@@ -1546,10 +1542,6 @@ mod tests {
             other => panic!("Expected error, got {:?}", other),
         }
     }
-
-    // -------------------------------------------------------------------
-    // handle_command: Reset without watcher (tracker fallback)
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_command_reset_nonexistent_attempt_without_watcher() {
@@ -1583,10 +1575,6 @@ mod tests {
             other => panic!("Expected Reset, got {:?}", other),
         }
     }
-
-    // -------------------------------------------------------------------
-    // handle_command: Stats with recorded data
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_command_stats_with_data() {
@@ -1627,10 +1615,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
-    // handle_command: ListPrs with data
-    // -------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_handle_command_list_prs_with_data() {
         let tracker = mock_tracker();
@@ -1663,10 +1647,6 @@ mod tests {
             other => panic!("Expected Attempts, got {:?}", other),
         }
     }
-
-    // -------------------------------------------------------------------
-    // handle_command: ListRetries with retryable data
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_command_list_retries_with_data() {
@@ -1701,10 +1681,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
-    // handle_command: Activity with empty state
-    // -------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_handle_command_activity_empty() {
         let tracker = mock_tracker();
@@ -1731,10 +1707,6 @@ mod tests {
             other => panic!("Expected Activity, got {:?}", other),
         }
     }
-
-    // -------------------------------------------------------------------
-    // log_activity with all activity type variants
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_log_activity_all_activity_types() {
@@ -1790,10 +1762,6 @@ mod tests {
         assert_eq!(activity.len(), count);
     }
 
-    // -------------------------------------------------------------------
-    // log_activity with issue_id and source variations
-    // -------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_log_activity_with_issue_and_source() {
         let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
@@ -1827,10 +1795,6 @@ mod tests {
         assert_eq!(activity[0].source, None);
     }
 
-    // -------------------------------------------------------------------
-    // IpcServer with_watcher
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_ipc_server_with_watcher_sets_watcher() {
         let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
@@ -1838,10 +1802,6 @@ mod tests {
         // We cannot easily create a real Watcher in tests, but we can verify
         // the initial state
     }
-
-    // -------------------------------------------------------------------
-    // Builder chaining
-    // -------------------------------------------------------------------
 
     #[test]
     fn test_builder_chaining() {
@@ -1855,10 +1815,6 @@ mod tests {
         assert!(!server.is_paused());
     }
 
-    // -------------------------------------------------------------------
-    // Shutdown receiver can be subscribed multiple times
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_multiple_shutdown_receivers() {
         let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
@@ -1871,10 +1827,6 @@ mod tests {
         assert!(rx2.try_recv().is_ok());
     }
 
-    // -------------------------------------------------------------------
-    // IpcServer::new uses default builder
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_ipc_server_new_uses_defaults() {
         let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
@@ -1885,10 +1837,6 @@ mod tests {
         assert_eq!(server.state.max_retries, 2);
         assert_eq!(*server.state.mode.blocking_read(), "initializing");
     }
-
-    // -------------------------------------------------------------------
-    // Status command shows processing items
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_handle_command_status_with_processing_items() {
@@ -1923,10 +1871,6 @@ mod tests {
             other => panic!("Expected State, got {:?}", other),
         }
     }
-
-    // -------------------------------------------------------------------
-    // Pause and resume toggle
-    // -------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_pause_resume_toggle() {
@@ -1989,10 +1933,6 @@ mod tests {
         assert!(state.paused.load(Ordering::SeqCst));
     }
 
-    // -------------------------------------------------------------------
-    // Activity limit edge case: limit = 0
-    // -------------------------------------------------------------------
-
     #[tokio::test]
     async fn test_handle_command_activity_limit_zero() {
         let tracker = mock_tracker();
@@ -2032,10 +1972,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
-    // Concurrent increments
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_concurrent_increments() {
         let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
@@ -2051,10 +1987,6 @@ mod tests {
         assert_eq!(server.state.prs_created.load(Ordering::SeqCst), 50);
     }
 
-    // -------------------------------------------------------------------
-    // Builder with empty sources
-    // -------------------------------------------------------------------
-
     #[test]
     fn test_builder_empty_sources() {
         let server = IpcServerBuilder::new(
@@ -2066,10 +1998,6 @@ mod tests {
 
         assert!(server.state.source_names.is_empty());
     }
-
-    // -------------------------------------------------------------------
-    // IpcCommand serialization roundtrip
-    // -------------------------------------------------------------------
 
     #[test]
     fn test_ipc_command_serde_roundtrip() {
@@ -2102,10 +2030,6 @@ mod tests {
             assert_eq!(json, json2);
         }
     }
-
-    // -------------------------------------------------------------------
-    // IpcResponse serialization roundtrip
-    // -------------------------------------------------------------------
 
     #[test]
     fn test_ipc_response_ok_serde() {
