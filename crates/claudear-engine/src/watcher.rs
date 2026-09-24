@@ -239,6 +239,24 @@ impl Drop for ProcessingClaim<'_> {
     }
 }
 
+/// A housekeeping run's hold on the shutdown drain, released on drop.
+///
+/// Take it before checking [`Watcher::is_running`]: [`Watcher::stop`] clears
+/// `is_running` before the drain reads the active count, so either the check
+/// sees the stop or the drain sees the claim.
+struct RunClaim<'a> {
+    watcher: &'a Watcher,
+}
+
+impl Drop for RunClaim<'_> {
+    fn drop(&mut self) {
+        self.watcher
+            .active_processing
+            .fetch_sub(1, Ordering::SeqCst);
+        self.watcher.slot_available.notify_waiters();
+    }
+}
+
 /// Options for creating a watcher.
 pub struct WatcherOptions {
     pub config: Config,
@@ -1399,6 +1417,7 @@ impl Watcher {
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
                 }
+                let _claim = self.claim_run();
                 if !self.is_running() {
                     break;
                 }
@@ -1980,6 +1999,9 @@ impl Watcher {
         }
 
         for upstream in upstreams {
+            if !self.is_running() {
+                break;
+            }
             // Use generic SCM provider when available, fall back to GitHub client
             let release_result = if let Some(ref provider) = self.scm_provider {
                 provider.get_latest_release(upstream).await
@@ -2008,6 +2030,11 @@ impl Watcher {
                 if seen.get(upstream).map(|t| t.as_str()) == Some(&release.tag) {
                     continue;
                 }
+            }
+
+            let _claim = self.claim_run();
+            if !self.is_running() {
+                break;
             }
 
             tracing::info!(
@@ -2755,6 +2782,11 @@ Create a PR with your changes.{custom_instructions}"#,
                 released.await;
             }
 
+            let claim = self.claim_run();
+            if !self.is_running() {
+                break;
+            }
+
             tracing::info!(
                 component = "watcher",
                 source = %attempt.source,
@@ -2887,6 +2919,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     );
                 }
             }
+            drop(claim);
 
             // Add delay between retries (skip trailing delay after the last item)
             if i + 1 < ready_count && self.config.processing_delay_ms > 0 {
@@ -3032,6 +3065,7 @@ Create a PR with your changes.{custom_instructions}"#,
             };
             match pr_status {
                 Ok(PrStatus::Merged) => {
+                    let _claim = self.claim_run();
                     if !self.is_running() {
                         break;
                     }
@@ -3754,6 +3788,11 @@ Create a PR with your changes.{custom_instructions}"#,
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
         Some(ProcessingClaim { watcher: self, key })
+    }
+
+    fn claim_run(&self) -> RunClaim<'_> {
+        self.active_processing.fetch_add(1, Ordering::SeqCst);
+        RunClaim { watcher: self }
     }
 
     /// Dispatch one concurrency lane: spawn a processing task per item, gating on the
@@ -5429,11 +5468,15 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use claudear_analysis::deploy_qa::{VERDICT_ALL_VERIFIED, VERDICT_FAIL, VERDICT_PREFIX};
-    use claudear_config::config::{DeployQaConfig, DeployQaTrackConfig};
-    use claudear_core::types::IssuePriority;
+    use claudear_config::config::{
+        CascadeRule, CascadeTrigger, DeployQaConfig, DeployQaTrackConfig,
+    };
+    use claudear_core::types::{IndexedRepo, IssuePriority, RepoIndex};
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
-    use claudear_integrations::scm::{CodeReview, PrInfo, RemoteRepo, ReviewComment, ReviewUser};
+    use claudear_integrations::scm::{
+        CodeReview, PrInfo, RemoteRepo, ReviewComment, ReviewUser, ScmRelease,
+    };
     use claudear_integrations::source::{DeployQaSource, IssueSource};
     use claudear_storage::{ActivityStore, AttemptTracker, SqliteTracker};
     use futures::FutureExt;
@@ -7186,12 +7229,14 @@ mod tests {
     }
 
     /// SCM provider that reports every PR as `status` with a [`fix_request`]
-    /// on it, holding each status and comment lookup at its gate when `gated`.
+    /// on it, and [`RELEASE_TAG`] as every repo's latest release, holding each
+    /// status, comment and release lookup at its gate when `gated`.
     struct MockScm {
         status: PrStatus,
         gated: bool,
         gate: Gate,
         status_checks: AtomicUsize,
+        release_checks: AtomicUsize,
     }
 
     impl MockScm {
@@ -7201,6 +7246,7 @@ mod tests {
                 gated: false,
                 gate: Gate::default(),
                 status_checks: AtomicUsize::new(0),
+                release_checks: AtomicUsize::new(0),
             }
         }
 
@@ -7213,6 +7259,10 @@ mod tests {
 
         fn status_check_count(&self) -> usize {
             self.status_checks.load(AtomicOrdering::SeqCst)
+        }
+
+        fn release_check_count(&self) -> usize {
+            self.release_checks.load(AtomicOrdering::SeqCst)
         }
 
         async fn hold(&self) {
@@ -7269,6 +7319,16 @@ mod tests {
         }
         async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
             Ok(Vec::new())
+        }
+        async fn get_latest_release(&self, _project: &str) -> Result<Option<ScmRelease>> {
+            self.release_checks.fetch_add(1, AtomicOrdering::SeqCst);
+            self.hold().await;
+            Ok(Some(ScmRelease {
+                tag: RELEASE_TAG.to_string(),
+                name: None,
+                url: String::new(),
+                published_at: None,
+            }))
         }
     }
 
@@ -7564,6 +7624,481 @@ mod tests {
             attempt_for(&tracker, &issue).status,
             FixAttemptStatus::Success,
             "a PR found merged after the stop must be left for the next start"
+        );
+    }
+
+    /// Agent that holds each fix run and reply at its gate, then fails the run
+    /// and replies with [`CUSTOMER_REPLY`].
+    struct GatedAgent {
+        gate: Arc<Gate>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for GatedAgent {
+        fn name(&self) -> &str {
+            "gated-agent"
+        }
+        fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
+            claudear_integrations::runner::ProviderCapabilities::default()
+        }
+        fn build_prompt_for_issue(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _project_dir: &std::path::Path,
+        ) -> String {
+            String::new()
+        }
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &std::path::Path,
+        ) -> Result<claudear_core::types::AgentResult> {
+            self.gate.pass().await;
+            Err(claudear_core::error::Error::runner("gated run failed"))
+        }
+        async fn generate_reply(
+            &self,
+            _issue: &Issue,
+            _context: &str,
+            _guideline: Option<&str>,
+            _kind: ReplyKind,
+            _project_dir: &std::path::Path,
+        ) -> Result<String> {
+            self.gate.pass().await;
+            Ok(CUSTOMER_REPLY.to_string())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_the_reply_to_a_merged_fix() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let gate = Arc::new(Gate::default());
+        let mut config = test_config();
+        config.notifiers.helpscout.enabled = true;
+        let watcher = watcher_with_scm(
+            config,
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            Arc::new(GatedAgent {
+                gate: Arc::clone(&gate),
+            }),
+            Arc::new(MockScm::reporting(PrStatus::Merged)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        gate.arrival_during(&mut merges).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_replying = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_replying.is_err(),
+            "the drain must wait while the merged fix's reply is in flight"
+        );
+        assert_eq!(
+            watcher.active_count(),
+            1,
+            "the merge follow-up must count as an active run"
+        );
+
+        gate.open();
+        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the merge follow-up finishes"
+        );
+        let checked = merges.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Merged
+        );
+        assert!(!gate.was_cancelled(), "draining must not cancel the reply");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_a_review_run_in_flight() {
+        let issue = fixed_issue(GATED_SOURCE);
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Open)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+        let mut reviews = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_reviews().await }
+        });
+        source.gate.arrival_during(&mut reviews).await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_reviewing =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_reviewing.is_err(),
+            "the drain must wait while the review run is still in flight"
+        );
+        assert_eq!(
+            watcher.active_count(),
+            1,
+            "the review run must count as an active run"
+        );
+
+        source.gate.open();
+        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the review run finishes"
+        );
+        let checked = reviews.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the review check should finish: {checked:?}"
+        );
+        assert!(
+            !source.gate.was_cancelled(),
+            "draining must not cancel the review run"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_a_retry_in_flight() {
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let watcher = watcher_with_agent(
+            config,
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        tracker
+            .record_attempt(GATED_SOURCE, "retry-1", "GATED-1")
+            .unwrap();
+        tracker
+            .mark_failed(GATED_SOURCE, "retry-1", "initial failure")
+            .unwrap();
+        watcher.set_running(true);
+        let mut retries = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.process_ready_retries().await }
+        });
+        source.gate.arrival_during(&mut retries).await;
+        let retry_status = || {
+            tracker
+                .get_attempt(GATED_SOURCE, "retry-1")
+                .unwrap()
+                .expect("the retried attempt should be recorded")
+                .status
+        };
+
+        assert_eq!(
+            retry_status(),
+            FixAttemptStatus::Pending,
+            "the retry should have prepared its attempt before loading the issue"
+        );
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_retrying = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_retrying.is_err(),
+            "the drain must wait while the retry is still in flight"
+        );
+        assert_eq!(
+            watcher.active_count(),
+            1,
+            "the retry must count as an active run"
+        );
+
+        source.gate.open();
+        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the retry finishes"
+        );
+        assert_eq!(
+            retry_status(),
+            FixAttemptStatus::Failed,
+            "the drain must not end before the retry settles its attempt"
+        );
+        let retried = retries.await;
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_waiting_for_a_slot_does_not_start_once_stopped() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.max_concurrent = 1;
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let watcher = watcher_with_agent(
+            config,
+            Arc::new(MockSource::new("mock")),
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        tracker.record_attempt("mock", "retry-1", "MOCK-1").unwrap();
+        tracker
+            .mark_failed("mock", "retry-1", "initial failure")
+            .unwrap();
+        watcher.set_running(true);
+        let busy = watcher
+            .claim_processing("mock:busy".to_string(), false)
+            .expect("the source's only slot should be free");
+        let retries = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.process_ready_retries().await }
+        });
+        while tracker
+            .get_metrics("ready_retries_found", None, 1)
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        watcher.stop();
+        drop(busy);
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            tracker
+                .get_attempt("mock", "retry-1")
+                .unwrap()
+                .expect("the retry's attempt should be recorded")
+                .retry_count,
+            0,
+            "a retry whose slot frees after the stop must not start"
+        );
+    }
+
+    const UPSTREAM_REPO: &str = "org/lib";
+    const UPSTREAM_PR_URL: &str = "https://github.com/org/lib/pull/3";
+    const DOWNSTREAM_REPO: &str = "app";
+    const RELEASE_TAG: &str = "v1.0.0";
+
+    fn run_git(directory: &std::path::Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A clone of [`DOWNSTREAM_REPO`] under `root` whose origin has one commit
+    /// on `main`.
+    fn downstream_clone(root: &std::path::Path) -> std::path::PathBuf {
+        let origin = format!("{DOWNSTREAM_REPO}.git");
+        run_git(root, &["init", "--bare", "--initial-branch=main", &origin]);
+        run_git(root, &["clone", &origin, DOWNSTREAM_REPO]);
+        let clone = root.join(DOWNSTREAM_REPO);
+        run_git(
+            &clone,
+            &[
+                "-c",
+                "user.name=claudear",
+                "-c",
+                "user.email=claudear@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "--no-verify",
+                "-m",
+                "Initial commit",
+            ],
+        );
+        run_git(&clone, &["push", "--no-verify", "origin", "HEAD:main"]);
+        clone
+    }
+
+    /// A watcher whose merged fix in [`UPSTREAM_REPO`] cascades to a local
+    /// clone of [`DOWNSTREAM_REPO`] once `scm` reports a release.
+    struct ReleaseHarness {
+        watcher: Arc<Watcher>,
+        scm: Arc<MockScm>,
+        _root: tempfile::TempDir,
+    }
+
+    impl ReleaseHarness {
+        fn new(scm: MockScm, agent: Arc<dyn AgentRunner>) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let mut index = RepoIndex::new();
+            index.add_repo(IndexedRepo::new(
+                DOWNSTREAM_REPO,
+                downstream_clone(root.path()),
+            ));
+            let mut config = test_config();
+            config.workspace = root.path().join("workspace");
+            config.cascade.enabled = true;
+            config.cascade.rules = vec![CascadeRule {
+                upstream: UPSTREAM_REPO.to_string(),
+                downstream: DOWNSTREAM_REPO.to_string(),
+                trigger: CascadeTrigger::Release,
+                target_branch: None,
+                version_update: true,
+                instructions: None,
+            }];
+            let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+            tracker.record_attempt("mock", "lib-1", "LIB-1").unwrap();
+            tracker
+                .mark_success("mock", "lib-1", UPSTREAM_PR_URL)
+                .unwrap();
+            tracker.mark_merged("mock", "lib-1").unwrap();
+            let scm = Arc::new(scm);
+            let watcher = Arc::new(Watcher::new(WatcherOptions {
+                inferrer: Some(RepoInferrer::new(index)),
+                relationships: Some(RepoRelationships::new()),
+                ..scm_watcher_options(
+                    config,
+                    Arc::new(MockSource::new("mock")),
+                    tracker,
+                    agent,
+                    Arc::clone(&scm),
+                )
+            }));
+            Self {
+                watcher,
+                scm,
+                _root: root,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_releases_on_a_stopped_watcher_checks_no_release() {
+        let harness = ReleaseHarness::new(MockScm::reporting(PrStatus::Open), crashing_agent());
+        harness.watcher.stop();
+
+        harness.watcher.check_releases_and_cascade().await.unwrap();
+
+        assert_eq!(
+            harness.scm.release_check_count(),
+            0,
+            "a stopped watcher must not look up releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_releases_stopped_while_checking_starts_no_cascade() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = ReleaseHarness::new(
+            MockScm::gated(PrStatus::Open),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        harness.watcher.set_running(true);
+        let mut releases = tokio::spawn({
+            let watcher = Arc::clone(&harness.watcher);
+            async move { watcher.check_releases_and_cascade().await }
+        });
+        harness.scm.gate.arrival_during(&mut releases).await;
+        harness.watcher.stop();
+        harness.scm.gate.open();
+        let checked = releases.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the release check should finish: {checked:?}"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a release found after the stop must not start a cascade run"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_a_release_cascade_in_flight() {
+        let gate = Arc::new(Gate::default());
+        let harness = ReleaseHarness::new(
+            MockScm::reporting(PrStatus::Open),
+            Arc::new(GatedAgent {
+                gate: Arc::clone(&gate),
+            }),
+        );
+        harness.watcher.set_running(true);
+        let mut releases = tokio::spawn({
+            let watcher = Arc::clone(&harness.watcher);
+            async move { watcher.check_releases_and_cascade().await }
+        });
+        gate.arrival_during(&mut releases).await;
+
+        let drain = harness.watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_cascading =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_cascading.is_err(),
+            "the drain must wait while the release cascade is still in flight"
+        );
+        assert_eq!(
+            harness.watcher.active_count(),
+            1,
+            "the release cascade must count as an active run"
+        );
+
+        gate.open();
+        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the release cascade finishes"
+        );
+        let checked = releases.await;
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the release check should finish: {checked:?}"
+        );
+        assert!(
+            !gate.was_cancelled(),
+            "draining must not cancel the release cascade"
         );
     }
 
