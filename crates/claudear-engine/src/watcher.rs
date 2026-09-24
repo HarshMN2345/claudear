@@ -1366,6 +1366,9 @@ impl Watcher {
             Some(rw) => rw,
             None => return Ok(()),
         };
+        if !self.is_running() {
+            return Ok(());
+        }
 
         // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
@@ -1396,6 +1399,9 @@ impl Watcher {
                     review_watcher.unwatch_pr(&pr_url);
                     continue;
                 }
+                if !self.is_running() {
+                    break;
+                }
                 match self
                     .process_review_action(&attempt, &feedback_summary)
                     .await
@@ -1419,12 +1425,14 @@ impl Watcher {
                         );
                         // Leave the batch's comments unhandled so they retry, but
                         // count the failure so a poison comment eventually gives up.
-                        if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
-                            &pr_url,
-                            &comment_refs,
-                            MAX_REVIEW_COMMENT_ATTEMPTS,
-                        ) {
-                            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                        if self.is_running() {
+                            if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                                &pr_url,
+                                &comment_refs,
+                                MAX_REVIEW_COMMENT_ATTEMPTS,
+                            ) {
+                                tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                            }
                         }
                     }
                 }
@@ -2998,6 +3006,9 @@ Create a PR with your changes.{custom_instructions}"#,
         let mut cascade_failed = 0usize;
 
         for attempt in &pending_prs {
+            if !self.is_running() {
+                break;
+            }
             let repo = match &attempt.scm_repo {
                 Some(r) => r,
                 None => continue,
@@ -3021,6 +3032,9 @@ Create a PR with your changes.{custom_instructions}"#,
             };
             match pr_status {
                 Ok(PrStatus::Merged) => {
+                    if !self.is_running() {
+                        break;
+                    }
                     pr_status_merged += 1;
                     // A cascade row shares the parent's issue id: marking by issue id
                     // updated the parent and left this row pending, so every poll saw
@@ -5419,6 +5433,7 @@ mod tests {
     use claudear_core::types::IssuePriority;
     use claudear_integrations::notifier::Notifier;
     use claudear_integrations::reports::Report;
+    use claudear_integrations::scm::{CodeReview, PrInfo, RemoteRepo, ReviewComment, ReviewUser};
     use claudear_integrations::source::{DeployQaSource, IssueSource};
     use claudear_storage::{ActivityStore, AttemptTracker, SqliteTracker};
     use futures::FutureExt;
@@ -7012,6 +7027,15 @@ mod tests {
             self.arrived.notified().await;
         }
 
+        /// Wait for a caller to arrive, failing instead of hanging when `task`
+        /// ends without reaching the gate.
+        async fn arrival_during<T: std::fmt::Debug>(&self, task: &mut tokio::task::JoinHandle<T>) {
+            tokio::select! {
+                () = self.arrival() => {}
+                ended = task => panic!("the task ended before reaching the gate: {ended:?}"),
+            }
+        }
+
         fn open(&self) {
             self.opened.notify_one();
         }
@@ -7033,10 +7057,12 @@ mod tests {
     const GATED_SOURCE: &str = "gated";
 
     /// Source that lists no issues and holds every `get_issue` at its gate
-    /// before reporting the issue missing.
+    /// before returning its issue, or reporting the issue missing when it has
+    /// none.
     #[derive(Default)]
     struct GatedSource {
         gate: Gate,
+        issue: Option<Issue>,
     }
 
     #[async_trait]
@@ -7058,10 +7084,15 @@ mod tests {
         }
         async fn get_issue(&self, id: &str) -> Result<Issue> {
             self.gate.pass().await;
-            Err(claudear_core::error::Error::source(
-                GATED_SOURCE,
-                format!("Issue {id} not found"),
-            ))
+            self.issue
+                .clone()
+                .filter(|issue| issue.id == id)
+                .ok_or_else(|| {
+                    claudear_core::error::Error::source(
+                        GATED_SOURCE,
+                        format!("Issue {id} not found"),
+                    )
+                })
         }
     }
 
@@ -7121,6 +7152,418 @@ mod tests {
         assert!(
             !source.gate.was_cancelled(),
             "stopping must not cancel the housekeeping retry mid-run"
+        );
+    }
+
+    const SCM_REPO: &str = "org/repo";
+    const PR_NUMBER: i64 = 7;
+    const PR_URL: &str = "https://github.com/org/repo/pull/7";
+    const REVIEW_TRIGGER: &str = "@claudear";
+    const FIX_REQUEST_ID: i64 = 70;
+    const FIX_REQUEST_TIME: &str = "2026-01-01T00:00:00Z";
+
+    /// A PR conversation comment that asks for a fix with [`REVIEW_TRIGGER`].
+    fn fix_request() -> ReviewComment {
+        ReviewComment {
+            id: FIX_REQUEST_ID,
+            path: String::new(),
+            position: None,
+            original_position: None,
+            body: format!("{REVIEW_TRIGGER} please handle an empty list"),
+            user: ReviewUser {
+                id: 1,
+                login: "reviewer".to_string(),
+                user_type: Some("User".to_string()),
+            },
+            created_at: FIX_REQUEST_TIME.to_string(),
+            updated_at: FIX_REQUEST_TIME.to_string(),
+            html_url: String::new(),
+            pull_request_review_id: None,
+            line: None,
+            start_line: None,
+            side: None,
+        }
+    }
+
+    /// SCM provider that reports every PR as `status` with a [`fix_request`]
+    /// on it, holding each status and comment lookup at its gate when `gated`.
+    struct MockScm {
+        status: PrStatus,
+        gated: bool,
+        gate: Gate,
+        status_checks: AtomicUsize,
+    }
+
+    impl MockScm {
+        fn reporting(status: PrStatus) -> Self {
+            Self {
+                status,
+                gated: false,
+                gate: Gate::default(),
+                status_checks: AtomicUsize::new(0),
+            }
+        }
+
+        fn gated(status: PrStatus) -> Self {
+            Self {
+                gated: true,
+                ..Self::reporting(status)
+            }
+        }
+
+        fn status_check_count(&self) -> usize {
+            self.status_checks.load(AtomicOrdering::SeqCst)
+        }
+
+        async fn hold(&self) {
+            if self.gated {
+                self.gate.pass().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ScmProvider for MockScm {
+        fn name(&self) -> &str {
+            "mock-scm"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn review_trigger(&self) -> &str {
+            REVIEW_TRIGGER
+        }
+        async fn get_pr_status(&self, _project: &str, _number: i64) -> Result<PrStatus> {
+            self.status_checks.fetch_add(1, AtomicOrdering::SeqCst);
+            self.hold().await;
+            Ok(self.status)
+        }
+        async fn get_pr_info(&self, _project: &str, _number: i64) -> Result<PrInfo> {
+            Ok(PrInfo {
+                head_branch: None,
+                base_branch: None,
+                title: None,
+                author: None,
+            })
+        }
+        async fn get_pr_diff(&self, _project: &str, _number: i64) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn get_reviews(&self, _project: &str, _number: i64) -> Result<Vec<CodeReview>> {
+            Ok(Vec::new())
+        }
+        async fn get_review_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> Result<Vec<ReviewComment>> {
+            Ok(Vec::new())
+        }
+        async fn get_pr_conversation_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> Result<Vec<ReviewComment>> {
+            self.hold().await;
+            Ok(vec![fix_request()])
+        }
+        async fn list_repos(&self, _org_or_group: &str) -> Result<Vec<RemoteRepo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn crashing_agent() -> Arc<dyn AgentRunner> {
+        Arc::new(ScriptedQaAgent {
+            calls: Arc::new(AtomicUsize::new(0)),
+            answer: QaAnswer::Crash,
+        })
+    }
+
+    /// Options for a watcher over `source` that follows PRs and their reviews
+    /// through `scm`.
+    fn scm_watcher_options(
+        config: Config,
+        source: Arc<dyn IssueSource>,
+        tracker: Arc<SqliteTracker>,
+        agent: Arc<dyn AgentRunner>,
+        scm: Arc<MockScm>,
+    ) -> WatcherOptions {
+        let provider: Arc<dyn ScmProvider> = scm;
+        WatcherOptions {
+            config,
+            sources: vec![source],
+            notifier: Arc::new(MockNotifier::new(true)),
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: Some(Arc::new(ReviewWatcher::with_tracker(
+                Arc::clone(&provider),
+                tracker,
+            ))),
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: Some(provider),
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent,
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        }
+    }
+
+    fn watcher_with_scm(
+        config: Config,
+        source: Arc<dyn IssueSource>,
+        tracker: Arc<SqliteTracker>,
+        agent: Arc<dyn AgentRunner>,
+        scm: Arc<MockScm>,
+    ) -> Arc<Watcher> {
+        Arc::new(Watcher::new(scm_watcher_options(
+            config, source, tracker, agent, scm,
+        )))
+    }
+
+    /// Record `issue`'s successful attempt as the author of [`PR_URL`], and
+    /// have `watcher` follow the PR's reviews.
+    fn open_pr(watcher: &Watcher, tracker: &SqliteTracker, issue: &Issue) {
+        tracker
+            .record_attempt(&issue.source, &issue.id, &issue.short_id)
+            .unwrap();
+        tracker
+            .mark_success(&issue.source, &issue.id, PR_URL)
+            .unwrap();
+        watcher
+            .review_watcher
+            .as_ref()
+            .expect("the watcher should follow PR reviews")
+            .watch_pr(PrReviewState::new(
+                PR_URL,
+                SCM_REPO,
+                PR_NUMBER,
+                &issue.id,
+                &issue.source,
+            ));
+    }
+
+    fn attempt_for(tracker: &SqliteTracker, issue: &Issue) -> FixAttempt {
+        tracker
+            .get_attempt(&issue.source, &issue.id)
+            .unwrap()
+            .expect("the issue's attempt should be recorded")
+    }
+
+    fn fixed_issue(source: &str) -> Issue {
+        Issue::new(
+            "review-1",
+            "REVIEW-1",
+            "Crash on an empty list",
+            "https://example.com/issues/review-1",
+            source,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_check_reviews_on_a_stopped_watcher_leaves_review_feedback_untouched() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Open)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.stop();
+
+        watcher.check_reviews().await.unwrap();
+
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a stopped watcher must not start a run for review feedback"
+        );
+        let state = watcher
+            .review_watcher
+            .as_ref()
+            .and_then(|review_watcher| review_watcher.get_state(PR_URL))
+            .expect("the PR should still be followed");
+        assert_eq!(
+            state.last_issue_comment_id, None,
+            "a stopped watcher must not move the review cursor"
+        );
+        assert!(
+            tracker
+                .get_unhandled_pr_review_comments(PR_URL)
+                .unwrap()
+                .is_empty(),
+            "a stopped watcher must not fetch review feedback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reviews_stopped_while_fetching_starts_no_run() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::gated(PrStatus::Open));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+
+        let mut reviews = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_reviews().await }
+        });
+        scm.gate.arrival_during(&mut reviews).await;
+        watcher.stop();
+        scm.gate.open();
+        let checked = reviews.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the review check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "review feedback fetched after the stop must not start a run"
+        );
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(PR_URL)
+                .unwrap()
+                .len(),
+            1,
+            "the fix request must stay unhandled for the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_runs_refused_by_a_stop_do_not_count_toward_giving_up() {
+        let issue = fixed_issue(GATED_SOURCE);
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Open)),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher
+            .lock_processing()
+            .insert(format!("{GATED_SOURCE}:{}", issue.id));
+
+        for _ in 0..MAX_REVIEW_COMMENT_ATTEMPTS {
+            watcher.set_running(true);
+            let mut reviews = tokio::spawn({
+                let watcher = Arc::clone(&watcher);
+                async move { watcher.check_reviews().await }
+            });
+            source.gate.arrival_during(&mut reviews).await;
+            watcher.stop();
+            source.gate.open();
+            let checked = reviews.await;
+            assert!(
+                matches!(checked, Ok(Ok(()))),
+                "the review check should finish: {checked:?}"
+            );
+        }
+
+        assert_eq!(
+            tracker
+                .get_unhandled_pr_review_comments(PR_URL)
+                .unwrap()
+                .len(),
+            1,
+            "review runs refused by a stop must not give up on the fix request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_merges_on_a_stopped_watcher_checks_no_pr() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::reporting(PrStatus::Merged));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.stop();
+
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+
+        assert_eq!(
+            scm.status_check_count(),
+            0,
+            "a stopped watcher must not check its PRs"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a stopped watcher must leave a merged PR for the next start"
+        );
+        let checks = tracker.get_metrics("pr_status_checks", None, 10).unwrap();
+        assert_eq!(
+            checks.len(),
+            1,
+            "a cycle cut short by a stop must still record its metrics"
+        );
+        assert_eq!(checks[0].metric_value, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_merges_stopped_while_checking_leaves_the_pr_unmerged() {
+        let issue = fixed_issue("mock");
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let scm = Arc::new(MockScm::gated(PrStatus::Merged));
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])),
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::clone(&scm),
+        );
+        open_pr(&watcher, &tracker, &issue);
+        watcher.set_running(true);
+
+        let mut merges = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.check_pr_merges_and_cascade().await }
+        });
+        scm.gate.arrival_during(&mut merges).await;
+        watcher.stop();
+        scm.gate.open();
+        let checked = merges.await;
+
+        assert!(
+            matches!(checked, Ok(Ok(()))),
+            "the merge check should finish: {checked:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a PR found merged after the stop must be left for the next start"
         );
     }
 
@@ -12207,6 +12650,7 @@ mod tests {
             dry_run: false,
             llm_engine: None,
         });
+        watcher.set_running(true);
 
         watcher.check_pr_merges_and_cascade().await.unwrap();
         watcher.check_pr_merges_and_cascade().await.unwrap();
