@@ -27,7 +27,7 @@ use claudear::{
     retry::RetryManager,
     runner::{process_group, AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
-    shutdown::{self, Outcome, Service, Signals, Summary},
+    shutdown::{self, Outcome, Reason, Service, Signals, Summary},
     source::{
         DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
         SlackSource, TelegramSource, WhatsAppSource,
@@ -46,9 +46,11 @@ use claudear::{
         WebhookServer, WhatsAppWebhookHandler,
     },
 };
+use futures::Stream;
 use serde_json::json;
 use std::future::{pending, Future};
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::time::{interval, Duration, Instant};
 use tokio_util::task::TaskTracker;
 use tracing_subscriber::{
@@ -1772,6 +1774,12 @@ async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
 /// Exit code for a shutdown forced by a second signal, as for any interrupted process.
 const FORCED_EXIT_CODE: i32 = 130;
 
+/// A second signal cut the drain short. `async_main` returns it instead of exiting in place,
+/// so its logging guard flushes the file log before `main` exits with [`FORCED_EXIT_CODE`].
+#[derive(Debug, Error)]
+#[error("shutdown forced by a second signal")]
+struct ForcedShutdown;
+
 /// How often `claudear stop` reports that it is still waiting for the daemon to exit.
 const STOP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -1805,25 +1813,29 @@ impl Daemon<'_> {
     /// Run `services` until a signal, `request` or a service ending starts the shutdown, then
     /// stop taking new work and drain the runs in flight.
     ///
-    /// Exits the process at once when another signal forces the shutdown.
+    /// Fails with [`ForcedShutdown`] when another signal forces the shutdown.
     async fn serve<'s>(
         &self,
         services: impl IntoIterator<Item = Service<'s>>,
         request: impl Future<Output = ()>,
     ) -> anyhow::Result<Summary> {
         let mut signals = Signals::listen()?;
-        let summary = shutdown::run(
-            services,
-            request,
-            &mut signals,
-            |_| self.stop(),
-            self.drain(),
-        )
-        .await;
+        self.serve_with(&mut signals, services, request).await
+    }
+
+    /// [`Self::serve`], reading the stop signals from `signals`.
+    async fn serve_with<'s>(
+        &self,
+        signals: &mut (impl Stream<Item = Reason> + Unpin),
+        services: impl IntoIterator<Item = Service<'s>>,
+        request: impl Future<Output = ()>,
+    ) -> anyhow::Result<Summary> {
+        let summary =
+            shutdown::run(services, request, signals, |_| self.stop(), self.drain()).await;
         match summary.outcome {
             Outcome::Forced => {
                 tracing::warn!("Shutdown forced, exiting immediately");
-                std::process::exit(FORCED_EXIT_CODE);
+                return Err(ForcedShutdown.into());
             }
             Outcome::TimedOut => tracing::warn!(
                 watcher_runs = self.watcher.active_count(),
@@ -2022,7 +2034,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
-    let _sentry_guard = sentry::init((
+    let sentry_guard = sentry::init((
         std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
         sentry::ClientOptions {
             release: std::env::var("CLAUDEAR_SENTRY_RELEASE")
@@ -2046,6 +2058,14 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async_main(cli));
+    let forced = result
+        .as_ref()
+        .is_err_and(|error| error.is::<ForcedShutdown>());
+    if forced {
+        runtime.shutdown_background();
+        drop(sentry_guard);
+        std::process::exit(FORCED_EXIT_CODE);
+    }
     runtime.shutdown_timeout(shutdown::RUNTIME_GRACE);
     result
 }
@@ -2053,8 +2073,6 @@ fn main() -> anyhow::Result<()> {
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let verbose = cli.verbose;
 
-    // Initialize logging (must keep _guard alive for file logging to work)
-    // Empty path disables file logging
     let log_dir = if cli.log_dir.as_os_str().is_empty() {
         None
     } else {
@@ -2065,6 +2083,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &cli.command,
             Commands::Start { .. } | Commands::Webhook { .. } | Commands::Poll { .. }
         );
+    // Dropping the guard flushes the file log: exiting the process before async_main returns
+    // can lose its last lines.
     let _log_guard = init_logging(log_dir, verbose, suppress_console_info);
 
     let config_path = cli.config.clone();
@@ -4789,6 +4809,62 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::channel::mpsc::unbounded;
+    use std::collections::HashMap;
+
+    fn idle_watcher() -> Watcher {
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(SqliteTracker::in_memory().expect("open an in-memory tracker"));
+        Watcher::new(WatcherOptions {
+            config: Config::default(),
+            sources: Vec::new(),
+            notifier: Arc::new(ConsoleNotifier::new()),
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            agent: Arc::new(ClaudeAgentRunner::new(
+                ClaudeRunnerConfig::default(),
+                tracker,
+            )),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_fails_serve_instead_of_exiting_the_process() {
+        let watcher = idle_watcher();
+        let runs = TaskTracker::new();
+        let _run = runs.token();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: Some(&runs),
+            monitors: Vec::new(),
+        };
+        let (sender, mut signals) = unbounded();
+        sender.unbounded_send(Reason::Terminated).unwrap();
+        sender.unbounded_send(Reason::Interrupted).unwrap();
+
+        let result = daemon
+            .serve_with(&mut signals, [Service::new("idle", pending())], pending())
+            .await;
+
+        let error = result.expect_err("a forced shutdown must fail serve");
+        assert!(error.is::<ForcedShutdown>(), "unexpected error {error:#}");
+    }
 
     #[test]
     fn http_mode_runs_a_server_only_for_what_is_enabled() {

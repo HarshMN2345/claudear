@@ -16,14 +16,17 @@ const STARTUP_WAIT: Duration = Duration::from_secs(40);
 const STOP_MARGIN: Duration = Duration::from_secs(4);
 const EXIT_WAIT: Duration = Duration::from_secs(20);
 const HANGUP_WAIT: Duration = Duration::from_secs(2);
+const SUSPEND_WAIT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(3600);
 const TAIL_LINES: usize = 40;
+const FORCED_EXIT_CODE: i32 = 130;
 const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
 const DAEMON: &str = "daemon";
 const STOP: &str = "stop";
 const STOPPED: &str = "Daemon stopped.";
 const SOCKET_CLOSED: &str = "The daemon closed its control socket";
+const FORCED_NOTICE: &str = "Shutdown forced";
 
 struct Sandbox {
     root: TempDir,
@@ -161,6 +164,45 @@ impl Sandbox {
             .expect("wait for the daemon")
     }
 
+    /// Sends `signals` while the daemon is suspended, so it receives them together and the
+    /// drain the first one starts cannot finish before the next one arrives.
+    async fn send_together(&self, daemon: &Child, signals: &[libc::c_int]) {
+        send(daemon, libc::SIGSTOP);
+        self.wait_until_suspended(daemon).await;
+        for &signal in signals {
+            send(daemon, signal);
+        }
+        send(daemon, libc::SIGCONT);
+    }
+
+    async fn wait_until_suspended(&self, daemon: &Child) {
+        let pid = pid_of(daemon);
+        let deadline = Instant::now() + SUSPEND_WAIT;
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: WNOHANG keeps waitpid from blocking, and WUNTRACED reports the stop
+            // without reaping the daemon, which the test still owns.
+            let changed =
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if changed == pid && libc::WIFSTOPPED(status) {
+                return;
+            }
+            assert_eq!(
+                changed,
+                0,
+                "waitpid reported status {status} for the daemon\n{}",
+                self.diagnostics()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the daemon was not suspended within {}s\n{}",
+                SUSPEND_WAIT.as_secs(),
+                self.diagnostics()
+            );
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+
     async fn assert_running(&self) {
         let status = IpcClient::with_socket_path(self.socket())
             .status()
@@ -217,15 +259,24 @@ impl Sandbox {
         );
     }
 
-    fn diagnostics(&self) -> String {
-        let logs = fs::read_dir(self.path().join("logs"))
+    fn log_files(&self) -> impl Iterator<Item = PathBuf> {
+        fs::read_dir(self.path().join("logs"))
             .into_iter()
             .flatten()
             .flatten()
-            .map(|entry| entry.path());
+            .map(|entry| entry.path())
+    }
+
+    fn log(&self) -> String {
+        self.log_files()
+            .map(|path| fs::read_to_string(path).unwrap_or_default())
+            .collect()
+    }
+
+    fn diagnostics(&self) -> String {
         [self.output(DAEMON), self.output(STOP)]
             .into_iter()
-            .chain(logs)
+            .chain(self.log_files())
             .filter(|path| path.is_file())
             .map(|path| format!("{}:\n{}", path.display(), tail(&path)))
             .collect::<Vec<_>>()
@@ -417,5 +468,29 @@ async fn sighup_under_nohup_leaves_the_daemon_running() {
     sandbox.assert_running().await;
     let status = sandbox.stop_with(&mut daemon, libc::SIGTERM).await;
     assert_exited_cleanly(status, &sandbox);
+    sandbox.assert_files_removed();
+}
+
+#[tokio::test]
+async fn second_signal_forces_the_exit_after_flushing_the_log() {
+    let sandbox = Sandbox::new();
+    let mut daemon = sandbox.start().await;
+
+    sandbox
+        .send_together(&daemon, &[libc::SIGINT, libc::SIGTERM])
+        .await;
+    let status = sandbox.wait_for_exit(&mut daemon).await;
+
+    assert_eq!(
+        status.code(),
+        Some(FORCED_EXIT_CODE),
+        "the daemon exited with {status}\n{}",
+        sandbox.diagnostics()
+    );
+    assert!(
+        sandbox.log().contains(FORCED_NOTICE),
+        "the forced shutdown never reached the log file\n{}",
+        sandbox.diagnostics()
+    );
     sandbox.assert_files_removed();
 }
