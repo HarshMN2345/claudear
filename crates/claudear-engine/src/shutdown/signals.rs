@@ -6,11 +6,19 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::signal::unix::{self, Signal, SignalKind};
 
+/// The signals that stop the daemon, each with the reason it reads as.
+const STOP_SIGNALS: [(SignalKind, Reason); 3] = [
+    (SignalKind::interrupt(), Reason::Interrupted),
+    (SignalKind::terminate(), Reason::Terminated),
+    (SignalKind::hangup(), Reason::Interrupted),
+];
+
 /// The stop signals, as a stream of shutdown reasons: SIGINT and SIGHUP read as
 /// [`Reason::Interrupted`], SIGTERM as [`Reason::Terminated`].
 ///
-/// SIGHUP is only heard when it wasn't already ignored at startup, so a closed terminal still
-/// leaves a daemon started under `nohup` running.
+/// A signal already ignored at startup stays ignored, as whoever started the daemon intended:
+/// `nohup` ignores SIGHUP so the daemon outlives its terminal, and a script's background jobs
+/// ignore SIGINT so Ctrl+C leaves them running.
 #[derive(Debug)]
 pub struct Signals {
     listeners: Vec<(Signal, Reason)>,
@@ -20,12 +28,9 @@ impl Signals {
     /// Installs the handlers inside the current Tokio runtime. From then on these signals no
     /// longer kill the process, so the caller decides how to exit.
     pub fn listen() -> io::Result<Self> {
-        let mut listeners = vec![
-            (unix::signal(SignalKind::interrupt())?, Reason::Interrupted),
-            (unix::signal(SignalKind::terminate())?, Reason::Terminated),
-        ];
-        if !ignored(disposition(libc::SIGHUP)?) {
-            listeners.push((unix::signal(SignalKind::hangup())?, Reason::Interrupted));
+        let mut listeners = Vec::with_capacity(STOP_SIGNALS.len());
+        for (kind, reason) in heeded(disposition)? {
+            listeners.push((unix::signal(kind)?, reason));
         }
         Ok(Self { listeners })
     }
@@ -64,9 +69,17 @@ fn receive<Listener>(
     }
 }
 
-/// Whether `handler` is the ignore disposition, which `nohup` sets for SIGHUP.
-fn ignored(handler: libc::sighandler_t) -> bool {
-    handler == libc::SIG_IGN
+/// The stop signals worth listening for: those `disposition` does not report as ignored.
+fn heeded(
+    disposition: impl Fn(libc::c_int) -> io::Result<libc::sighandler_t>,
+) -> io::Result<Vec<(SignalKind, Reason)>> {
+    let mut heeded = Vec::with_capacity(STOP_SIGNALS.len());
+    for (kind, reason) in STOP_SIGNALS {
+        if disposition(kind.as_raw_value())? != libc::SIG_IGN {
+            heeded.push((kind, reason));
+        }
+    }
+    Ok(heeded)
 }
 
 /// Reads the handler currently installed for `signal` without changing it.
@@ -90,6 +103,18 @@ mod tests {
 
     fn received(listeners: &mut Vec<(Poll<Option<()>>, Reason)>) -> Poll<Option<Reason>> {
         receive(listeners, |listener| *listener)
+    }
+
+    fn ignoring(
+        ignored: &[SignalKind],
+    ) -> impl Fn(libc::c_int) -> io::Result<libc::sighandler_t> + '_ {
+        move |signal| {
+            if ignored.iter().any(|kind| kind.as_raw_value() == signal) {
+                Ok(libc::SIG_IGN)
+            } else {
+                Ok(libc::SIG_DFL)
+            }
+        }
     }
 
     #[test]
@@ -138,17 +163,67 @@ mod tests {
     }
 
     #[test]
-    fn only_an_ignored_hangup_is_left_alone() {
-        assert!(ignored(libc::SIG_IGN));
-        assert!(!ignored(libc::SIG_DFL));
+    fn every_stop_signal_is_heeded_with_its_reason_when_none_is_ignored() {
+        let heeded = heeded(ignoring(&[])).expect("every disposition reads");
+
+        assert_eq!(
+            heeded,
+            [
+                (SignalKind::interrupt(), Reason::Interrupted),
+                (SignalKind::terminate(), Reason::Terminated),
+                (SignalKind::hangup(), Reason::Interrupted),
+            ]
+        );
+    }
+
+    #[test]
+    fn signal_ignored_at_startup_stays_ignored() {
+        for (ignored, _) in STOP_SIGNALS {
+            let heeded = heeded(ignoring(&[ignored])).expect("every disposition reads");
+
+            let others: Vec<_> = STOP_SIGNALS
+                .into_iter()
+                .filter(|(kind, _)| *kind != ignored)
+                .collect();
+            assert_eq!(heeded, others, "{ignored:?} was ignored at startup");
+        }
+    }
+
+    #[test]
+    fn background_job_under_nohup_still_stops_on_sigterm() {
+        let ignored = [SignalKind::interrupt(), SignalKind::hangup()];
+
+        let heeded = heeded(ignoring(&ignored)).expect("every disposition reads");
+
+        assert_eq!(heeded, [(SignalKind::terminate(), Reason::Terminated)]);
+    }
+
+    #[test]
+    fn signal_with_a_handler_installed_is_still_heeded() {
+        extern "C" fn handler(_: libc::c_int) {}
+
+        let installed = handler as *const () as libc::sighandler_t;
+
+        let heeded = heeded(|_| Ok(installed)).expect("every disposition reads");
+
+        assert_eq!(heeded, STOP_SIGNALS);
+    }
+
+    #[test]
+    fn unreadable_disposition_fails_listening() {
+        let error = heeded(|_| Err(io::Error::from_raw_os_error(libc::EINVAL)))
+            .expect_err("a disposition that cannot be read fails listening");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]
     fn disposition_reads_an_ignored_signal_as_ignored() {
         let handler = disposition(libc::SIGPIPE).expect("SIGPIPE is a valid signal");
 
-        assert!(
-            ignored(handler),
+        assert_eq!(
+            handler,
+            libc::SIG_IGN,
             "the Rust runtime ignores SIGPIPE before main"
         );
     }
