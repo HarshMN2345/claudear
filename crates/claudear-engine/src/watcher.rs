@@ -1050,6 +1050,10 @@ impl Watcher {
     }
 
     /// Start the watcher with polling.
+    ///
+    /// Returns once both the polling and housekeeping loops have stopped, so a
+    /// housekeeping cycle still running at [`Self::stop`] finishes first. If
+    /// either loop fails, the watcher stops and the first error is returned.
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
@@ -1149,18 +1153,22 @@ impl Watcher {
 
         self.poll().await?;
 
-        // Source polling loop
-        let poll_future = self.run_source_poll_loop(poll_interval);
-
-        // Housekeeping loop (retries, cascades, auto-close, reviews, learning, deps)
-        let housekeeping =
-            crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
-        let housekeeping_future = housekeeping.run_loop();
-
-        tokio::select! {
-            result = poll_future => result,
-            result = housekeeping_future => result.map_err(|e| claudear_core::error::Error::Config(e.to_string())),
-        }
+        let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
+        let (polling, housekeeping) = tokio::join!(
+            async {
+                self.run_source_poll_loop(poll_interval)
+                    .await
+                    .inspect_err(|_| self.stop())
+            },
+            async {
+                worker
+                    .run_loop()
+                    .await
+                    .map_err(|e| claudear_core::error::Error::Config(e.to_string()))
+                    .inspect_err(|_| self.stop())
+            },
+        );
+        polling.and(housekeeping)
     }
 
     /// Run the source polling loop.
@@ -6968,6 +6976,139 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a stopped watcher must not run a housekeeping cycle"
+        );
+    }
+
+    /// Holds each caller of [`Gate::pass`] until [`Gate::open`], signalling its
+    /// arrival and recording whether a held caller was dropped instead.
+    #[derive(Default)]
+    struct Gate {
+        arrived: Notify,
+        opened: Notify,
+        cancelled: AtomicBool,
+    }
+
+    impl Gate {
+        async fn pass(&self) {
+            let held = HeldAtGate(self);
+            self.arrived.notify_one();
+            self.opened.notified().await;
+            std::mem::forget(held);
+        }
+
+        async fn arrival(&self) {
+            self.arrived.notified().await;
+        }
+
+        fn open(&self) {
+            self.opened.notify_one();
+        }
+
+        fn was_cancelled(&self) -> bool {
+            self.cancelled.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// Marks its gate cancelled when the caller held there is dropped.
+    struct HeldAtGate<'a>(&'a Gate);
+
+    impl Drop for HeldAtGate<'_> {
+        fn drop(&mut self) {
+            self.0.cancelled.store(true, AtomicOrdering::SeqCst);
+        }
+    }
+
+    const GATED_SOURCE: &str = "gated";
+
+    /// Source that lists no issues and holds every `get_issue` at its gate
+    /// before reporting the issue missing.
+    #[derive(Default)]
+    struct GatedSource {
+        gate: Gate,
+    }
+
+    #[async_trait]
+    impl IssueSource for GatedSource {
+        fn name(&self) -> &str {
+            GATED_SOURCE
+        }
+        fn display_name(&self) -> &str {
+            GATED_SOURCE
+        }
+        async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            Ok(vec![])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Gated match", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
+            Ok(format!("Context for {}", issue.short_id))
+        }
+        async fn get_issue(&self, id: &str) -> Result<Issue> {
+            self.gate.pass().await;
+            Err(claudear_core::error::Error::source(
+                GATED_SOURCE,
+                format!("Issue {id} not found"),
+            ))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_start_after_stop_waits_for_the_housekeeping_retry_in_flight() {
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let watcher = watcher_with_agent(
+            config,
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        let start = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.start(Some(50)).await }
+        });
+
+        // The initial poll runs ready retries inline, so seed the retry only
+        // once that poll has finished; the housekeeping loop must run it.
+        while tracker
+            .get_metrics("poll_cycle_duration_secs", None, 1)
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tracker
+            .record_attempt(GATED_SOURCE, "retry-1", "GATED-1")
+            .unwrap();
+        tracker
+            .mark_failed(GATED_SOURCE, "retry-1", "initial failure")
+            .unwrap();
+
+        source.gate.arrival().await;
+        watcher.stop();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert!(
+            !start.is_finished(),
+            "start must not return while a housekeeping retry is still running"
+        );
+
+        source.gate.open();
+        let finished = tokio::time::timeout(Duration::from_secs(5), start).await;
+
+        assert!(
+            matches!(finished, Ok(Ok(Ok(())))),
+            "start should return once the retry finishes: {finished:?}"
+        );
+        assert!(
+            !source.gate.was_cancelled(),
+            "stopping must not cancel the housekeeping retry mid-run"
         );
     }
 
