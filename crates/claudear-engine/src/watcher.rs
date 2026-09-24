@@ -61,6 +61,20 @@ const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
 /// shutdown by at most this long.
 const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Why a trigger is refused once [`Watcher::stop`] has been called.
+const STOPPING_REFUSAL: &str = "Watcher is stopping; not starting new runs";
+
+/// How [`Watcher::process_issue`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueRun {
+    /// The issue went through the processing pipeline.
+    Processed,
+    /// The issue was skipped, such as one already being processed.
+    Skipped,
+    /// The watcher is stopping, so no run started.
+    Stopping,
+}
+
 /// Whether a retry that failed to start should get its retry back.
 fn retry_trigger_error_is_transient(e: &claudear_core::error::Error) -> bool {
     use claudear_core::error::Error;
@@ -1064,11 +1078,17 @@ impl Watcher {
     /// first, such as a stop requested while warm start was still running.
     pub(crate) fn mark_running(&self) -> bool {
         self.is_running.store(true, Ordering::SeqCst);
-        if self.stopped.load(Ordering::SeqCst) {
+        if self.is_stopped() {
             self.is_running.store(false, Ordering::SeqCst);
             return false;
         }
         true
+    }
+
+    /// Whether [`Self::stop`] has been called. Unlike a watcher that is not
+    /// [running](Self::is_running), one that was never started is not stopped.
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Start the watcher with polling.
@@ -4262,6 +4282,10 @@ Create a PR with your changes.{custom_instructions}"#,
     /// [is runnable](DeployQaTipStatus::is_runnable) and this process
     /// [claims](Self::claim_deploy_qa_tip) it, so no retry, trigger or other
     /// daemon re-runs a tip that is running or already has a verdict.
+    ///
+    /// Once [`Self::stop`] has been called no run starts and nothing is
+    /// recorded, so a run dispatched or triggered before the stop cannot
+    /// start after the shutdown drain has finished.
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -4270,7 +4294,7 @@ Create a PR with your changes.{custom_instructions}"#,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
         intent: Option<Intent>,
-    ) -> bool {
+    ) -> IssueRun {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
         // Retries, IPC and review-feedback triggers pass no intent, and a
@@ -4291,9 +4315,9 @@ Create a PR with your changes.{custom_instructions}"#,
                         status = %tip.status,
                         "Skipping deploy_qa tip that is running or has a verdict"
                     );
-                    return false;
+                    return IssueRun::Skipped;
                 }
-                None => return false,
+                None => return IssueRun::Skipped,
             }
         } else {
             None
@@ -4304,7 +4328,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Skipping issue processing while watcher is paused for Claude rate limit"
             );
-            return false;
+            return IssueRun::Skipped;
         }
 
         let processing_key = format!("{}:{}", source.name(), issue.id);
@@ -4317,12 +4341,20 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Issue already being processed, skipping"
             );
-            return false;
+            return IssueRun::Skipped;
         };
+        // Checked only once claimed, so either this sees the stop or the drain sees the claim.
+        if self.is_stopped() {
+            tracing::info!(
+                short_id = %issue.short_id,
+                "Not starting issue processing because the watcher is stopping"
+            );
+            return IssueRun::Stopping;
+        }
 
         if let Some(ref tip) = deploy_qa_tip {
             if !self.claim_deploy_qa_tip(tip, &issue.short_id) {
-                return false;
+                return IssueRun::Skipped;
             }
         }
 
@@ -4481,10 +4513,12 @@ Create a PR with your changes.{custom_instructions}"#,
                             repo = %repo_name,
                             "Redirect repo not found, skipping issue"
                         );
-                        return false;
+                        return IssueRun::Skipped;
                     }
                 }
-                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => return false,
+                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => {
+                    return IssueRun::Skipped
+                }
             }
         }
 
@@ -4542,10 +4576,13 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Return false for semantic duplicate skips (don't count as processed),
-        // true for everything else
-        !matches!(&outcome, ProcessingOutcome::Failed { error }
+        if matches!(&outcome, ProcessingOutcome::Failed { error }
             if error.contains("Semantic duplicate of"))
+        {
+            IssueRun::Skipped
+        } else {
+            IssueRun::Processed
+        }
     }
 
     async fn clear_rate_limit_pause(&self) {
@@ -5139,6 +5176,9 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Manually trigger processing for a specific issue with optional review feedback context.
+    ///
+    /// Refused with [`STOPPING_REFUSAL`] once [`Self::stop`] has been called,
+    /// including when the stop comes while the issue is being loaded.
     pub async fn trigger_issue_with_feedback(
         &self,
         source_name: &str,
@@ -5174,6 +5214,11 @@ Create a PR with your changes.{custom_instructions}"#,
             .iter()
             .find(|s| s.name() == source_name)
             .ok_or_else(|| claudear_core::error::Error::source(source_name, "Unknown source"))?;
+        if self.is_stopped() {
+            return Err(claudear_core::error::Error::Other(
+                STOPPING_REFUSAL.to_string(),
+            ));
+        }
 
         tracing::info!(
             component = "watcher",
@@ -5192,7 +5237,7 @@ Create a PR with your changes.{custom_instructions}"#,
             issue.set_metadata(REVIEW_PR_REPO_KEY, repo);
         }
 
-        let started = self
+        let run = self
             .process_issue(
                 Arc::clone(source),
                 issue,
@@ -5202,17 +5247,19 @@ Create a PR with your changes.{custom_instructions}"#,
                 None,
             )
             .await;
-        if !started {
-            return Err(claudear_core::error::Error::source(
+        match run {
+            IssueRun::Processed => Ok(()),
+            IssueRun::Skipped => Err(claudear_core::error::Error::source(
                 source_name,
                 format!(
                     "Issue {} is already being processed; trigger deferred",
                     issue_id
                 ),
-            ));
+            )),
+            IssueRun::Stopping => Err(claudear_core::error::Error::Other(
+                STOPPING_REFUSAL.to_string(),
+            )),
         }
-
-        Ok(())
     }
 
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
@@ -7099,22 +7146,32 @@ mod tests {
 
     const GATED_SOURCE: &str = "gated";
 
-    /// Source that lists no issues and holds every `get_issue` at its gate
-    /// before returning its issue, or reporting the issue missing when it has
-    /// none.
-    #[derive(Default)]
+    /// Source named [`GATED_SOURCE`] unless given another name, that lists no
+    /// issues and holds every `get_issue` at its gate before returning its
+    /// issue, or reporting the issue missing when it has none.
     struct GatedSource {
+        name: &'static str,
         gate: Gate,
         issue: Option<Issue>,
+    }
+
+    impl Default for GatedSource {
+        fn default() -> Self {
+            Self {
+                name: GATED_SOURCE,
+                gate: Gate::default(),
+                issue: None,
+            }
+        }
     }
 
     #[async_trait]
     impl IssueSource for GatedSource {
         fn name(&self) -> &str {
-            GATED_SOURCE
+            self.name
         }
         fn display_name(&self) -> &str {
-            GATED_SOURCE
+            self.name
         }
         async fn fetch_issues(&self) -> Result<Vec<Issue>> {
             Ok(vec![])
@@ -7131,10 +7188,7 @@ mod tests {
                 .clone()
                 .filter(|issue| issue.id == id)
                 .ok_or_else(|| {
-                    claudear_core::error::Error::source(
-                        GATED_SOURCE,
-                        format!("Issue {id} not found"),
-                    )
+                    claudear_core::error::Error::source(self.name, format!("Issue {id} not found"))
                 })
         }
     }
@@ -7906,6 +7960,95 @@ mod tests {
                 .retry_count,
             0,
             "a retry whose slot frees after the stop must not start"
+        );
+    }
+
+    fn triggered_issue() -> Issue {
+        Issue::new(
+            "trigger-1",
+            "TRIGGER-1",
+            "Crash on an empty list",
+            "https://example.com/issues/trigger-1",
+            GATED_SOURCE,
+        )
+    }
+
+    fn is_stopping_refusal(triggered: &Result<()>) -> bool {
+        matches!(triggered, Err(error) if error.to_string() == STOPPING_REFUSAL)
+    }
+
+    #[tokio::test]
+    async fn test_trigger_on_a_stopped_watcher_refuses_without_loading_the_issue() {
+        let issue = triggered_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            crashing_agent(),
+        );
+        watcher.stop();
+
+        let mut trigger = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move { watcher.trigger_issue(GATED_SOURCE, &issue.id).await }
+        });
+        let triggered = tokio::select! {
+            () = source.gate.arrival() => panic!("a stopped watcher must not load the issue"),
+            triggered = &mut trigger => triggered.expect("the trigger should not panic"),
+        };
+
+        assert!(
+            is_stopping_refusal(&triggered),
+            "a trigger on a stopped watcher must be refused as stopping: {triggered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_loading_its_issue_across_a_stop_starts_no_run() {
+        let issue = triggered_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        watcher.set_running(true);
+        let mut trigger = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            let issue_id = issue.id.clone();
+            async move { watcher.trigger_issue(GATED_SOURCE, &issue_id).await }
+        });
+        source.gate.arrival_during(&mut trigger).await;
+
+        watcher.stop();
+        source.gate.open();
+        let triggered = trigger.await.expect("the trigger should not panic");
+
+        assert!(
+            is_stopping_refusal(&triggered),
+            "a trigger whose issue loads after the stop must be refused as stopping: {triggered:?}"
+        );
+        assert!(
+            !tracker.has_attempted(GATED_SOURCE, &issue.id).unwrap(),
+            "a trigger refused by the stop must not record an attempt"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a trigger refused by the stop must not run the agent"
         );
     }
 
@@ -10426,9 +10569,10 @@ mod tests {
         let result = watcher
             .process_issue(source, issue, match_result, None, None, None)
             .await;
-        assert!(
-            !result,
-            "process_issue should return false when issue already in-flight"
+        assert_eq!(
+            result,
+            IssueRun::Skipped,
+            "process_issue should skip an issue already in-flight"
         );
     }
 
@@ -10716,6 +10860,7 @@ mod tests {
             watcher
                 .process_issue(self.source.clone(), issue, match_result, None, None, None)
                 .await
+                == IssueRun::Processed
         }
 
         fn assert_processing_released(&self, watcher: &Watcher) {
@@ -11593,8 +11738,9 @@ mod tests {
             .await
             .expect("the retried run should not panic");
 
-        assert!(
+        assert_eq!(
             retried,
+            IssueRun::Processed,
             "the issue must not be refused as already being processed"
         );
         assert_eq!(
@@ -11666,11 +11812,63 @@ mod tests {
             Ok(true),
             "the drain must end once the QA run finishes"
         );
-        assert!(
+        assert_eq!(
             run.await.expect("the QA run should not panic"),
+            IssueRun::Processed,
             "the QA run should have been processed"
         );
         assert!(!gate.was_cancelled(), "draining must not cancel the QA run");
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatched_before_a_stop_does_not_start_after_it() {
+        let issue = Issue::new(
+            "dispatch-1",
+            "DISPATCH-1",
+            "How do I rotate my API key?",
+            "http://example.com/dispatch/1",
+            "mock",
+        );
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            test_config(),
+            source.clone(),
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        watcher.set_running(true);
+        let match_result = source.matches_criteria(&issue);
+        watcher
+            .dispatch_lane(
+                &source,
+                vec![(issue.clone(), match_result, Some(Intent::Question))],
+                1,
+                true,
+            )
+            .await;
+        assert!(
+            !tracker.has_attempted("mock", &issue.id).unwrap(),
+            "the dispatched run must not have started before the stop"
+        );
+
+        watcher.stop();
+        watcher.drain_spawned_tasks().await;
+
+        assert!(
+            !tracker.has_attempted("mock", &issue.id).unwrap(),
+            "a run dispatched before the stop must not start after it"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a run dispatched before the stop must not reach the agent"
+        );
     }
 
     #[tokio::test]
@@ -11698,6 +11896,42 @@ mod tests {
             harness.stored_status(),
             DeployQaTipStatus::Pending,
             "an undispatched tip must stay pending for a later dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_tip_loaded_across_a_stop_stays_pending() {
+        let mut gated = None;
+        let harness = DeployQaHarness::build(test_config(), QaAnswer::Crash, |_, tip| {
+            let source = Arc::new(GatedSource {
+                name: DEPLOY_QA_SOURCE,
+                issue: Some(deploy_qa_issue(tip)),
+                ..GatedSource::default()
+            });
+            gated = Some(Arc::clone(&source));
+            source
+        });
+        let source = gated.expect("the harness should build its source");
+        harness.watcher.set_running(true);
+        let mut runs = harness.dispatch_pending_tips().await;
+        assert_eq!(runs.len(), 1, "the pending tip should be dispatched");
+        source.gate.arrival_during(&mut runs[0]).await;
+
+        harness.watcher.stop();
+        source.gate.open();
+        for run in runs {
+            run.await.expect("the dispatched run should not panic");
+        }
+
+        assert_eq!(
+            harness.agent_calls(),
+            0,
+            "a tip loaded after the stop must not reach the QA agent"
+        );
+        assert_eq!(
+            harness.stored_status(),
+            DeployQaTipStatus::Pending,
+            "a tip loaded after the stop must stay pending for the next start"
         );
     }
 
@@ -12944,7 +13178,11 @@ mod tests {
         let started = watcher
             .process_issue(source, issue, match_result, None, None, None)
             .await;
-        assert!(started); // true because it processed (even though it failed)
+        assert_eq!(
+            started,
+            IssueRun::Processed,
+            "a run that fails to resolve its repository still went through processing"
+        );
 
         // Verify processing set was cleaned up
         assert!(!watcher.lock_processing().contains("mock:cleanup-1"));
@@ -15936,9 +16174,10 @@ mod tests {
         let result = watcher
             .process_issue(source, issue, match_result, None, None, None)
             .await;
-        assert!(
-            !result,
-            "process_issue should return false when rate limited"
+        assert_eq!(
+            result,
+            IssueRun::Skipped,
+            "process_issue should skip an issue while rate limited"
         );
     }
 
