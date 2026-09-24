@@ -4,7 +4,8 @@ use super::protocol::{
     ActivityEntry, ActivityType, IpcCommand, IpcData, IpcResponse, WatcherState,
 };
 use super::{
-    cleanup_stale_files, default_pid_path, default_socket_path, read_pid_file, write_pid_file,
+    cleanup_stale_files, default_pid_path, default_socket_path, is_accepting, read_pid_file,
+    write_pid_file,
 };
 use crate::watcher::Watcher;
 use claudear_core::error::{Error, Result};
@@ -33,6 +34,7 @@ const SHUTDOWN_INITIATED: &str = "Shutdown initiated";
 const SHUTDOWN_IN_PROGRESS: &str = "Shutdown already in progress";
 const NEW_RUNS_REFUSED: &str = "Daemon is shutting down; not starting new runs";
 const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";
+const ALREADY_LISTENING: &str = "Another claudear daemon is already listening on";
 
 /// IPC server that listens on a Unix socket.
 pub struct IpcServer {
@@ -261,12 +263,19 @@ impl IpcServer {
         self.shutdown_tx.subscribe()
     }
 
-    /// Serve IPC requests until this future is dropped; it returns only if setup fails.
+    /// Serve IPC requests until this future is dropped; it returns only if setup fails, such
+    /// as when another daemon already listens on the socket, whose files it leaves alone.
     ///
     /// A `Shutdown` request marks the server as stopping but keeps it answering, so status
     /// stays available while the daemon drains. Dropping the future removes the socket and
     /// PID files, unless another daemon has replaced them by then.
     pub async fn start(&self) -> Result<()> {
+        if is_accepting(&self.socket_path) {
+            return Err(Error::Other(format!(
+                "{ALREADY_LISTENING} {}. Stop it first with 'claudear stop'",
+                self.socket_path.display()
+            )));
+        }
         cleanup_stale_files(&self.socket_path, &self.pid_path);
 
         if self.socket_path.exists() {
@@ -2651,5 +2660,54 @@ mod tests {
             !started.socket_path.exists(),
             "the server's own socket should still be removed"
         );
+    }
+
+    #[tokio::test]
+    async fn test_start_refuses_a_socket_another_daemon_listens_on() {
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
+        let pid_path = directory.path().join("claudear.pid");
+        let _daemon = UnixListener::bind(&socket_path).unwrap();
+        let socket_inode = OwnedFiles::inode(&socket_path).unwrap();
+        let other_pid = std::process::id() + 1;
+        std::fs::write(&pid_path, other_pid.to_string()).unwrap();
+        let server = IpcServer::builder(mock_tracker(), mock_sources(), mock_notifier())
+            .socket_path(socket_path.clone())
+            .pid_path(pid_path.clone())
+            .build();
+
+        let error = tokio::time::timeout(STARTUP_TIMEOUT, server.start())
+            .await
+            .expect("start should fail instead of serving")
+            .expect_err("start should refuse a socket another daemon listens on");
+
+        assert!(
+            error.to_string().starts_with(ALREADY_LISTENING),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            OwnedFiles::inode(&socket_path).ok(),
+            Some(socket_inode),
+            "the other daemon's socket must survive"
+        );
+        assert_eq!(
+            read_pid_file(&pid_path),
+            Some(other_pid),
+            "the other daemon's PID file must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_replaces_a_socket_nobody_listens_on() {
+        let directory = short_temporary_directory();
+        drop(UnixListener::bind(directory.path().join("claudear.sock")).unwrap());
+
+        let started = start_in(directory.path()).await;
+
+        assert!(
+            started.client.ping().await.unwrap(),
+            "the server should answer on the socket it replaced"
+        );
+        abort(started.task).await;
     }
 }
