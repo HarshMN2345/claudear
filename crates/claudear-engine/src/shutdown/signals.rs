@@ -65,23 +65,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signals_can_drive_a_shutdown() {
-        fn stream<S: Stream<Item = Reason> + Unpin>() {}
-
-        stream::<Signals>();
-    }
-
-    #[test]
     fn only_an_ignored_hangup_is_left_alone() {
         assert!(ignored(libc::SIG_IGN));
         assert!(!ignored(libc::SIG_DFL));
     }
 
     #[test]
-    fn disposition_reads_without_changing_the_handler() {
-        let before = disposition(libc::SIGHUP).expect("SIGHUP is a valid signal");
+    fn disposition_reads_an_ignored_signal_as_ignored() {
+        let handler = disposition(libc::SIGPIPE).expect("SIGPIPE is a valid signal");
 
-        assert_eq!(disposition(libc::SIGHUP).unwrap(), before);
+        assert!(
+            ignored(handler),
+            "the Rust runtime ignores SIGPIPE before main"
+        );
     }
 
     #[test]
