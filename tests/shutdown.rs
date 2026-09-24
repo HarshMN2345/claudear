@@ -22,6 +22,8 @@ const TAIL_LINES: usize = 40;
 const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
 const DAEMON: &str = "daemon";
 const STOP: &str = "stop";
+const STOPPED: &str = "Daemon stopped.";
+const SOCKET_CLOSED: &str = "The daemon closed its control socket";
 
 struct Sandbox {
     root: TempDir,
@@ -122,13 +124,36 @@ impl Sandbox {
         }
     }
 
+    async fn stop(&self) {
+        let deadline = shutdown::EXIT_TIMEOUT + STOP_MARGIN;
+        let stop = timeout(deadline, self.command(STOP, &["stop"]).status())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "claudear stop did not return within {}s\n{}",
+                    deadline.as_secs(),
+                    self.diagnostics()
+                )
+            })
+            .expect("run claudear stop");
+        assert!(
+            stop.success(),
+            "claudear stop failed with {stop}\n{}",
+            self.diagnostics()
+        );
+    }
+
     async fn stop_with(&self, daemon: &mut Child, signal: libc::c_int) -> ExitStatus {
         send(daemon, signal);
+        self.wait_for_exit(daemon).await
+    }
+
+    async fn wait_for_exit(&self, daemon: &mut Child) -> ExitStatus {
         timeout(EXIT_WAIT, daemon.wait())
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "the daemon did not exit within {}s of signal {signal}\n{}",
+                    "the daemon did not exit within {}s\n{}",
                     EXIT_WAIT.as_secs(),
                     self.diagnostics()
                 )
@@ -173,6 +198,10 @@ impl Sandbox {
 
     fn output(&self, name: &str) -> PathBuf {
         self.path().join(format!("{name}.out"))
+    }
+
+    fn read(&self, name: &str) -> String {
+        fs::read_to_string(self.output(name)).unwrap_or_default()
     }
 
     fn assert_files_removed(&self) {
@@ -293,27 +322,17 @@ async fn stop_returns_once_the_daemon_has_exited() {
     let mut daemon = sandbox.start().await;
     let pid = pid_of(&daemon);
     let exited = tokio::spawn(async move { daemon.wait().await });
-    let deadline = shutdown::EXIT_TIMEOUT + STOP_MARGIN;
 
-    let stop = timeout(deadline, sandbox.command(STOP, &["stop"]).status())
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "claudear stop did not return within {}s\n{}",
-                deadline.as_secs(),
-                sandbox.diagnostics()
-            )
-        })
-        .expect("run claudear stop");
+    sandbox.stop().await;
 
-    assert!(
-        stop.success(),
-        "claudear stop failed with {stop}\n{}",
-        sandbox.diagnostics()
-    );
     assert!(
         !is_alive(pid),
         "claudear stop returned before the daemon exited\n{}",
+        sandbox.diagnostics()
+    );
+    assert!(
+        sandbox.read(STOP).contains(STOPPED),
+        "claudear stop did not report the exit\n{}",
         sandbox.diagnostics()
     );
     let status = timeout(EXIT_WAIT, exited)
@@ -321,6 +340,30 @@ async fn stop_returns_once_the_daemon_has_exited() {
         .expect("the daemon was reaped")
         .expect("the reaper task finished")
         .expect("wait for the daemon");
+    assert_exited_cleanly(status, &sandbox);
+    sandbox.assert_files_removed();
+}
+
+#[tokio::test]
+async fn stop_without_the_pid_file_reports_only_the_closed_socket() {
+    let sandbox = Sandbox::new();
+    let mut daemon = sandbox.start().await;
+    fs::remove_file(sandbox.pid_file()).expect("remove the PID file");
+
+    sandbox.stop().await;
+
+    let output = sandbox.read(STOP);
+    assert!(
+        !output.contains(STOPPED),
+        "claudear stop claimed the daemon had exited without knowing its PID\n{}",
+        sandbox.diagnostics()
+    );
+    assert!(
+        output.contains(SOCKET_CLOSED),
+        "claudear stop did not report the closed socket\n{}",
+        sandbox.diagnostics()
+    );
+    let status = sandbox.wait_for_exit(&mut daemon).await;
     assert_exited_cleanly(status, &sandbox);
     sandbox.assert_files_removed();
 }

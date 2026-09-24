@@ -2096,7 +2096,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 shutdown::EXIT_TIMEOUT.as_secs()
             );
             wait_for_exit(&client, pid).await?;
-            println!("Daemon stopped.");
+            match pid {
+                Some(_) => println!("Daemon stopped."),
+                None => println!(
+                    "The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed."
+                ),
+            }
             return Ok(());
         }
 
