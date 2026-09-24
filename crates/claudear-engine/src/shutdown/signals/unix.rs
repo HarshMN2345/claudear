@@ -1,4 +1,4 @@
-use super::Reason;
+use crate::shutdown::Reason;
 use futures::Stream;
 use std::io;
 use std::pin::Pin;
