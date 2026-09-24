@@ -57,6 +57,10 @@ const MAX_REVIEW_CYCLES: i32 = 3;
 
 const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
 
+/// How often a drain re-reads the active count, so a missed wake-up delays
+/// shutdown by at most this long.
+const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Whether a retry that failed to start should get its retry back.
 fn retry_trigger_error_is_transient(e: &claudear_core::error::Error) -> bool {
     use claudear_core::error::Error;
@@ -1254,39 +1258,47 @@ impl Watcher {
         self.slot_available.notify_waiters();
     }
 
-    /// Stop the watcher and wait for all active processing to drain.
+    /// Stop the watcher and wait up to [`DRAIN_TIMEOUT`] for in-flight runs to
+    /// finish.
     ///
-    /// This is useful for graceful shutdown scenarios where you want to ensure
-    /// all in-progress work completes before the application exits.
-    pub async fn stop_and_drain(&self) {
+    /// Returns `true` once no run is active, or `false` when the timeout
+    /// elapses first.
+    pub async fn stop_and_drain(&self) -> bool {
         self.stop();
 
-        // Wait for any active processing to complete (up to DRAIN_TIMEOUT).
-        // Uses slot_available to wake immediately when a task finishes rather
-        // than polling on a fixed interval.
-        let start = std::time::Instant::now();
+        if tokio::time::timeout(DRAIN_TIMEOUT, self.wait_until_idle())
+            .await
+            .is_ok()
+        {
+            tracing::info!("Claude Watcher stopped gracefully");
+            return true;
+        }
+        tracing::warn!(
+            remaining = self.active_count(),
+            "Graceful shutdown timeout reached, some tasks may not have completed"
+        );
+        false
+    }
 
+    /// Wait until no run holds a processing slot, waking on each release and
+    /// at least every [`DRAIN_RECHECK_INTERVAL`].
+    async fn wait_until_idle(&self) {
+        let mut reported = 0;
         loop {
             let released = self.next_slot_release();
-            if self.active_processing.load(Ordering::SeqCst) == 0 {
-                break;
+            let active = self.active_count();
+            if active == 0 {
+                return;
             }
-            if start.elapsed() > DRAIN_TIMEOUT {
-                tracing::warn!(
-                    remaining = self.active_processing.load(Ordering::SeqCst),
-                    "Graceful shutdown timeout reached, some tasks may not have completed"
+            if active != reported {
+                tracing::info!(
+                    active_count = active,
+                    "Waiting for active tasks to complete..."
                 );
-                break;
+                reported = active;
             }
-            tracing::info!(
-                active_count = self.active_processing.load(Ordering::SeqCst),
-                "Waiting for active tasks to complete..."
-            );
-            let remaining = DRAIN_TIMEOUT.saturating_sub(start.elapsed());
-            let _ = tokio::time::timeout(remaining, released).await;
+            let _ = tokio::time::timeout(DRAIN_RECHECK_INTERVAL, released).await;
         }
-
-        tracing::info!("Claude Watcher stopped gracefully");
     }
 
     /// Check if the watcher is currently running.
@@ -8328,6 +8340,31 @@ mod tests {
         assert_eq!(watcher.active_count(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_rechecks_a_release_that_sends_no_wake_up() {
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            vec![],
+            false,
+        );
+        watcher.active_processing.store(1, Ordering::SeqCst);
+
+        let release = Arc::clone(&watcher);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            release.active_processing.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        let drained = tokio::time::timeout(Duration::from_secs(5), watcher.stop_and_drain()).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "a release whose wake-up is missed must still end the drain"
+        );
+    }
+
     #[test]
     fn test_group_review_feedback_empty_events() {
         let events: Vec<claudear_integrations::scm::ReviewEvent> = vec![];
@@ -9428,6 +9465,8 @@ mod tests {
         Panic,
         /// Panics on the first question, then answers with the report.
         PanicOnce(String),
+        /// Waits at the gate, then answers with [`CUSTOMER_REPLY`].
+        Gated(Arc<Gate>),
     }
 
     /// Agent that counts every invocation, answers QA as its [`QaAnswer`]
@@ -9490,6 +9529,10 @@ mod tests {
                         panic!("first QA probe panicked");
                     }
                     Ok(report.clone())
+                }
+                QaAnswer::Gated(gate) => {
+                    gate.pass().await;
+                    Ok(CUSTOMER_REPLY.to_string())
                 }
             }
         }
@@ -10581,6 +10624,75 @@ mod tests {
             2,
             "the retried run should reach the QA agent"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_an_in_flight_qa_run() {
+        let issue = Issue::new(
+            "drain-1",
+            "DRAIN-1",
+            "How do I rotate my API key?",
+            "http://example.com/drain/1",
+            "mock",
+        );
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let gate = Arc::new(Gate::default());
+        let watcher = watcher_with_agent(
+            test_config(),
+            source.clone(),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::new(AtomicUsize::new(0)),
+                answer: QaAnswer::Gated(Arc::clone(&gate)),
+            }),
+        );
+        watcher.set_running(true);
+        let run = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move {
+                let match_result = source.matches_criteria(&issue);
+                watcher
+                    .process_issue(
+                        source,
+                        issue,
+                        match_result,
+                        None,
+                        None,
+                        Some(Intent::Question),
+                    )
+                    .await
+            }
+        });
+        gate.arrival().await;
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_running = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_running.is_err(),
+            "the drain must wait while the QA run is still in flight"
+        );
+        assert_eq!(
+            watcher.active_count(),
+            1,
+            "the QA run must hold its processing slot until it finishes"
+        );
+
+        gate.open();
+        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the QA run finishes"
+        );
+        assert!(
+            run.await.expect("the QA run should not panic"),
+            "the QA run should have been processed"
+        );
+        assert!(!gate.was_cancelled(), "draining must not cancel the QA run");
     }
 
     #[tokio::test]
@@ -11912,30 +12024,28 @@ mod tests {
         assert!(result.is_char_boundary(result.len()));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_stop_and_drain_does_not_hang_forever() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let watcher = Arc::new(create_test_watcher(notifier, tracker, vec![], false));
         watcher.is_running.store(true, Ordering::SeqCst);
-
-        // Simulate a task that never completes (active count stays > 0)
         watcher.active_processing.store(1, Ordering::SeqCst);
 
-        // stop_and_drain has a 5-minute internal timeout, but we use an outer timeout
-        // We just verify it eventually returns (the internal max_wait breaks the loop)
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), watcher.stop_and_drain())
-                .await;
-        // In test the internal max_wait is 300s which we can't wait for,
-        // so this test verifies the method was called correctly and stop was set
-        // The timeout will trigger because 300s > 10s, but that's fine
-        if result.is_err() {
-            // Timed out externally - that's expected since internal timeout is 300s
-            assert!(!watcher.is_running());
-        } else {
-            assert!(!watcher.is_running());
-        }
+        let started = tokio::time::Instant::now();
+        let drained = tokio::time::timeout(DRAIN_TIMEOUT * 2, watcher.stop_and_drain()).await;
+
+        assert_eq!(
+            drained,
+            Ok(false),
+            "a drain that runs out of time must give up and report it"
+        );
+        assert_eq!(
+            started.elapsed(),
+            DRAIN_TIMEOUT,
+            "the drain must give up exactly when its budget runs out"
+        );
+        assert!(!watcher.is_running());
     }
 
     #[tokio::test]

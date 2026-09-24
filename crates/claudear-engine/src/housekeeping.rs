@@ -183,7 +183,9 @@ impl HousekeepingWorker {
     }
 
     /// Signal the watcher to stop and wait for active tasks to drain.
-    pub async fn stop_and_drain(&self) {
-        self.watcher.stop_and_drain().await;
+    ///
+    /// Returns `false` when the drain timed out with tasks still active.
+    pub async fn stop_and_drain(&self) -> bool {
+        self.watcher.stop_and_drain().await
     }
 }
