@@ -288,8 +288,6 @@ mod tests {
         assert_eq!(client.socket_path, path);
     }
 
-    // === Constructor tests ===
-
     #[test]
     fn test_new_uses_default_path() {
         let client = IpcClient::new();
@@ -316,8 +314,6 @@ mod tests {
         assert_eq!(client.timeout, Duration::from_secs(30));
     }
 
-    // === with_timeout tests ===
-
     #[test]
     fn test_with_timeout_sets_custom_timeout() {
         let client = IpcClient::new().with_timeout(Duration::from_secs(120));
@@ -339,8 +335,6 @@ mod tests {
         assert_eq!(client.timeout, Duration::from_secs(0));
     }
 
-    // === is_daemon_running tests ===
-
     #[test]
     fn test_is_daemon_running_nonexistent_socket() {
         let client =
@@ -357,8 +351,6 @@ mod tests {
         assert!(!client.is_daemon_running());
         let _ = std::fs::remove_file(&tmp);
     }
-
-    // === send to non-existent socket tests ===
 
     #[tokio::test]
     async fn test_send_to_nonexistent_socket_returns_error() {
@@ -398,8 +390,6 @@ mod tests {
         let result = client.trigger("linear", "LIN-1").await;
         assert!(result.is_err());
     }
-
-    // === print_response tests ===
 
     use super::super::protocol::{ActivityEntry, ActivityType, WatcherState};
     use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
@@ -556,8 +546,6 @@ mod tests {
         print_response(&response);
     }
 
-    // === Coverage tests for print_response with by_source entries ===
-
     #[test]
     fn test_print_response_stats_with_by_source() {
         use claudear_core::types::SourceStats;
@@ -599,8 +587,6 @@ mod tests {
         print_response(&response);
     }
 
-    // === Coverage: state with no poll_interval and no processing ===
-
     #[test]
     fn test_print_response_state_no_poll_no_processing() {
         let state = WatcherState {
@@ -617,8 +603,6 @@ mod tests {
         let response = IpcResponse::Ok(IpcData::State(state));
         print_response(&response);
     }
-
-    // === Coverage: convenience methods that delegate to send ===
 
     #[tokio::test]
     async fn test_pause_nonexistent_socket_returns_error() {
