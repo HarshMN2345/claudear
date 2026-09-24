@@ -110,12 +110,36 @@
           <li><code>--port</code> &mdash; sets the dashboard and webhook listen port</li>
           <li><code>--no-webhooks</code> &mdash; disables the webhook server</li>
           <li><code>--no-dashboard</code> &mdash; disables the web dashboard</li>
+          <li><code>--foreground</code> &mdash; runs in the foreground instead of daemonizing (use it under launchd, systemd, or Docker)</li>
         </ul>
         <p>Control a running daemon with:</p>
         <pre><code class="language-bash">claudear status     # check if the daemon is running
 claudear pause      # pause issue processing
 claudear resume     # resume issue processing
-claudear stop       # gracefully shut down</code></pre>
+claudear stop       # stop after in-flight runs finish (up to 30s)</code></pre>
+
+        <h2 id="graceful-shutdown"><a class="anchor-link" href="#graceful-shutdown" aria-label="Link to Graceful shutdown">#</a>Graceful shutdown</h2>
+        <p><code>claudear start</code>, <code>claudear poll</code>, <code>claudear webhook</code>, and <code>claudear dry-run</code> shut down the same way on SIGTERM, SIGINT, or SIGHUP. SIGHUP counts only if it was not already ignored when Claudear started, so a Claudear started under <code>nohup</code> keeps running when its terminal closes. <code>claudear stop</code> works only for a daemon started with <code>claudear start</code>; stop the other commands with a signal. Claudear then:</p>
+        <ol>
+          <li>Stops taking new work:
+            <ul>
+              <li>polling and background housekeeping start no new runs</li>
+              <li>issue webhooks are answered with <code>503 Service Unavailable</code> and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)</li>
+              <li>IPC <code>Trigger</code> and <code>ProcessRetries</code> commands are refused</li>
+            </ul>
+          </li>
+          <li>Waits up to 30 seconds for in-flight runs to finish.</li>
+          <li>Exits, even if some runs are still going, in which case it logs <code>Exiting with runs still in flight after 30s</code>. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends.</li>
+        </ol>
+        <p>While it drains, <code>claudear status</code> reports <code>Running: false</code>. <code>claudear stop</code> waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints <code>Daemon stopped.</code> and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. A signal that reaches Claudear during the drain, including after <code>claudear stop</code>, forces an immediate exit.</p>
+        <p>Exit codes:</p>
+        <ul>
+          <li><code>0</code> &mdash; graceful shutdown, including when the drain runs out of time</li>
+          <li><code>130</code> &mdash; a signal during the drain forced the exit</li>
+          <li><code>1</code> &mdash; a service failed, which started the shutdown</li>
+        </ul>
+        <p>In a terminal, Ctrl+C also interrupts the agent CLIs that Claudear started. To let in-flight runs finish, send SIGTERM instead, or run <code>claudear stop</code> for a daemon started with <code>claudear start</code>.</p>
+        <p>Under launchd, systemd, or Docker, run <code>claudear start --foreground</code> so the manager keeps track of the process, and give Claudear 45 seconds to stop before it is sent SIGKILL: that covers the 30-second drain, up to 5 seconds for blocking work to stop, and a margin. The examples below are set up this way.</p>
 
         <h2 id="macos-launchd"><a class="anchor-link" href="#macos-launchd" aria-label="Link to macOS (launchd)">#</a>macOS (launchd)</h2>
         <p>Create a plist at <code>~/Library/LaunchAgents/com.claudear.daemon.plist</code>:</p>
@@ -133,6 +157,7 @@ claudear stop       # gracefully shut down</code></pre>
     &lt;string&gt;--poll&lt;/string&gt;
     &lt;string&gt;--port&lt;/string&gt;
     &lt;string&gt;3100&lt;/string&gt;
+    &lt;string&gt;--foreground&lt;/string&gt;
   &lt;/array&gt;
   &lt;key&gt;WorkingDirectory&lt;/key&gt;
   &lt;string&gt;/path/to/your/project&lt;/string&gt;
@@ -149,11 +174,14 @@ claudear stop       # gracefully shut down</code></pre>
   &lt;string&gt;/tmp/claudear.err.log&lt;/string&gt;
   &lt;key&gt;KeepAlive&lt;/key&gt;
   &lt;true/&gt;
+  &lt;key&gt;ExitTimeOut&lt;/key&gt;
+  &lt;integer&gt;45&lt;/integer&gt;
 &lt;/dict&gt;
 &lt;/plist&gt;</code></pre>
         <p>Load and start the service:</p>
         <pre><code class="language-bash">launchctl load ~/Library/LaunchAgents/com.claudear.daemon.plist
 launchctl start com.claudear.daemon</code></pre>
+        <p><code>ExitTimeOut</code> is how long launchd waits after SIGTERM before it sends SIGKILL. <code>KeepAlive</code> restarts Claudear whenever it exits, so stop it with <code>launchctl unload ~/Library/LaunchAgents/com.claudear.daemon.plist</code> rather than <code>claudear stop</code>.</p>
 
         <h2 id="linux-systemd"><a class="anchor-link" href="#linux-systemd" aria-label="Link to Linux (systemd)">#</a>Linux (systemd)</h2>
         <p>Create a unit file at <code>/etc/systemd/system/claudear.service</code>:</p>
@@ -165,7 +193,9 @@ After=network.target
 Type=simple
 WorkingDirectory=/path/to/your/project
 EnvironmentFile=/etc/claudear/env
-ExecStart=/usr/local/bin/claudear start --poll --port 3100
+ExecStart=/usr/local/bin/claudear start --poll --port 3100 --foreground
+KillMode=mixed
+TimeoutStopSec=45
 Restart=on-failure
 RestartSec=5
 
@@ -179,23 +209,30 @@ CLAUDEAR_LINEAR_API_KEY=lin_api_...</code></pre>
 sudo systemctl enable claudear
 sudo systemctl start claudear
 sudo journalctl -u claudear -f   # follow logs</code></pre>
+        <p><code>KillMode=mixed</code> sends SIGTERM to Claudear only, so the agent CLIs it started keep running while it drains; systemd kills any that are left once Claudear exits. <code>TimeoutStopSec=45</code> is how long systemd waits for Claudear to exit before it sends SIGKILL.</p>
 
         <h2 id="docker"><a class="anchor-link" href="#docker" aria-label="Link to Docker">#</a>Docker</h2>
+        <p>The image runs Claudear under <a href="https://github.com/krallin/tini">tini</a>, which forwards signals to it and reaps orphaned processes. Its default command is <code>claudear start --foreground</code>, which serves webhooks and the dashboard on port 3100.</p>
 
         <h3 id="compose">Compose (recommended)</h3>
         <p>If your project includes a <code>docker-compose.yml</code>, this is the simplest path:</p>
         <pre><code class="language-bash">docker compose up -d
-docker compose logs -f claudear
+docker compose logs -f app
 docker compose down</code></pre>
 
         <h3 id="standalone">Standalone</h3>
         <p>Run the container directly:</p>
         <pre><code class="language-bash">docker run -d --name claudear \
+  --stop-timeout 45 \
   -v $(pwd)/claudear.toml:/app/claudear.toml:ro \
   -v claudear-data:/app/data \
   -p 3100:3100 \
-  ghcr.io/abnegate/claudear:latest start --poll --port 3100</code></pre>
+  ghcr.io/abnegate/claudear:latest claudear start --foreground --poll --port 3100</code></pre>
         <p>Health check: <code>GET /api/health</code> returns 200 when Claudear is up.</p>
+
+        <h3 id="stopping-the-container">Stopping the container</h3>
+        <p><code>docker stop</code> sends SIGTERM, which tini forwards to Claudear, so it shuts down gracefully. Docker kills the container if it is still running when the stop timeout runs out, and the default timeout is shorter than the drain: Claudear&rsquo;s <code>docker-compose.yml</code> sets <code>stop_grace_period: 45s</code>, and the standalone example passes <code>--stop-timeout 45</code>. For a container started without either, use <code>docker stop -t 45</code>.</p>
+        <p>Stop the container with <code>docker stop</code> (or <code>docker compose stop</code>) rather than running <code>claudear stop</code> inside it: the container ends as soon as Claudear exits, and a restart policy such as <code>unless-stopped</code> starts it again unless Docker itself stopped it.</p>
 
         <h2 id="environment-variables"><a class="anchor-link" href="#environment-variables" aria-label="Link to Environment variables">#</a>Environment variables</h2>
         <p>You can override any secret in <code>claudear.toml</code> with an environment variable. This is the recommended approach for production so secrets stay out of config files.</p>
@@ -344,11 +381,13 @@ docker compose down</code></pre>
         <ul class="toc-list">
         <li class="toc-item" data-toc-text="deployment checklist"><a class="toc-link" data-toc-link href="#deployment-checklist" data-target-id="deployment-checklist"><span class="toc-link-label">Deployment checklist</span></a></li>
         <li class="toc-item" data-toc-text="background daemon"><a class="toc-link" data-toc-link href="#background-daemon" data-target-id="background-daemon"><span class="toc-link-label">Background daemon</span></a></li>
+        <li class="toc-item" data-toc-text="graceful shutdown"><a class="toc-link" data-toc-link href="#graceful-shutdown" data-target-id="graceful-shutdown"><span class="toc-link-label">Graceful shutdown</span></a></li>
         <li class="toc-item" data-toc-text="macos (launchd)"><a class="toc-link" data-toc-link href="#macos-launchd" data-target-id="macos-launchd"><span class="toc-link-label">macOS (launchd)</span></a></li>
         <li class="toc-item" data-toc-text="linux (systemd)"><a class="toc-link" data-toc-link href="#linux-systemd" data-target-id="linux-systemd"><span class="toc-link-label">Linux (systemd)</span></a></li>
         <li class="toc-item" data-toc-text="docker"><a class="toc-link" data-toc-link href="#docker" data-target-id="docker"><span class="toc-link-label">Docker</span></a></li>
         <li class="toc-item" data-toc-text="compose (recommended)"><a class="toc-link toc-link-sub" data-toc-link href="#compose" data-target-id="compose"><span class="toc-link-label">Compose (recommended)</span></a></li>
         <li class="toc-item" data-toc-text="standalone"><a class="toc-link toc-link-sub" data-toc-link href="#standalone" data-target-id="standalone"><span class="toc-link-label">Standalone</span></a></li>
+        <li class="toc-item" data-toc-text="stopping the container"><a class="toc-link toc-link-sub" data-toc-link href="#stopping-the-container" data-target-id="stopping-the-container"><span class="toc-link-label">Stopping the container</span></a></li>
         <li class="toc-item" data-toc-text="environment variables"><a class="toc-link" data-toc-link href="#environment-variables" data-target-id="environment-variables"><span class="toc-link-label">Environment variables</span></a></li>
         <li class="toc-item" data-toc-text="tips for production"><a class="toc-link" data-toc-link href="#tips-for-production" data-target-id="tips-for-production"><span class="toc-link-label">Tips for production</span></a></li>
         </ul>

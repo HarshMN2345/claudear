@@ -29,6 +29,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
   - [Daemon Mode](#daemon-mode)
   - [Polling Mode](#polling-mode-foreground)
   - [Webhook Mode](#webhook-mode)
+  - [Graceful Shutdown](#graceful-shutdown)
   - [Manual Triggers](#manual-triggers)
   - [PR Management](#pr-management)
   - [Retry Management](#retry-management)
@@ -222,6 +223,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Runs as a background service with full IPC control
 - `start` / `stop` / `pause` / `resume` / `status` / `activity` commands
 - Unix socket communication with configurable timeout
+- Graceful shutdown: stops taking new work and gives in-flight runs up to 30 seconds to finish
 
 ### Security
 - API security headers (HSTS, X-Content-Type-Options, X-Frame-Options)
@@ -496,13 +498,16 @@ claudear start --poll --poll-interval 60000
 # Start without webhooks or dashboard
 claudear start --poll --no-webhooks --no-dashboard
 
+# Stay in the foreground (for systemd, launchd, or Docker)
+claudear start --poll --foreground
+
 # Control the daemon
 claudear status              # Check daemon health
 claudear pause               # Stop picking up new issues
 claudear resume              # Resume processing
 claudear activity            # View recent activity
 claudear activity 50         # Show last 50 entries
-claudear stop                # Stop the daemon
+claudear stop                # Stop after in-flight runs finish (up to 30s)
 ```
 
 ### Polling Mode (Foreground)
@@ -535,6 +540,27 @@ The `--setup` flag:
 2. Creates webhooks pointing to your server
 3. Retrieves signing secrets and writes them to your `.env` file
 4. Starts the webhook server with verification enabled
+
+### Graceful Shutdown
+
+`claudear start`, `claudear poll`, `claudear webhook`, and `claudear dry-run` shut down the same way on SIGTERM, SIGINT, or SIGHUP. SIGHUP counts only if it was not already ignored when Claudear started, so a Claudear started under `nohup` keeps running when its terminal closes. `claudear stop` works only for a daemon started with `claudear start`; stop the other commands with a signal. Claudear then:
+
+1. Stops taking new work:
+   - polling and background housekeeping start no new runs
+   - issue webhooks are answered with `503 Service Unavailable` and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)
+   - IPC `Trigger` and `ProcessRetries` commands are refused
+2. Waits up to 30 seconds for in-flight runs to finish.
+3. Exits, even if some runs are still going, in which case it logs `Exiting with runs still in flight after 30s`. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends.
+
+While it drains, `claudear status` reports `Running: false`. `claudear stop` waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints `Daemon stopped.` and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. A signal that reaches Claudear during the drain, including after `claudear stop`, forces an immediate exit.
+
+Exit codes:
+
+- `0`: graceful shutdown, including when the drain runs out of time
+- `130`: a signal during the drain forced the exit
+- `1`: a service failed, which started the shutdown
+
+In a terminal, Ctrl+C also interrupts the agent CLIs that Claudear started. To let in-flight runs finish, send SIGTERM instead, or run `claudear stop` for a daemon started with `claudear start`.
 
 ### Manual Triggers
 
@@ -997,6 +1023,8 @@ use_agent = false
 
 ## Running as a Service
 
+Service managers need `claudear start --foreground`: without it, `start` forks into the background and the manager loses track of the daemon. Give Claudear 45 seconds to stop before the manager sends SIGKILL: that covers the 30-second drain (see [Graceful Shutdown](#graceful-shutdown)), up to 5 seconds for blocking work to stop, and a margin.
+
 ### macOS (launchd)
 
 Create `~/Library/LaunchAgents/com.claudear.plist`:
@@ -1013,11 +1041,14 @@ Create `~/Library/LaunchAgents/com.claudear.plist`:
         <string>/usr/local/bin/claudear</string>
         <string>start</string>
         <string>--poll</string>
+        <string>--foreground</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>45</integer>
     <key>StandardOutPath</key>
     <string>/tmp/claudear.log</string>
     <key>StandardErrorPath</key>
@@ -1029,6 +1060,8 @@ Create `~/Library/LaunchAgents/com.claudear.plist`:
 ```bash
 launchctl load ~/Library/LaunchAgents/com.claudear.plist
 ```
+
+`ExitTimeOut` is how long launchd waits after SIGTERM before it sends SIGKILL. `KeepAlive` restarts Claudear whenever it exits, so stop it with `launchctl unload ~/Library/LaunchAgents/com.claudear.plist` rather than `claudear stop`.
 
 ### Linux (systemd)
 
@@ -1042,7 +1075,9 @@ After=network.target
 [Service]
 Type=simple
 User=YOUR_USER
-ExecStart=/usr/local/bin/claudear start --poll
+ExecStart=/usr/local/bin/claudear start --poll --foreground
+KillMode=mixed
+TimeoutStopSec=45
 Restart=on-failure
 RestartSec=10
 
@@ -1054,6 +1089,8 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now claudear
 ```
+
+`KillMode=mixed` sends SIGTERM to Claudear only, so the agent CLIs it started keep running while it drains; systemd kills any that are left once Claudear exits. `TimeoutStopSec=45` is how long systemd waits for Claudear to exit before it sends SIGKILL.
 
 ---
 
@@ -1081,6 +1118,7 @@ docker build -t claudear .
 # Run with config file
 docker run -d \
   -p 3100:3100 \
+  --stop-timeout 45 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/workspace \
   -v claudear-data:/app/data \
@@ -1089,19 +1127,28 @@ docker run -d \
 # Or with environment variable overrides
 docker run -d \
   -p 3100:3100 \
+  --stop-timeout 45 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/workspace \
   -v claudear-data:/app/data \
-  -e LINEAR_API_KEY=your-key \
-  -e GITHUB_TOKEN=your-token \
+  -e CLAUDEAR_LINEAR_API_KEY=your-key \
+  -e CLAUDEAR_GITHUB_TOKEN=your-token \
   claudear
 ```
+
+### Stopping
+
+`docker stop` sends SIGTERM, which tini forwards to Claudear, so it shuts down gracefully (see [Graceful Shutdown](#graceful-shutdown)). Docker kills the container if it is still running when the stop timeout runs out, and the default timeout is shorter than the drain: `docker-compose.yml` sets `stop_grace_period: 45s`, and the standalone examples pass `--stop-timeout 45`. For a container started without either, use `docker stop -t 45`.
+
+Stop the container with `docker stop` (or `docker compose stop`) rather than running `claudear stop` inside it: the container ends as soon as Claudear exits, and a restart policy such as the compose file's `unless-stopped` starts it again unless Docker itself stopped it.
 
 ### Docker Details
 
 The Docker image:
 - Multi-stage build (Bun for dashboard, Rust for binary, Debian slim runtime)
-- Includes Claude Code (installed via npm), git, and Node.js
+- Includes Claude Code, git, and the GitHub CLI
+- Runs Claudear under [tini](https://github.com/krallin/tini), which forwards signals and reaps orphaned processes
+- Runs `claudear start --foreground` by default (webhooks and dashboard on port 3100); pass a command after the image name (or set `command:` in `docker-compose.yml`) to change it, e.g. `claudear start --foreground --poll`
 - Embeds the dashboard UI in the binary
 - Persists embedding model cache between restarts
 - Supports both `ANTHROPIC_API_KEY` and OAuth login for Claude authentication
