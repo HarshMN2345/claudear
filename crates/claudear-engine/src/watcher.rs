@@ -57,7 +57,7 @@ const MAX_REVIEW_CYCLES: i32 = 3;
 
 const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
 
-/// How often a drain re-reads the active count, so a missed wake-up delays
+/// How often a drain re-reads the in-flight count, so a missed wake-up delays
 /// shutdown by at most this long.
 const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -235,9 +235,10 @@ impl Drop for DeployQaTipClaim {
     }
 }
 
-/// An issue's hold on its processing key and concurrency slot, released on
-/// drop so a run that panics or is aborted frees them instead of refusing the
-/// issue as in-flight and consuming the slot until restart.
+/// An issue's hold on its processing key, its concurrency slot and the
+/// shutdown drain, released on drop so a run that panics or is aborted frees
+/// them instead of refusing the issue as in-flight, consuming the slot until
+/// restart and stalling shutdown.
 struct ProcessingClaim<'a> {
     watcher: &'a Watcher,
     key: String,
@@ -249,24 +250,25 @@ impl Drop for ProcessingClaim<'_> {
         self.watcher
             .active_processing
             .fetch_sub(1, Ordering::SeqCst);
+        self.watcher.in_flight.fetch_sub(1, Ordering::SeqCst);
         self.watcher.slot_available.notify_waiters();
     }
 }
 
-/// A housekeeping run's hold on the shutdown drain, released on drop.
+/// A housekeeping run's hold on the shutdown drain, released on drop. It takes
+/// no processing slot, so [`Watcher::active_count`] leaves it out.
 ///
-/// Take it before checking [`Watcher::is_running`]: [`Watcher::stop`] clears
-/// `is_running` before the drain reads the active count, so either the check
-/// sees the stop or the drain sees the claim.
+/// Take it before checking whether the watcher stopped: [`Watcher::stop`]
+/// sets `stopped` and clears `is_running` before the drain reads
+/// [`Watcher::in_flight`], so either the check sees the stop or the drain sees
+/// the claim.
 struct RunClaim<'a> {
     watcher: &'a Watcher,
 }
 
 impl Drop for RunClaim<'_> {
     fn drop(&mut self) {
-        self.watcher
-            .active_processing
-            .fetch_sub(1, Ordering::SeqCst);
+        self.watcher.in_flight.fetch_sub(1, Ordering::SeqCst);
         self.watcher.slot_available.notify_waiters();
     }
 }
@@ -335,6 +337,9 @@ pub struct Watcher {
     /// [`ProcessingClaim`], whose `Drop` needs a synchronous lock.
     processing: Mutex<ProcessingState>,
     active_processing: AtomicUsize,
+    /// Runs the shutdown drain waits for, one per [`ProcessingClaim`] and
+    /// [`RunClaim`].
+    in_flight: AtomicUsize,
     /// Feedback analyzer for learning from past outcomes
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     /// Last seen release tag per upstream repo (for release-triggered cascades).
@@ -440,6 +445,7 @@ impl Watcher {
             stopped: AtomicBool::new(false),
             processing: Mutex::new(ProcessingState::new()),
             active_processing: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             last_seen_releases: RwLock::new(HashMap::new()),
             rate_limit_pause_until: RwLock::new(HashMap::new()),
@@ -1289,7 +1295,7 @@ impl Watcher {
             return;
         }
         tracing::info!(
-            active_count = self.active_processing.load(Ordering::SeqCst),
+            in_flight = self.in_flight(),
             "Stopping Claude Watcher, waiting for active tasks to complete..."
         );
         // Wake any tasks blocked on slot_available so they re-check is_running and exit.
@@ -1299,8 +1305,8 @@ impl Watcher {
     /// Stop the watcher and wait up to [`DRAIN_TIMEOUT`] for in-flight runs to
     /// finish.
     ///
-    /// Returns `true` once no run is active, or `false` when the timeout
-    /// elapses first.
+    /// Returns `true` once no run is [in flight](Self::in_flight), or `false`
+    /// when the timeout elapses first.
     pub async fn stop_and_drain(&self) -> bool {
         self.stop();
 
@@ -1312,28 +1318,25 @@ impl Watcher {
             return true;
         }
         tracing::warn!(
-            remaining = self.active_count(),
+            remaining = self.in_flight(),
             "Graceful shutdown timeout reached, some tasks may not have completed"
         );
         false
     }
 
-    /// Wait until no run holds a processing slot, waking on each release and
-    /// at least every [`DRAIN_RECHECK_INTERVAL`].
+    /// Wait until no run is in flight, waking on each release and at least
+    /// every [`DRAIN_RECHECK_INTERVAL`].
     async fn wait_until_idle(&self) {
         let mut reported = 0;
         loop {
             let released = self.next_slot_release();
-            let active = self.active_count();
-            if active == 0 {
+            let in_flight = self.in_flight();
+            if in_flight == 0 {
                 return;
             }
-            if active != reported {
-                tracing::info!(
-                    active_count = active,
-                    "Waiting for active tasks to complete..."
-                );
-                reported = active;
+            if in_flight != reported {
+                tracing::info!(in_flight, "Waiting for active tasks to complete...");
+                reported = in_flight;
             }
             let _ = tokio::time::timeout(DRAIN_RECHECK_INTERVAL, released).await;
         }
@@ -1344,9 +1347,16 @@ impl Watcher {
         self.is_running.load(Ordering::SeqCst)
     }
 
-    /// Get the count of currently active processing tasks.
+    /// Number of issues being processed, the `active_processing` metric.
     pub fn active_count(&self) -> usize {
         self.active_processing.load(Ordering::SeqCst)
+    }
+
+    /// Number of holds [`Self::stop_and_drain`] waits for: one per issue being
+    /// processed, and one per housekeeping retry, review run, merge follow-up
+    /// or release cascade in progress.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     /// Check if the watcher is in dry-run mode.
@@ -3807,11 +3817,12 @@ Create a PR with your changes.{custom_instructions}"#,
             return None;
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
         Some(ProcessingClaim { watcher: self, key })
     }
 
     fn claim_run(&self) -> RunClaim<'_> {
-        self.active_processing.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
         RunClaim { watcher: self }
     }
 
@@ -7759,9 +7770,9 @@ mod tests {
             "the drain must wait while the merged fix's reply is in flight"
         );
         assert_eq!(
-            watcher.active_count(),
+            watcher.in_flight(),
             1,
-            "the merge follow-up must count as an active run"
+            "the merge follow-up must count as a run in flight"
         );
 
         gate.open();
@@ -7814,9 +7825,9 @@ mod tests {
             "the drain must wait while the review run is still in flight"
         );
         assert_eq!(
-            watcher.active_count(),
+            watcher.in_flight(),
             1,
-            "the review run must count as an active run"
+            "the review run must count as a run in flight"
         );
 
         source.gate.open();
@@ -7886,9 +7897,9 @@ mod tests {
             "the drain must wait while the retry is still in flight"
         );
         assert_eq!(
-            watcher.active_count(),
+            watcher.in_flight(),
             1,
-            "the retry must count as an active run"
+            "the retry must count as a run in flight"
         );
 
         source.gate.open();
@@ -8221,9 +8232,9 @@ mod tests {
             "the drain must wait while the release cascade is still in flight"
         );
         assert_eq!(
-            harness.watcher.active_count(),
+            harness.watcher.in_flight(),
             1,
-            "the release cascade must count as an active run"
+            "the release cascade must count as a run in flight"
         );
 
         gate.open();
@@ -9444,13 +9455,13 @@ mod tests {
 
         let watcher = Arc::new(create_test_watcher(notifier, tracker, sources, false));
         watcher.is_running.store(true, Ordering::SeqCst);
-        watcher.active_processing.fetch_add(1, Ordering::SeqCst);
+        watcher.in_flight.fetch_add(1, Ordering::SeqCst);
 
         // Simulate task finishing after a short delay
         let release = Arc::clone(&watcher);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            release.active_processing.fetch_sub(1, Ordering::SeqCst);
+            release.in_flight.fetch_sub(1, Ordering::SeqCst);
             release.slot_available.notify_waiters();
         });
 
@@ -9458,7 +9469,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), watcher.stop_and_drain()).await;
         assert!(result.is_ok(), "stop_and_drain timed out");
         assert!(!watcher.is_running());
-        assert_eq!(watcher.active_count(), 0);
+        assert_eq!(watcher.in_flight(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -9469,12 +9480,12 @@ mod tests {
             vec![],
             false,
         );
-        watcher.active_processing.store(1, Ordering::SeqCst);
+        watcher.in_flight.store(1, Ordering::SeqCst);
 
         let release = Arc::clone(&watcher);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            release.active_processing.fetch_sub(1, Ordering::SeqCst);
+            release.in_flight.fetch_sub(1, Ordering::SeqCst);
         });
 
         let drained = tokio::time::timeout(Duration::from_secs(5), watcher.stop_and_drain()).await;
@@ -9483,6 +9494,44 @@ mod tests {
             drained,
             Ok(true),
             "a release whose wake-up is missed must still end the drain"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_housekeeping_run_holds_the_drain_without_counting_as_active_processing() {
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            Arc::new(SqliteTracker::in_memory().unwrap()),
+            vec![],
+            false,
+        );
+        let claim = watcher.claim_run();
+
+        assert_eq!(
+            watcher.active_count(),
+            0,
+            "a housekeeping run processes no issue, so it must not count as active processing"
+        );
+        assert_eq!(
+            watcher.in_flight(),
+            1,
+            "a housekeeping run must count as a run in flight"
+        );
+
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_claimed = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 3, drain.as_mut()).await;
+
+        assert!(
+            while_claimed.is_err(),
+            "the drain must wait for the housekeeping run"
+        );
+
+        drop(claim);
+
+        assert!(
+            drain.await,
+            "the drain must end once the housekeeping run finishes"
         );
     }
 
@@ -11729,6 +11778,11 @@ mod tests {
             0,
             "a run that panicked must give back its processing slot"
         );
+        assert_eq!(
+            watcher.in_flight(),
+            0,
+            "a run that panicked must not hold the shutdown drain"
+        );
         assert!(
             slot_freed.now_or_never().is_some(),
             "a run that panicked must wake tasks waiting for a free slot"
@@ -11932,6 +11986,53 @@ mod tests {
             harness.stored_status(),
             DeployQaTipStatus::Pending,
             "a tip loaded after the stop must stay pending for the next start"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_processing_its_issue_counts_once_as_active_processing() {
+        let gate = Arc::new(Gate::default());
+        let mut config = test_config();
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        let harness = DeployQaHarness::answering(config, QaAnswer::Gated(Arc::clone(&gate)));
+        harness
+            .tracker
+            .record_attempt(DEPLOY_QA_SOURCE, &harness.tip.issue_id, &harness.tip.tag)
+            .unwrap();
+        harness
+            .tracker
+            .mark_failed(DEPLOY_QA_SOURCE, &harness.tip.issue_id, "initial failure")
+            .unwrap();
+        harness.watcher.set_running(true);
+        let mut retries = tokio::spawn({
+            let watcher = Arc::clone(&harness.watcher);
+            async move { watcher.process_ready_retries().await }
+        });
+        gate.arrival_during(&mut retries).await;
+
+        assert_eq!(
+            harness.watcher.active_count(),
+            1,
+            "a retry processing its issue must count once as active processing"
+        );
+        assert_eq!(
+            harness.watcher.in_flight(),
+            2,
+            "the drain must wait for both the retry and the issue it processes"
+        );
+
+        gate.open();
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            harness.agent_calls(),
+            1,
+            "the retry should reach the QA agent"
         );
     }
 
@@ -13246,7 +13347,7 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let watcher = Arc::new(create_test_watcher(notifier, tracker, vec![], false));
         watcher.is_running.store(true, Ordering::SeqCst);
-        watcher.active_processing.store(1, Ordering::SeqCst);
+        watcher.in_flight.store(1, Ordering::SeqCst);
 
         let started = tokio::time::Instant::now();
         let drained = tokio::time::timeout(DRAIN_TIMEOUT * 2, watcher.stop_and_drain()).await;
