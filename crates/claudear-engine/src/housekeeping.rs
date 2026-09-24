@@ -33,20 +33,22 @@ impl HousekeepingWorker {
     /// 2. Mark the watcher as running, or return if it was stopped meanwhile.
     /// 3. On every tick: retries, cascades, auto-close, reviews, metrics,
     ///    periodic learning and report-gen
+    ///
+    /// Only warm start can fail: the loop logs its failures and carries on.
     pub async fn start(&self) -> anyhow::Result<()> {
         self.watcher.warm_start().await?;
-        if !self.watcher.mark_running() {
-            return Ok(());
+        if self.watcher.mark_running() {
+            self.run_loop().await;
         }
-
-        self.run_loop().await
+        Ok(())
     }
 
-    /// Run the housekeeping tick loop without warm-starting.
+    /// Run the housekeeping tick loop without warm-starting, until the watcher
+    /// is stopped.
     ///
     /// Assumes the watcher has already been warm-started and marked as running.
     /// Used by [`Watcher::start`] which handles warm-start itself.
-    pub async fn run_loop(&self) -> anyhow::Result<()> {
+    pub async fn run_loop(&self) {
         let mut timer = interval(Duration::from_millis(self.interval_ms));
         timer.tick().await; // skip immediate first tick
 
@@ -173,19 +175,5 @@ impl HousekeepingWorker {
                 self.interval_ms,
             );
         }
-
-        Ok(())
-    }
-
-    /// Signal the watcher to stop.
-    pub fn stop(&self) {
-        self.watcher.stop();
-    }
-
-    /// Signal the watcher to stop and wait for active tasks to drain.
-    ///
-    /// Returns `false` when the drain timed out with tasks still active.
-    pub async fn stop_and_drain(&self) -> bool {
-        self.watcher.stop_and_drain().await
     }
 }

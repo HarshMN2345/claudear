@@ -1073,7 +1073,8 @@ impl Watcher {
         Ok(())
     }
 
-    /// Set the running state of the watcher.
+    /// Set the running state of the watcher, even after [`Self::stop`].
+    #[cfg(test)]
     pub fn set_running(&self, running: bool) {
         self.is_running.store(running, Ordering::SeqCst);
     }
@@ -1100,8 +1101,9 @@ impl Watcher {
     /// Start the watcher with polling.
     ///
     /// Returns once both the polling and housekeeping loops have stopped, so a
-    /// housekeeping cycle still running at [`Self::stop`] finishes first. If
-    /// either loop fails, the watcher stops and the first error is returned.
+    /// housekeeping cycle still running at [`Self::stop`] finishes first. The
+    /// loops log their failures and carry on, so only warm start and the
+    /// initial poll can fail.
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
@@ -1202,28 +1204,16 @@ impl Watcher {
         self.poll().await?;
 
         let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(self), poll_interval);
-        let (polling, housekeeping) = tokio::join!(
-            async {
-                self.run_source_poll_loop(poll_interval)
-                    .await
-                    .inspect_err(|_| self.stop())
-            },
-            async {
-                worker
-                    .run_loop()
-                    .await
-                    .map_err(|e| claudear_core::error::Error::Config(e.to_string()))
-                    .inspect_err(|_| self.stop())
-            },
-        );
-        polling.and(housekeeping)
+        tokio::join!(self.run_source_poll_loop(poll_interval), worker.run_loop());
+        Ok(())
     }
 
-    /// Run the source polling loop.
+    /// Run the source polling loop until the watcher stops.
     ///
-    /// Polls each source at its configured interval. Housekeeping is handled
-    /// separately by [`HousekeepingWorker`].
-    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) -> Result<()> {
+    /// Polls each source at its configured interval, logging failed polls.
+    /// Housekeeping is handled separately by
+    /// [`HousekeepingWorker`](crate::housekeeping::HousekeepingWorker).
+    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) {
         // Build per-source timer state: (source index, interval_ms, last_poll)
         let now = std::time::Instant::now();
         let mut source_timers: Vec<(usize, u64, std::time::Instant)> = self
@@ -1278,8 +1268,6 @@ impl Watcher {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Stop the watcher for good.
@@ -7100,7 +7088,7 @@ mod tests {
         );
         let worker = crate::housekeeping::HousekeepingWorker::new(Arc::clone(&watcher), 50);
 
-        worker.stop();
+        watcher.stop();
         let started = tokio::time::timeout(Duration::from_secs(5), worker.start()).await;
 
         assert!(
