@@ -1838,7 +1838,7 @@ impl Daemon<'_> {
                 return Err(ForcedShutdown.into());
             }
             Outcome::TimedOut => tracing::warn!(
-                watcher_runs = self.watcher.active_count(),
+                watcher_runs = self.watcher.in_flight(),
                 webhook_runs = self.webhook_runs(),
                 "Exiting with runs still in flight after {}s",
                 shutdown::DRAIN_TIMEOUT.as_secs()
@@ -1860,7 +1860,7 @@ impl Daemon<'_> {
             monitor.abort();
         }
         tracing::warn!(
-            watcher_runs = self.watcher.active_count(),
+            watcher_runs = self.watcher.in_flight(),
             webhook_runs = self.webhook_runs(),
             "Stopped taking new work, waiting for the runs in flight"
         );
