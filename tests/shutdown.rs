@@ -3,6 +3,7 @@
 use claudear::ipc::{IpcClient, IpcData, IpcResponse};
 use claudear::shutdown;
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -14,7 +15,9 @@ use tokio::time::{sleep, timeout, Instant};
 const STARTUP_WAIT: Duration = Duration::from_secs(40);
 const STOP_MARGIN: Duration = Duration::from_secs(4);
 const EXIT_WAIT: Duration = Duration::from_secs(20);
+const HANGUP_WAIT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(3600);
 const TAIL_LINES: usize = 40;
 const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
 const DAEMON: &str = "daemon";
@@ -61,22 +64,38 @@ impl Sandbox {
         command
     }
 
+    fn daemon(&self) -> Command {
+        let poll_interval = DAEMON_POLL_INTERVAL.as_millis().to_string();
+        self.command(
+            DAEMON,
+            &[
+                "start",
+                "--foreground",
+                "--poll",
+                "--poll-interval",
+                &poll_interval,
+                "--no-webhooks",
+                "--no-dashboard",
+            ],
+        )
+    }
+
     async fn start(&self) -> Child {
-        let mut daemon = self
-            .command(
-                DAEMON,
-                &[
-                    "start",
-                    "--foreground",
-                    "--poll",
-                    "--poll-interval",
-                    "3600000",
-                    "--no-webhooks",
-                    "--no-dashboard",
-                ],
-            )
-            .spawn()
-            .expect("spawn the daemon");
+        self.launch(self.daemon()).await
+    }
+
+    /// Starts the daemon with `disposition` for SIGHUP, which it inherits like the SIG_IGN that
+    /// `nohup` sets.
+    async fn start_with_hangup(&self, disposition: libc::sighandler_t) -> Child {
+        let mut command = self.daemon();
+        // SAFETY: the hook runs between fork and exec and only calls set_hangup, which is
+        // async-signal-safe.
+        unsafe { command.pre_exec(move || set_hangup(disposition)) };
+        self.launch(command).await
+    }
+
+    async fn launch(&self, mut command: Command) -> Child {
+        let mut daemon = command.spawn().expect("spawn the daemon");
         self.wait_until_ready(&mut daemon).await;
         daemon
     }
@@ -103,7 +122,38 @@ impl Sandbox {
         }
     }
 
-    fn runtime_dir(&self) -> PathBuf {
+    async fn stop_with(&self, daemon: &mut Child, signal: libc::c_int) -> ExitStatus {
+        send(daemon, signal);
+        timeout(EXIT_WAIT, daemon.wait())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the daemon did not exit within {}s of signal {signal}\n{}",
+                    EXIT_WAIT.as_secs(),
+                    self.diagnostics()
+                )
+            })
+            .expect("wait for the daemon")
+    }
+
+    async fn assert_running(&self) {
+        let status = IpcClient::with_socket_path(self.socket())
+            .status()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the daemon did not answer a status request: {error}\n{}",
+                    self.diagnostics()
+                )
+            });
+        assert!(
+            matches!(&status, IpcResponse::Ok(IpcData::State(state)) if state.running),
+            "unexpected status {status:?}\n{}",
+            self.diagnostics()
+        );
+    }
+
+    fn runtime_directory(&self) -> PathBuf {
         if cfg!(target_os = "macos") {
             // SAFETY: getuid has no preconditions and cannot fail.
             let uid = unsafe { libc::getuid() };
@@ -114,11 +164,11 @@ impl Sandbox {
     }
 
     fn socket(&self) -> PathBuf {
-        self.runtime_dir().join("claudear.sock")
+        self.runtime_directory().join("claudear.sock")
     }
 
     fn pid_file(&self) -> PathBuf {
-        self.runtime_dir().join("claudear.pid")
+        self.runtime_directory().join("claudear.pid")
     }
 
     fn output(&self, name: &str) -> PathBuf {
@@ -195,6 +245,26 @@ fn is_alive(pid: libc::pid_t) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+fn send(daemon: &Child, signal: libc::c_int) {
+    // SAFETY: kill only sends `signal` to the daemon this test spawned and still owns.
+    let sent = unsafe { libc::kill(pid_of(daemon), signal) };
+    assert_eq!(
+        sent,
+        0,
+        "send signal {signal} to the daemon: {}",
+        io::Error::last_os_error()
+    );
+}
+
+fn set_hangup(disposition: libc::sighandler_t) -> io::Result<()> {
+    // SAFETY: callers pass SIG_IGN or SIG_DFL, so no handler is installed, and signal is
+    // async-signal-safe.
+    if unsafe { libc::signal(libc::SIGHUP, disposition) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn assert_exited_cleanly(status: ExitStatus, sandbox: &Sandbox) {
     assert_eq!(
         status.code(),
@@ -209,15 +279,7 @@ async fn daemon_without_an_http_server_keeps_running() {
     let sandbox = Sandbox::new();
     let mut daemon = sandbox.start().await;
 
-    let status = IpcClient::with_socket_path(sandbox.socket())
-        .status()
-        .await
-        .expect("the daemon answers a status request");
-
-    assert!(
-        matches!(&status, IpcResponse::Ok(IpcData::State(state)) if state.running),
-        "unexpected status {status:?}"
-    );
+    sandbox.assert_running().await;
     assert!(
         daemon.try_wait().expect("check on the daemon").is_none(),
         "the daemon exited after startup\n{}",
@@ -268,20 +330,49 @@ async fn sigterm_drains_and_exits_cleanly() {
     let sandbox = Sandbox::new();
     let mut daemon = sandbox.start().await;
 
-    // SAFETY: kill only sends SIGTERM to the daemon this test spawned and still owns.
-    let sent = unsafe { libc::kill(pid_of(&daemon), libc::SIGTERM) };
-    assert_eq!(sent, 0, "send SIGTERM to the daemon");
-    let status = timeout(EXIT_WAIT, daemon.wait())
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "the daemon did not exit within {}s of SIGTERM\n{}",
-                EXIT_WAIT.as_secs(),
-                sandbox.diagnostics()
-            )
-        })
-        .expect("wait for the daemon");
+    let status = sandbox.stop_with(&mut daemon, libc::SIGTERM).await;
 
+    assert_exited_cleanly(status, &sandbox);
+    sandbox.assert_files_removed();
+}
+
+#[tokio::test]
+async fn sigint_drains_and_exits_cleanly() {
+    let sandbox = Sandbox::new();
+    let mut daemon = sandbox.start().await;
+
+    let status = sandbox.stop_with(&mut daemon, libc::SIGINT).await;
+
+    assert_exited_cleanly(status, &sandbox);
+    sandbox.assert_files_removed();
+}
+
+#[tokio::test]
+async fn sighup_drains_and_exits_cleanly() {
+    let sandbox = Sandbox::new();
+    let mut daemon = sandbox.start_with_hangup(libc::SIG_DFL).await;
+
+    let status = sandbox.stop_with(&mut daemon, libc::SIGHUP).await;
+
+    assert_exited_cleanly(status, &sandbox);
+    sandbox.assert_files_removed();
+}
+
+#[tokio::test]
+async fn sighup_under_nohup_leaves_the_daemon_running() {
+    let sandbox = Sandbox::new();
+    let mut daemon = sandbox.start_with_hangup(libc::SIG_IGN).await;
+
+    send(&daemon, libc::SIGHUP);
+
+    if let Ok(status) = timeout(HANGUP_WAIT, daemon.wait()).await {
+        panic!(
+            "the daemon exited after an ignored SIGHUP with {status:?}\n{}",
+            sandbox.diagnostics()
+        );
+    }
+    sandbox.assert_running().await;
+    let status = sandbox.stop_with(&mut daemon, libc::SIGTERM).await;
     assert_exited_cleanly(status, &sandbox);
     sandbox.assert_files_removed();
 }
