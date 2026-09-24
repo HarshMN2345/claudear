@@ -35,11 +35,31 @@ impl Stream for Signals {
     type Item = Reason;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Reason>> {
-        for (listener, reason) in self.listeners.iter_mut() {
-            if listener.poll_recv(context).is_ready() {
-                return Poll::Ready(Some(*reason));
+        receive(&mut self.listeners, |listener| listener.poll_recv(context))
+    }
+}
+
+/// Yields the reason of the first listener whose signal arrived.
+///
+/// A closed listener can never deliver its signal, so it is dropped rather than taken for one,
+/// and the signals end once no listener is left.
+fn receive<Listener>(
+    listeners: &mut Vec<(Listener, Reason)>,
+    mut poll: impl FnMut(&mut Listener) -> Poll<Option<()>>,
+) -> Poll<Option<Reason>> {
+    let mut index = 0;
+    while let Some((listener, reason)) = listeners.get_mut(index) {
+        match poll(listener) {
+            Poll::Ready(Some(())) => return Poll::Ready(Some(*reason)),
+            Poll::Ready(None) => {
+                listeners.remove(index);
             }
+            Poll::Pending => index += 1,
         }
+    }
+    if listeners.is_empty() {
+        Poll::Ready(None)
+    } else {
         Poll::Pending
     }
 }
@@ -63,6 +83,59 @@ fn disposition(signal: libc::c_int) -> io::Result<libc::sighandler_t> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IDLE: Poll<Option<()>> = Poll::Pending;
+    const DELIVERED: Poll<Option<()>> = Poll::Ready(Some(()));
+    const CLOSED: Poll<Option<()>> = Poll::Ready(None);
+
+    fn received(listeners: &mut Vec<(Poll<Option<()>>, Reason)>) -> Poll<Option<Reason>> {
+        receive(listeners, |listener| *listener)
+    }
+
+    #[test]
+    fn delivered_signal_yields_its_reason() {
+        let mut listeners = vec![(IDLE, Reason::Interrupted), (DELIVERED, Reason::Terminated)];
+
+        assert_eq!(
+            received(&mut listeners),
+            Poll::Ready(Some(Reason::Terminated))
+        );
+        assert_eq!(listeners.len(), 2, "every listener keeps listening");
+    }
+
+    #[test]
+    fn closed_listener_is_dropped_instead_of_read_as_a_signal() {
+        let mut listeners = vec![(CLOSED, Reason::Interrupted), (IDLE, Reason::Terminated)];
+
+        assert_eq!(received(&mut listeners), Poll::Pending);
+        assert_eq!(listeners, [(IDLE, Reason::Terminated)]);
+    }
+
+    #[test]
+    fn signal_behind_a_closed_listener_is_still_delivered() {
+        let mut listeners = vec![
+            (CLOSED, Reason::Interrupted),
+            (DELIVERED, Reason::Terminated),
+        ];
+
+        assert_eq!(
+            received(&mut listeners),
+            Poll::Ready(Some(Reason::Terminated))
+        );
+    }
+
+    #[test]
+    fn signals_end_once_every_listener_has_closed() {
+        let mut listeners = vec![(CLOSED, Reason::Interrupted), (CLOSED, Reason::Terminated)];
+
+        assert_eq!(received(&mut listeners), Poll::Ready(None));
+        assert!(listeners.is_empty());
+    }
+
+    #[test]
+    fn signals_without_listeners_have_ended() {
+        assert_eq!(received(&mut Vec::new()), Poll::Ready(None));
+    }
 
     #[test]
     fn only_an_ignored_hangup_is_left_alone() {
