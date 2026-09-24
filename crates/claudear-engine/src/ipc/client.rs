@@ -272,7 +272,8 @@ mod tests {
     #[test]
     fn test_client_default() {
         let client = IpcClient::default();
-        assert!(!client.is_daemon_running()); // Assuming no daemon in tests
+        assert_eq!(client.socket_path, default_socket_path());
+        assert_eq!(client.timeout, DEFAULT_TIMEOUT);
     }
 
     #[test]
