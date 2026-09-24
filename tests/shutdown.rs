@@ -47,7 +47,7 @@ impl Sandbox {
         self.root.path()
     }
 
-    fn command(&self, name: &str, args: &[&str]) -> Command {
+    fn command(&self, name: &str, arguments: &[&str]) -> Command {
         let output = File::create(self.output(name)).expect("create the output file");
         let mut command = Command::new(env!("CARGO_BIN_EXE_claudear"));
         command
@@ -61,7 +61,7 @@ impl Sandbox {
             .arg(self.path().join("claudear.toml"))
             .arg("--log-dir")
             .arg(self.path().join("logs"))
-            .args(args)
+            .args(arguments)
             .stdin(Stdio::null())
             .stdout(output.try_clone().expect("share the output file"))
             .stderr(output)

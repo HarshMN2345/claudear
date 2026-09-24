@@ -2089,7 +2089,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let config_path = cli.config.clone();
 
-    // Load and validate config from YAML file
     let config = Config::load(&config_path)?;
 
     // Handle daemon control commands early (don't need full config validation)
@@ -3570,13 +3569,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     config.validate()?;
 
-    // Initialize components
     tracing::info!("Initializing...");
     let user_registry = UserRegistry::new(config.users.clone());
     let notifier = create_notifier(&config, user_registry.clone());
     let tracker = create_tracker(&config);
 
-    // Handle Start command (daemon mode with IPC - runs all services concurrently)
     if let Commands::Start {
         port,
         poll,
@@ -3590,7 +3587,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             anyhow::bail!("A daemon is already running. Stop it first with 'claudear stop'");
         }
 
-        // Determine what services to run
         let enable_webhooks = !no_webhooks;
         let enable_dashboard = !no_dashboard;
         let enable_polling = *poll;
@@ -3599,7 +3595,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             anyhow::bail!("No services enabled. Remove --no-webhooks/--no-dashboard or add --poll");
         }
 
-        // Build mode string for status
         let mut modes = Vec::new();
         if enable_dashboard {
             modes.push("dashboard");
@@ -3612,7 +3607,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         let mode_str = modes.join("+");
 
-        // Build shared watcher dependencies
         let deps = build_watcher_deps(&config, &tracker).await?;
         let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
         let sources = deps.sources;
@@ -3623,7 +3617,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let github_webhook_handler =
             create_github_webhook_handler(&config, deps.review_watcher.clone());
 
-        // Always create watcher (used for both polling and housekeeping-only)
         let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: config.clone(),
             sources: sources.clone(),
@@ -3648,7 +3641,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             llm_engine: deps.llm_engine.clone(),
         }));
 
-        // Create IPC server
         let ipc_server = Arc::new(
             IpcServer::builder(tracker.clone(), sources.clone(), notifier.clone())
                 .max_retries(config.retry.max_retries)
@@ -3661,7 +3653,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             ipc_server.set_poll_interval(*poll_interval);
         }
 
-        // Log watcher_started activity
         let activity = ActivityLogEntry::new(
             "watcher_started",
             format!("Watcher daemon started in {} mode", mode_str),
@@ -3674,7 +3665,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }));
         tracker.record_activity(&activity).ok();
 
-        // Log startup info
         tracing::info!("Starting watcher daemon...");
         tracing::info!("  Mode: {}", mode_str);
         tracing::info!("  Port: {}", port);
@@ -4307,7 +4297,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let mut config = config;
             config.webhook_port = port;
 
-            // Auto-configure webhooks if requested
             if setup {
                 let base_url = base_url.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -4323,8 +4312,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     Ok(result) => {
                         print_setup_result(&result);
 
-                        // Reload config to get the new secrets from env vars
-                        // (webhook secrets are stored in env file, which overrides YAML config)
+                        // The configurator writes the new secrets to the env file, which
+                        // overrides the config file.
                         tracing::info!("Reloading configuration with new secrets...");
                         config = Config::load(&config_path)?;
                         config.webhook_port = port;
@@ -4344,7 +4333,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             let handlers = create_webhook_handlers(&config);
 
-            // Build shared watcher dependencies (needed for housekeeping)
             let deps = build_watcher_deps(&config, &tracker).await?;
             let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
             let github_webhook_handler =
@@ -4366,7 +4354,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 &user_registry,
             );
 
-            // Create a Watcher for housekeeping (retries, cascades, auto-close, etc.)
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources: deps.sources,
@@ -4464,7 +4451,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
 
         _ => {
-            // Initialize sources for polling/seed/dry-run modes
             tracing::info!("Initializing sources...");
             let sources = create_sources(&config, &tracker);
 
@@ -4476,10 +4462,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let sources_for_regression = sources.clone();
             let notifier_for_regression = notifier.clone();
 
-            // Create GitHub client for API-based repo discovery
             let github_client = GitHubClient::new(config.github().clone());
 
-            // Build inferrer for repo inference (with embeddings for semantic matching)
             let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
                 &config,
                 Some(&github_client),
@@ -4487,7 +4471,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
 
-            // Create ReviewWatcher for PR review tracking
             let review_watcher = create_review_watcher(&config, tracker.clone());
 
             let issue_embedding_service =
@@ -4507,7 +4490,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let agent: Arc<dyn AgentRunner> =
                 claudear::build_provider_runner(&config, tracker.clone(), None);
 
-            // Eagerly load LLM engine — download model if not present on disk
             let llm_engine = if config.llm.enabled {
                 let model_path = claudear::chat::service::expand_tilde(&config.llm.model_path);
                 let model_ready = if model_path.exists() && model_path.is_file() {
@@ -4578,7 +4560,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 None
             };
 
-            // Build a separate agent runner for classification if configured
             let provider = config.agent.default_provider_config();
             let classification_agent = claudear::build_purpose_runner(
                 &config,
@@ -4761,7 +4742,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     println!("  Failed:     {}", stats.failed);
                     println!("  Cannot Fix: {} (max retries reached)", stats.cannot_fix);
 
-                    // Calculate success rate
                     let completed = stats.merged + stats.closed + stats.failed + stats.cannot_fix;
                     if completed > 0 {
                         let merge_rate = (stats.merged as f64 / completed as f64) * 100.0;
