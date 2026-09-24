@@ -84,7 +84,6 @@ impl HousekeepingWorker {
             let cron_start = Instant::now();
             self.watcher
                 .send_cron_check_in("in_progress", &cron_id, None, self.interval_ms);
-            // Periodically refresh repo index to detect new repositories
             if cycle_count.is_multiple_of(REFRESH_INTERVAL) {
                 match self.watcher.refresh_repos().await {
                     Ok(0) => {}
@@ -96,7 +95,6 @@ impl HousekeepingWorker {
                 }
             }
 
-            // Periodically pull and re-index all repos
             if let Some(reindex_dur) = reindex_interval {
                 if last_reindex.elapsed() >= reindex_dur {
                     self.watcher.pull_and_reindex_all_repos().await;
@@ -104,7 +102,6 @@ impl HousekeepingWorker {
                 }
             }
 
-            // Periodically re-index the Discord knowledge source
             if let Some(discord_dur) = discord_reindex_interval {
                 if last_discord_reindex.elapsed() >= discord_dur {
                     self.watcher.reindex_discord_knowledgebase().await;
@@ -112,7 +109,6 @@ impl HousekeepingWorker {
                 }
             }
 
-            // Run independent housekeeping jobs concurrently
             let auto_close_fut = async {
                 if !self.watcher.is_dry_run() {
                     if let Err(e) = self.watcher.check_and_auto_close_prs().await {
@@ -143,7 +139,6 @@ impl HousekeepingWorker {
                 }
             };
 
-            // Weekly repetitive-issues digest (report-only).
             let digest_fut = async {
                 if !self.watcher.is_dry_run() {
                     if let Some(schedule) = digest_schedule.as_mut() {

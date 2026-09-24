@@ -1251,7 +1251,6 @@ impl Watcher {
                 continue;
             }
 
-            // Poll each source whose interval has elapsed
             for (src_idx, src_interval_ms, last_poll) in &mut source_timers {
                 let src_interval = Duration::from_millis(*src_interval_ms);
                 if last_poll.elapsed() >= src_interval {
@@ -1406,7 +1405,6 @@ impl Watcher {
             return Ok(());
         }
 
-        // Check for new reviews
         let events = review_watcher.check_for_reviews().await?;
         for (pr_url, feedback_summary, feedback_count, comment_refs) in
             Self::group_review_feedback_by_pr(events)
@@ -1417,7 +1415,6 @@ impl Watcher {
                 "Review feedback received, processing..."
             );
 
-            // Find the original issue for this PR
             if let Some(attempt) = self.tracker.get_attempt_by_pr_url(&pr_url)? {
                 if Self::is_terminal_attempt_status(attempt.status) {
                     tracing::info!(
@@ -1463,12 +1460,12 @@ impl Watcher {
                         // Leave the batch's comments unhandled so they retry, but
                         // count the failure so a poison comment eventually gives up.
                         if self.is_running() {
-                            if let Err(e) = self.tracker.note_pr_review_comment_failure_by_ids(
+                            if let Err(error) = self.tracker.note_pr_review_comment_failure_by_ids(
                                 &pr_url,
                                 &comment_refs,
                                 MAX_REVIEW_COMMENT_ATTEMPTS,
                             ) {
-                                tracing::warn!(pr_url = %pr_url, error = %e, "Failed to record review-comment failure");
+                                tracing::warn!(pr_url = %pr_url, %error, "Failed to record review-comment failure");
                             }
                         }
                     }
@@ -2010,7 +2007,6 @@ impl Watcher {
             return Ok(());
         }
 
-        // Need an SCM provider or GitHub client for release polling
         let has_scm = self.scm_provider.is_some() || self.github_client.is_some();
         if !has_scm {
             return Ok(());
@@ -2020,7 +2016,6 @@ impl Watcher {
             if !self.is_running() {
                 break;
             }
-            // Use generic SCM provider when available, fall back to GitHub client
             let release_result = if let Some(ref provider) = self.scm_provider {
                 provider.get_latest_release(upstream).await
             } else if let Some(ref gh) = self.github_client {
@@ -2042,7 +2037,6 @@ impl Watcher {
                 }
             };
 
-            // Check if we've already processed this release
             {
                 let seen = self.last_seen_releases.read().await;
                 if seen.get(upstream).map(|t| t.as_str()) == Some(&release.tag) {
@@ -2067,7 +2061,6 @@ impl Watcher {
                 seen.insert(upstream.to_string(), release.tag.clone());
             }
 
-            // Find the most recently merged attempt for this upstream repo
             let merged_attempt = self
                 .tracker
                 .get_most_recent_merged_attempt_for_repo(upstream)
@@ -2753,12 +2746,10 @@ Create a PR with your changes.{custom_instructions}"#,
         let mut retries_failed = 0usize;
 
         for (i, attempt) in ready.into_iter().enumerate() {
-            // Check if we're still running
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Check if this issue is already being processed
             let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
             if self.lock_processing().contains(&processing_key) {
                 self.record_source_decision(
@@ -2780,7 +2771,6 @@ Create a PR with your changes.{custom_instructions}"#,
                 continue;
             }
 
-            // Wait for concurrency slot (per-source limit, clamped to 1 to avoid deadlock).
             let configured_retry_max_concurrent = self.config.max_concurrent_for(&attempt.source);
             let retry_max_concurrent = configured_retry_max_concurrent.max(1);
             if configured_retry_max_concurrent == 0 {
@@ -2813,10 +2803,8 @@ Create a PR with your changes.{custom_instructions}"#,
                 "Retrying issue"
             );
 
-            // Prepare for retry (resets status to pending, clears PR info)
             retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
 
-            // Build trigger reason from attempt context
             let trigger_reason = {
                 let reason_detail = if attempt.status == FixAttemptStatus::Closed {
                     "PR closed without merge".to_string()
@@ -2837,7 +2825,6 @@ Create a PR with your changes.{custom_instructions}"#,
                 )
             };
 
-            // Trigger the issue processing
             match self
                 .trigger_issue_with_feedback(
                     &attempt.source,
@@ -2939,7 +2926,6 @@ Create a PR with your changes.{custom_instructions}"#,
             }
             drop(claim);
 
-            // Add delay between retries (skip trailing delay after the last item)
             if i + 1 < ready_count && self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
             }
@@ -2960,7 +2946,6 @@ Create a PR with your changes.{custom_instructions}"#,
         Ok(())
     }
 
-    /// Check for merged PRs and trigger cascade processing.
     /// After a fix merges, post a human-sounding "fix shipped" reply back to the
     /// originating ticket. Opt-in via `[reply]`; only tracker-style sources receive
     /// a ticket comment (conversational sources are notified via their channel).
@@ -3036,11 +3021,10 @@ Create a PR with your changes.{custom_instructions}"#,
         );
     }
 
+    /// Check for merged PRs and trigger cascade processing.
     async fn check_pr_merges_and_cascade(&self) -> Result<()> {
         let github_client = self.github_client.as_ref();
         let scm_provider = self.scm_provider.as_ref();
-        // Get all successful attempts with PRs that haven't been merged yet.
-        // Need either a GitHub client or a generic SCM provider for merge detection.
         let has_scm = github_client.is_some() || scm_provider.is_some();
         let pending_prs = if has_scm {
             self.tracker.get_pending_prs()?
@@ -3073,7 +3057,6 @@ Create a PR with your changes.{custom_instructions}"#,
             }
 
             pr_status_checks += 1;
-            // Use generic SCM provider when available, fall back to GitHub client
             let pr_status = if let Some(provider) = scm_provider {
                 provider.get_pr_status(repo, pr_number).await
             } else if let Some(gh) = github_client {
@@ -3098,7 +3081,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         self.tracker
                             .mark_merged(&attempt.source, &attempt.issue_id)?;
                     }
-                    // Timeline: PR merged.
                     self.tracker
                         .record_activity(
                             &ActivityLogEntry::new(
@@ -3114,7 +3096,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, true);
 
-                    // Update prs record to merged
                     if let Some(ref pr_url) = attempt.pr_url {
                         if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
                             pr_record.status = "merged".to_string();
@@ -3167,7 +3148,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         None
                     };
 
-                    // Auto-resolve only when enabled and no regression watch is active.
                     let should_resolve = !is_cascade
                         && regression_watch_id.is_none()
                         && self.config.github().auto_resolve_on_merge;
@@ -3204,19 +3184,15 @@ Create a PR with your changes.{custom_instructions}"#,
                         }
                     }
 
-                    // Action pipeline: once the fix is live, post a human-sounding
-                    // "fix shipped" reply back to the originating ticket.
                     if !is_cascade {
                         self.maybe_send_fix_shipped_reply(attempt).await;
                     }
 
-                    // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
                         .await;
 
                     self.run_post_merge_learning(attempt).await;
 
-                    // Stop review polling for merged PRs.
                     if let (Some(review_watcher), Some(pr_url)) =
                         (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
                     {
@@ -3260,7 +3236,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         self.tracker
                             .mark_closed(&attempt.source, &attempt.issue_id)?;
                     }
-                    // Timeline: PR closed without merging.
                     self.tracker
                         .record_activity(
                             &ActivityLogEntry::new(
@@ -3283,7 +3258,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         review_watcher.unwatch_pr(pr_url);
                     }
 
-                    // Notify PR closed
                     if let Some(pr_url) = &attempt.pr_url {
                         let issue = Issue::new(
                             &attempt.issue_id,
@@ -4399,7 +4373,6 @@ Create a PR with your changes.{custom_instructions}"#,
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
-        // Timeline: attempt created (pending).
         self.tracker
             .record_activity(
                 &ActivityLogEntry::new(
@@ -4434,7 +4407,6 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Get the attempt ID for the processing pipeline
         let attempt_id = self
             .tracker
             .get_attempt(source.name(), &issue.id)
@@ -4464,7 +4436,6 @@ Create a PR with your changes.{custom_instructions}"#,
             resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker))
         });
 
-        // Log resolution decision (watcher-specific verbose logging)
         match &resolution {
             RepoResolution::Resolved { project_dir, .. } => {
                 self.record_issue_decision(
@@ -4478,7 +4449,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         "project_dir": project_dir.display().to_string(),
                     }),
                 );
-                // Timeline: repository resolved.
                 self.tracker
                     .record_activity(
                         &ActivityLogEntry::new(
@@ -4494,7 +4464,6 @@ Create a PR with your changes.{custom_instructions}"#,
             RepoResolution::Skip { .. } => {}
         }
 
-        // Confidence-aware approval gate
         if !is_deploy_qa && self.should_request_approval(&resolution) {
             match self
                 .request_approval(source.name(), &issue, &resolution)
@@ -4525,12 +4494,8 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Save issue info before move for post-processing
         let issue_short_id = issue.short_id.clone();
 
-        // Build IssueProcessor and delegate to shared pipeline. The processor
-        // internally routes pure questions to a read-only Q&A answer path and
-        // everything else to the fix pipeline.
         let processor = IssueProcessor {
             config: self.config.clone(),
             tracker: Arc::clone(&self.tracker),
@@ -4571,7 +4536,6 @@ Create a PR with your changes.{custom_instructions}"#,
             self.release_unfinished_deploy_qa_tip(tip);
         }
 
-        // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
             if runner::is_rate_limit_error(error) {
                 let tmp_issue = Issue::new("", &issue_short_id, "", "", source.name());
@@ -5381,9 +5345,7 @@ Create a PR with your changes.{custom_instructions}"#,
             if self.is_stopped() {
                 break;
             }
-            // Find the source for this attempt
             if let Some(source) = self.sources.iter().find(|s| s.name() == attempt.source) {
-                // Check if issue is still active
                 match source.get_issue_status(&attempt.issue_id).await {
                     Ok(status) if source.is_terminal_status(&status) => {
                         let _claim = self.claim_run();
@@ -5398,7 +5360,6 @@ Create a PR with your changes.{custom_instructions}"#,
                             "Auto-closing PR: issue reached terminal state"
                         );
 
-                        // Log activity
                         let activity = ActivityLogEntry::new(
                             "pr_auto_closed",
                             format!(
@@ -5415,7 +5376,6 @@ Create a PR with your changes.{custom_instructions}"#,
                         }));
                         let _ = self.tracker.record_activity(&activity);
 
-                        // Mark as closed in tracker
                         if let Err(e) = self.tracker.mark_closed(&attempt.source, &attempt.issue_id)
                         {
                             tracing::warn!(
@@ -5427,7 +5387,6 @@ Create a PR with your changes.{custom_instructions}"#,
                             .tracker
                             .update_qa_outcome_stats_for_attempt(attempt.id, false);
 
-                        // Notify about the auto-close
                         let issue = Issue::new(
                             &attempt.issue_id,
                             &attempt.short_id,
@@ -5443,11 +5402,9 @@ Create a PR with your changes.{custom_instructions}"#,
                             )
                             .await;
 
-                        // Record feedback outcome
                         self.record_feedback_outcome_from_attempt(&attempt, Outcome::Closed)
                             .await;
 
-                        // Stop review polling for auto-closed PRs.
                         if let (Some(review_watcher), Some(pr_url)) =
                             (self.review_watcher.as_ref(), attempt.pr_url.as_ref())
                         {
@@ -8000,7 +7957,7 @@ mod tests {
         );
 
         gate.open();
-        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
 
         assert_eq!(
             drained,
@@ -8055,7 +8012,7 @@ mod tests {
         );
 
         source.gate.open();
-        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
 
         assert_eq!(
             drained,
@@ -8127,7 +8084,7 @@ mod tests {
         );
 
         source.gate.open();
-        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
 
         assert_eq!(
             drained,
@@ -8462,7 +8419,7 @@ mod tests {
         );
 
         gate.open();
-        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
 
         assert_eq!(
             drained,
@@ -9712,7 +9669,8 @@ mod tests {
             release.in_flight.fetch_sub(1, Ordering::SeqCst);
         });
 
-        let drained = tokio::time::timeout(Duration::from_secs(5), watcher.stop_and_drain()).await;
+        let drained =
+            tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, watcher.stop_and_drain()).await;
 
         assert_eq!(
             drained,
@@ -12083,7 +12041,7 @@ mod tests {
         );
 
         gate.open();
-        let drained = tokio::time::timeout(Duration::from_secs(2), drain).await;
+        let drained = tokio::time::timeout(DRAIN_RECHECK_INTERVAL * 2, drain).await;
 
         assert_eq!(
             drained,
