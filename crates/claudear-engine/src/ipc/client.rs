@@ -290,19 +290,13 @@ pub fn print_response(response: &IpcResponse) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::short_temporary_directory;
     use std::time::Instant;
     use tokio::net::UnixListener;
 
     const STOP_TIMEOUT: Duration = Duration::from_secs(5);
     const SHORT_TIMEOUT: Duration = Duration::from_millis(500);
     const CLOSE_DELAY: Duration = Duration::from_millis(300);
-
-    fn short_temp_dir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("claudear-ipc")
-            .tempdir_in("/tmp")
-            .expect("create a temp dir under /tmp")
-    }
 
     #[test]
     fn test_client_default() {
@@ -714,8 +708,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_until_stopped_returns_once_the_socket_is_gone() {
-        let dir = short_temp_dir();
-        let socket_path = dir.path().join("claudear.sock");
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let client = IpcClient::with_socket_path(socket_path.clone());
         let started = Instant::now();
@@ -735,8 +729,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_until_stopped_waits_for_the_process_to_exit() {
-        let dir = short_temp_dir();
-        let client = IpcClient::with_socket_path(dir.path().join("claudear.sock"));
+        let directory = short_temporary_directory();
+        let client = IpcClient::with_socket_path(directory.path().join("claudear.sock"));
         let mut child = tokio::process::Command::new("sleep")
             .arg("30")
             .kill_on_drop(true)
@@ -759,8 +753,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_until_stopped_times_out_while_the_socket_accepts() {
-        let dir = short_temp_dir();
-        let socket_path = dir.path().join("claudear.sock");
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let acceptor = tokio::spawn(async move {
             loop {

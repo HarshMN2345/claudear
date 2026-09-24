@@ -130,17 +130,20 @@ fn is_process_running(pid: u32) -> bool {
     }
 }
 
+/// A temporary directory under `/tmp`, so socket paths inside it stay within the Unix socket
+/// path limit however long `TMPDIR` is.
+#[cfg(test)]
+fn short_temporary_directory() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("claudear-ipc")
+        .tempdir_in("/tmp")
+        .expect("create a temporary directory under /tmp")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
-
-    fn short_temp_dir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("claudear-ipc")
-            .tempdir_in("/tmp")
-            .expect("create a temp dir under /tmp")
-    }
 
     #[test]
     fn test_default_socket_path_ends_with_claudear_sock() {
@@ -174,8 +177,8 @@ mod tests {
 
     #[test]
     fn test_read_pid_file_ignores_missing_and_malformed_files() {
-        let dir = short_temp_dir();
-        let pid_path = dir.path().join("claudear.pid");
+        let directory = short_temporary_directory();
+        let pid_path = directory.path().join("claudear.pid");
         assert_eq!(read_pid_file(&pid_path), None);
 
         std::fs::write(&pid_path, "not a pid").unwrap();
@@ -187,8 +190,8 @@ mod tests {
 
     #[test]
     fn test_write_pid_file_stores_own_pid() {
-        let dir = short_temp_dir();
-        let pid_path = dir.path().join("claudear.pid");
+        let directory = short_temporary_directory();
+        let pid_path = directory.path().join("claudear.pid");
 
         write_pid_file(&pid_path).expect("write_pid_file should succeed");
 
@@ -197,8 +200,8 @@ mod tests {
 
     #[test]
     fn test_is_accepting_only_while_a_listener_is_bound() {
-        let dir = short_temp_dir();
-        let socket_path = dir.path().join("claudear.sock");
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
         assert!(!is_accepting(&socket_path));
 
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -231,9 +234,9 @@ mod tests {
 
     #[test]
     fn test_cleanup_stale_files_removes_files_of_a_dead_daemon() {
-        let dir = short_temp_dir();
-        let socket_path = dir.path().join("claudear.sock");
-        let pid_path = dir.path().join("claudear.pid");
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
+        let pid_path = directory.path().join("claudear.pid");
         drop(UnixListener::bind(&socket_path).unwrap());
         std::fs::write(&pid_path, u32::MAX.to_string()).unwrap();
 
@@ -245,9 +248,9 @@ mod tests {
 
     #[test]
     fn test_cleanup_stale_files_keeps_files_of_a_live_daemon() {
-        let dir = short_temp_dir();
-        let socket_path = dir.path().join("claudear.sock");
-        let pid_path = dir.path().join("claudear.pid");
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
+        let pid_path = directory.path().join("claudear.pid");
         let _listener = UnixListener::bind(&socket_path).unwrap();
         write_pid_file(&pid_path).unwrap();
 
@@ -259,9 +262,9 @@ mod tests {
 
     #[test]
     fn test_cleanup_stale_files_removes_a_socket_without_pid_once_nothing_listens() {
-        let dir = short_temp_dir();
-        let socket_path = dir.path().join("claudear.sock");
-        let pid_path = dir.path().join("claudear.pid");
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
+        let pid_path = directory.path().join("claudear.pid");
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         cleanup_stale_files(&socket_path, &pid_path);

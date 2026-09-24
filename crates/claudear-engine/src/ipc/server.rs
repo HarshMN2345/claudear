@@ -683,7 +683,7 @@ impl IpcServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::IpcClient;
+    use crate::ipc::{short_temporary_directory, IpcClient};
     use std::time::Duration;
     use tokio::task::JoinHandle;
 
@@ -836,13 +836,6 @@ mod tests {
         .await
     }
 
-    fn short_temp_dir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("claudear-ipc")
-            .tempdir_in("/tmp")
-            .expect("create a temp dir under /tmp")
-    }
-
     struct StartedServer {
         server: Arc<IpcServer>,
         task: JoinHandle<Result<()>>,
@@ -851,9 +844,9 @@ mod tests {
         pid_path: PathBuf,
     }
 
-    async fn start_in(dir: &Path) -> StartedServer {
-        let socket_path = dir.join("claudear.sock");
-        let pid_path = dir.join("claudear.pid");
+    async fn start_in(directory: &Path) -> StartedServer {
+        let socket_path = directory.join("claudear.sock");
+        let pid_path = directory.join("claudear.pid");
         let server = Arc::new(
             IpcServer::builder(mock_tracker(), mock_sources(), mock_notifier())
                 .socket_path(socket_path.clone())
@@ -2389,8 +2382,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_keeps_answering_after_shutdown_until_dropped() {
-        let dir = short_temp_dir();
-        let started = start_in(dir.path()).await;
+        let directory = short_temporary_directory();
+        let started = start_in(directory.path()).await;
         let mut shutdown_rx = started.server.shutdown_receiver();
 
         match started
@@ -2446,8 +2439,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropping_start_leaves_a_replaced_socket_alone() {
-        let dir = short_temp_dir();
-        let started = start_in(dir.path()).await;
+        let directory = short_temporary_directory();
+        let started = start_in(directory.path()).await;
         std::fs::remove_file(&started.socket_path).unwrap();
         let _replacement = UnixListener::bind(&started.socket_path).unwrap();
 
@@ -2465,8 +2458,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropping_start_leaves_a_replaced_pid_file_alone() {
-        let dir = short_temp_dir();
-        let started = start_in(dir.path()).await;
+        let directory = short_temporary_directory();
+        let started = start_in(directory.path()).await;
         let other_pid = std::process::id() + 1;
         std::fs::write(&started.pid_path, other_pid.to_string()).unwrap();
 
