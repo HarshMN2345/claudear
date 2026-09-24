@@ -318,7 +318,7 @@ impl IpcServer {
 
                     tokio::spawn(async move {
                         let _permit = permit; // held until handler completes
-                        if let Err(e) = handle_connection(
+                        if let Err(error) = handle_connection(
                             stream,
                             tracker,
                             sources,
@@ -329,12 +329,12 @@ impl IpcServer {
                         )
                         .await
                         {
-                            tracing::error!("Error handling IPC connection: {}", e);
+                            tracing::error!("Error handling IPC connection: {}", error);
                         }
                     });
                 }
-                Err(e) => {
-                    tracing::error!("Failed to accept connection: {}", e);
+                Err(error) => {
+                    tracing::error!("Failed to accept connection: {}", error);
                 }
             }
         }
@@ -429,7 +429,6 @@ async fn handle_command(
         IpcCommand::Pause => {
             state.paused.store(true, Ordering::SeqCst);
 
-            // Log watcher_paused activity
             let activity = ActivityLogEntry::new("watcher_paused", "Watcher paused by user")
                 .with_source("system".to_string());
             tracker.record_activity(&activity).ok();
@@ -440,7 +439,6 @@ async fn handle_command(
         IpcCommand::Resume => {
             state.paused.store(false, Ordering::SeqCst);
 
-            // Log watcher_resumed activity
             let activity = ActivityLogEntry::new("watcher_resumed", "Watcher resumed by user")
                 .with_source("system".to_string());
             tracker.record_activity(&activity).ok();
@@ -450,17 +448,17 @@ async fn handle_command(
 
         IpcCommand::Stats => match tracker.get_stats() {
             Ok(stats) => IpcResponse::ok_with(IpcData::Stats(stats)),
-            Err(e) => IpcResponse::error(format!("Failed to get stats: {}", e)),
+            Err(error) => IpcResponse::error(format!("Failed to get stats: {}", error)),
         },
 
         IpcCommand::ListPrs => match tracker.get_pending_prs() {
             Ok(attempts) => IpcResponse::ok_with(IpcData::Attempts(attempts)),
-            Err(e) => IpcResponse::error(format!("Failed to list PRs: {}", e)),
+            Err(error) => IpcResponse::error(format!("Failed to list PRs: {}", error)),
         },
 
         IpcCommand::ListRetries => match tracker.get_retryable_issues(state.max_retries) {
             Ok(attempts) => IpcResponse::ok_with(IpcData::Attempts(attempts)),
-            Err(e) => IpcResponse::error(format!("Failed to list retries: {}", e)),
+            Err(error) => IpcResponse::error(format!("Failed to list retries: {}", error)),
         },
 
         IpcCommand::Trigger { .. } | IpcCommand::ProcessRetries
@@ -473,12 +471,11 @@ async fn handle_command(
             if let Some(watcher) = watcher {
                 match watcher.trigger_issue(&source, &issue_id).await {
                     Ok(()) => {
-                        // Get the PR URL if available
                         let pr_url = tracker
                             .get_attempt(&source, &issue_id)
                             .ok()
                             .flatten()
-                            .and_then(|a| a.pr_url);
+                            .and_then(|attempt| attempt.pr_url);
 
                         IpcResponse::ok_with(IpcData::Triggered {
                             source,
@@ -486,7 +483,7 @@ async fn handle_command(
                             pr_url,
                         })
                     }
-                    Err(e) => IpcResponse::error(format!("Failed to trigger: {}", e)),
+                    Err(error) => IpcResponse::error(format!("Failed to trigger: {}", error)),
                 }
             } else {
                 IpcResponse::error("Watcher not available")
@@ -497,13 +494,12 @@ async fn handle_command(
             if let Some(watcher) = watcher {
                 match watcher.reset_attempt(&source, &issue_id) {
                     Ok(()) => IpcResponse::ok_with(IpcData::Reset { source, issue_id }),
-                    Err(e) => IpcResponse::error(format!("Failed to reset: {}", e)),
+                    Err(error) => IpcResponse::error(format!("Failed to reset: {}", error)),
                 }
             } else {
-                // Try direct tracker reset
                 match tracker.reset_attempt(&source, &issue_id) {
                     Ok(()) => IpcResponse::ok_with(IpcData::Reset { source, issue_id }),
-                    Err(e) => IpcResponse::error(format!("Failed to reset: {}", e)),
+                    Err(error) => IpcResponse::error(format!("Failed to reset: {}", error)),
                 }
             }
         }
