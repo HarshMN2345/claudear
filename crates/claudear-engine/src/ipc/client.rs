@@ -153,9 +153,12 @@ impl IpcClient {
         self.send(IpcCommand::Shutdown).await
     }
 
-    /// Wait until the daemon has exited: its socket no longer accepts connections and, when
-    /// `pid` is given, that process is gone. A child that exited but was not reaped still
-    /// counts as running.
+    /// Wait until the daemon's socket no longer accepts connections and, when `pid` is given,
+    /// that process has exited. A child that exited but was not reaped still counts as
+    /// running.
+    ///
+    /// Without a `pid`, returning true confirms only that the daemon closed its socket: its
+    /// process may still be exiting.
     ///
     /// Returns false if `timeout` elapses first.
     pub async fn wait_until_stopped(&self, pid: Option<u32>, timeout: Duration) -> bool {
