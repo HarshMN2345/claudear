@@ -20,6 +20,10 @@ use std::time::Duration;
 /// How long shutdown waits for in-flight runs to finish.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the runtime waits for blocking work, such as a local model call, after the drain
+/// before the process exits anyway.
+pub const RUNTIME_GRACE: Duration = Duration::from_secs(5);
+
 const FORCE_QUIT_HINT: &str = "Press Ctrl+C again to force quit.";
 
 /// Runs `services` until a signal, `request` or the end of a service starts the shutdown, then

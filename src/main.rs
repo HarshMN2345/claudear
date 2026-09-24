@@ -24,6 +24,7 @@ use claudear::{
     retry::RetryManager,
     runner::{process_group, AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
+    shutdown::{self, Outcome, Service, Signals, Summary},
     source::{
         DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
         SlackSource, TelegramSource, WhatsAppSource,
@@ -43,8 +44,10 @@ use claudear::{
     },
 };
 use serde_json::json;
+use std::future::{pending, Future};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
+use tokio_util::task::TaskTracker;
 use tracing_subscriber::{
     filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
@@ -1725,29 +1728,6 @@ async fn interrupted() {
         .expect("Failed to install signal handler");
 }
 
-/// Stop the watcher starting runs and pass the interrupt on to the agent CLIs,
-/// including any a run spawns from now on.
-fn interrupt(watcher: &Watcher) {
-    watcher.stop();
-    process_group::Registry::global().interrupt_all();
-}
-
-/// Let the watcher's runs finish, then interrupt the agent CLIs still running
-/// and kill whatever is left after [`INTERRUPT_GRACE`], force-quitting if
-/// interrupted again meanwhile.
-async fn shut_down(watcher: &Watcher) {
-    tokio::select! {
-        () = async {
-            watcher.stop_and_drain().await;
-            process_group::Registry::global().shutdown(INTERRUPT_GRACE).await;
-        } => {}
-        () = interrupted() => {
-            tracing::warn!("\nForce shutdown requested, exiting immediately");
-            force_quit();
-        }
-    }
-}
-
 /// Kill every agent CLI, then die of SIGINT as if it had not been caught, so a
 /// calling shell stops too rather than running its next command.
 fn force_quit() -> ! {
@@ -1784,6 +1764,103 @@ async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
         () = interrupted() => {}
     }
     force_quit();
+}
+
+/// Exit code for a shutdown forced by a second signal, as for any interrupted process.
+const FORCED_EXIT_CODE: i32 = 130;
+
+/// The HTTP server a `start` daemon runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMode {
+    /// The webhook server, serving the dashboard API on the same port when `dashboard` is set.
+    Webhooks { dashboard: bool },
+    /// The dashboard API alone.
+    Dashboard,
+}
+
+/// The HTTP server for the enabled webhooks and dashboard, or none when both are disabled.
+fn http_mode(webhooks: bool, dashboard: bool) -> Option<HttpMode> {
+    match (webhooks, dashboard) {
+        (true, dashboard) => Some(HttpMode::Webhooks { dashboard }),
+        (false, true) => Some(HttpMode::Dashboard),
+        (false, false) => None,
+    }
+}
+
+/// What a daemon mode stops and waits for when it shuts down.
+struct Daemon<'a> {
+    watcher: &'a Watcher,
+    ipc: Option<&'a IpcServer>,
+    runs: Option<&'a TaskTracker>,
+    monitors: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Daemon<'_> {
+    /// Run `services` until a signal, `request` or a service ending starts the shutdown, then
+    /// stop taking new work and drain the runs in flight.
+    ///
+    /// Exits the process at once when another signal forces the shutdown.
+    async fn serve<'s>(
+        &self,
+        services: impl IntoIterator<Item = Service<'s>>,
+        request: impl Future<Output = ()>,
+    ) -> anyhow::Result<Summary> {
+        let mut signals = Signals::listen()?;
+        let summary = shutdown::run(
+            services,
+            request,
+            &mut signals,
+            |_| self.stop(),
+            self.drain(),
+        )
+        .await;
+        match summary.outcome {
+            Outcome::Forced => {
+                tracing::warn!("Shutdown forced, exiting immediately");
+                std::process::exit(FORCED_EXIT_CODE);
+            }
+            Outcome::TimedOut => tracing::warn!(
+                watcher_runs = self.watcher.active_count(),
+                webhook_runs = self.webhook_runs(),
+                "Exiting with runs still in flight after {}s",
+                shutdown::DRAIN_TIMEOUT.as_secs()
+            ),
+            Outcome::Drained => {}
+        }
+        Ok(summary)
+    }
+
+    fn stop(&self) {
+        if let Some(ipc) = self.ipc {
+            ipc.set_stopping();
+        }
+        if let Some(runs) = self.runs {
+            runs.close();
+        }
+        self.watcher.stop();
+        for monitor in &self.monitors {
+            monitor.abort();
+        }
+        tracing::warn!(
+            watcher_runs = self.watcher.active_count(),
+            webhook_runs = self.webhook_runs(),
+            "Stopped taking new work, waiting for the runs in flight"
+        );
+    }
+
+    async fn drain(&self) -> bool {
+        let webhooks = async {
+            if let Some(runs) = self.runs {
+                runs.wait().await;
+            }
+        };
+        let (watcher_drained, ()) = tokio::join!(self.watcher.stop_and_drain(), webhooks);
+        watcher_drained
+    }
+
+    fn webhook_runs(&self) -> usize {
+        self.runs.map_or(0, TaskTracker::len)
+    }
 }
 
 /// Enrich the process PATH with entries from the user's login shell.
@@ -1934,10 +2011,12 @@ fn main() -> anyhow::Result<()> {
         scope.set_tag("app.component", "claudear-backend");
     });
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main(cli))
+        .build()?;
+    let result = runtime.block_on(async_main(cli));
+    runtime.shutdown_timeout(shutdown::RUNTIME_GRACE);
+    result
 }
 
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
@@ -3577,124 +3656,99 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &user_registry,
         );
 
-        let watcher_for_shutdown = watcher.clone();
-        let tracker_for_shutdown = tracker.clone();
-        let mut shutdown_rx = ipc_server.shutdown_receiver();
-        let shutdown_requested = async move {
-            tokio::select! {
-                () = interrupted() => {
-                    tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
-                    interrupt(&watcher_for_shutdown);
-                }
-                _ = shutdown_rx.recv() => {
-                    tracing::info!("\nReceived IPC shutdown command, initiating graceful shutdown...");
-                }
-            }
-        };
-
-        let monitoring_shutdown = async move {
-            for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
-                handle.abort();
-            }
-        };
-
-        // Build the unified HTTP server with dashboard API + webhooks
+        let runs = TaskTracker::new();
         let mut config = config.clone();
         config.webhook_port = *port;
+        let http = http_mode(enable_webhooks, enable_dashboard).map(|mode| {
+            let notifier = notifier.clone();
+            let tracker = tracker.clone();
+            let runs = runs.clone();
+            let config_path = std::path::PathBuf::from(&config_path);
+            Service::new("http", async move {
+                match mode {
+                    HttpMode::Webhooks { dashboard } => {
+                        let handlers = create_webhook_handlers(&config);
+                        if handlers.get_all().is_empty()
+                            && github_webhook_handler.is_none()
+                            && !dashboard
+                        {
+                            anyhow::bail!("No webhook handlers configured");
+                        }
 
-        // Start all services concurrently
-        let ipc_future = ipc_server.start();
-
-        let inferrer_clone = deps.inferrer.clone();
-        let embedding_client_clone = deps.embedding_client.clone();
-        let github_webhook_handler_for_http = github_webhook_handler;
-        let review_watcher_clone = deps.review_watcher.clone();
-        let issue_embedding_service_clone = deps.issue_embedding_service.clone();
-        let code_search_service_clone = deps.code_search_service.clone();
-        let discord_search_service_clone = deps.discord_search_service.clone();
-        let agent_clone = deps.agent.clone();
-        let qa_agent_clone = deps.qa_agent.clone();
-        let http_future = async move {
-            if enable_webhooks {
-                let handlers = create_webhook_handlers(&config);
-                if handlers.get_all().is_empty()
-                    && github_webhook_handler_for_http.is_none()
-                    && !enable_dashboard
-                {
-                    return Err(anyhow::anyhow!("No webhook handlers configured"));
+                        let mut server = WebhookServer::new_with_github(
+                            config,
+                            handlers,
+                            notifier,
+                            tracker.clone(),
+                            Some(tracker),
+                            deps.inferrer,
+                            github_webhook_handler,
+                            deps.agent,
+                        );
+                        server.set_qa_agent(deps.qa_agent);
+                        server.set_embedding_client(deps.embedding_client);
+                        server.set_issue_embedding_service(deps.issue_embedding_service);
+                        server.set_code_search_service(deps.code_search_service);
+                        server.set_discord_search_service(deps.discord_search_service);
+                        server.set_review_watcher(deps.review_watcher);
+                        server.set_runs(runs);
+                        if dashboard {
+                            server.set_dashboard(config_path);
+                        }
+                        server.start().await?;
+                    }
+                    HttpMode::Dashboard => {
+                        ApiServer::with_port(config, tracker, *port, config_path)
+                            .start()
+                            .await?;
+                    }
                 }
-
-                let mut server = WebhookServer::new_with_github(
-                    config.clone(),
-                    handlers,
-                    notifier.clone(),
-                    tracker.clone(),
-                    Some(tracker.clone()),
-                    inferrer_clone,
-                    github_webhook_handler_for_http,
-                    agent_clone,
-                );
-                server.set_qa_agent(qa_agent_clone);
-                server.set_embedding_client(embedding_client_clone);
-                server.set_issue_embedding_service(issue_embedding_service_clone);
-                server.set_code_search_service(code_search_service_clone);
-                server.set_discord_search_service(discord_search_service_clone);
-                server.set_review_watcher(review_watcher_clone);
-                if enable_dashboard {
-                    server.set_dashboard(std::path::PathBuf::from(config_path.clone()));
-                }
-                server.start().await?;
-            } else if enable_dashboard {
-                // Dashboard only (no webhooks)
-                let server = ApiServer::with_port(
-                    config.clone(),
-                    tracker.clone(),
-                    *port,
-                    std::path::PathBuf::from(config_path.clone()),
-                );
-                server.start().await?;
-            }
-            Ok::<(), anyhow::Error>(())
+                Ok(())
+            })
+        });
+        let poll = if enable_polling {
+            Service::new("poll", async {
+                watcher
+                    .start(Some(*poll_interval))
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        } else {
+            let worker = HousekeepingWorker::new(watcher.clone(), *poll_interval);
+            Service::new("housekeeping", async move { worker.start().await })
         };
+        let ipc = Service::new("ipc", async {
+            ipc_server.start().await.map_err(anyhow::Error::from)
+        });
 
-        let watcher_for_poll = watcher.clone();
-        let poll_future = async move {
-            if enable_polling {
-                watcher_for_poll.start(Some(*poll_interval)).await?;
-            } else {
-                // Run housekeeping without source polling
-                let worker = HousekeepingWorker::new(watcher_for_poll, *poll_interval);
-                worker.start().await?;
-            }
-            Ok::<(), anyhow::Error>(())
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: Some(&ipc_server),
+            runs: Some(&runs),
+            monitors: [regression_handle, deploy_qa_handle]
+                .into_iter()
+                .flatten()
+                .collect(),
         };
+        let mut requests = ipc_server.shutdown_receiver();
+        let summary = daemon
+            .serve([Some(ipc), http, Some(poll)].into_iter().flatten(), async {
+                let _ = requests.recv().await;
+            })
+            .await?;
 
-        // Run everything concurrently
-        tokio::select! {
-            result = ipc_future => {
-                if let Err(e) = result {
-                    tracing::error!("IPC server error: {}", e);
-                }
-            }
-            result = http_future => {
-                if let Err(e) = result {
-                    tracing::error!("HTTP server error: {}", e);
-                }
-            }
-            result = poll_future => {
-                if let Err(e) = result {
-                    tracing::error!("Polling error: {}", e);
-                }
-            }
-            () = shutdown_requested => {}
-        }
+        let activity = ActivityLogEntry::new(
+            "watcher_stopped",
+            format!("Watcher daemon stopped ({})", summary.reason),
+        )
+        .with_source("system".to_string())
+        .with_metadata(json!({
+            "reason": summary.reason.label(),
+            "outcome": summary.outcome.label(),
+        }));
+        tracker.record_activity(&activity).ok();
 
-        shut_down(&watcher).await;
-        let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
-            .with_source("system".to_string());
-        tracker_for_shutdown.record_activity(&activity).ok();
-        monitoring_shutdown.await;
-        return Ok(());
+        return summary.error.map_or(Ok(()), Err);
     }
 
     // Handle PR commands early since they don't need sources
@@ -4275,6 +4329,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }));
 
             let worker = HousekeepingWorker::new(watcher.clone(), config.poll_interval_ms);
+            let runs = TaskTracker::new();
 
             let mut server = WebhookServer::new_with_github(
                 config.clone(),
@@ -4292,6 +4347,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_code_search_service(deps.code_search_service);
             server.set_discord_search_service(deps.discord_search_service);
             server.set_review_watcher(deps.review_watcher);
+            server.set_runs(runs.clone());
 
             let regression_handle = start_regression_monitoring(
                 &config,
@@ -4304,13 +4360,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             let deploy_qa_handle =
                 start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
-
-            let watcher_for_shutdown = watcher.clone();
-            let shutdown_requested = async move {
-                interrupted().await;
-                tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
-                interrupt(&watcher_for_shutdown);
-            };
 
             if self_test {
                 let port_for_test = port;
@@ -4330,19 +4379,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 });
             }
 
-            tokio::select! {
-                result = server.start() => result?,
-                result = worker.start() => {
-                    if let Err(e) = result {
-                        tracing::error!("Housekeeping worker error: {}", e);
-                    }
-                }
-                () = shutdown_requested => {}
-            }
-
-            shut_down(&watcher).await;
-            for handle in [regression_handle, deploy_qa_handle].into_iter().flatten() {
-                handle.abort();
+            let daemon = Daemon {
+                watcher: &watcher,
+                ipc: None,
+                runs: Some(&runs),
+                monitors: [regression_handle, deploy_qa_handle]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            };
+            let services = [
+                Service::new("http", async move {
+                    server.start().await.map_err(anyhow::Error::from)
+                }),
+                Service::new("housekeeping", worker.start()),
+            ];
+            let summary = daemon.serve(services, pending()).await?;
+            if let Some(error) = summary.error {
+                return Err(error);
             }
         }
 
@@ -4509,26 +4563,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 llm_engine,
             }));
 
-            // Handle shutdown signals
-            let watcher_ref = &watcher;
-
             match cli.command {
                 Commands::Seed => {
                     watcher.seed().await?;
                 }
 
                 Commands::DryRun => {
-                    let shutdown = async {
-                        tokio::signal::ctrl_c()
-                            .await
-                            .expect("Failed to install signal handler");
-                        tracing::info!("\nReceived shutdown signal...");
-                        watcher_ref.stop();
+                    let daemon = Daemon {
+                        watcher: &watcher,
+                        ipc: None,
+                        runs: None,
+                        monitors: Vec::new(),
                     };
-
-                    tokio::select! {
-                        result = watcher.start(None) => result?,
-                        _ = shutdown => {}
+                    let poll = Service::new("poll", async {
+                        watcher.start(None).await.map_err(anyhow::Error::from)
+                    });
+                    let summary = daemon.serve([poll], pending()).await?;
+                    if let Some(error) = summary.error {
+                        return Err(error);
                     }
                 }
 
@@ -4551,43 +4603,50 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                     // Keep regression monitoring active in foreground poll mode so merged bug
                     // fixes complete the regression-final-check -> resolve flow.
-                    let _regression_handle = start_regression_monitoring(
+                    let regression_handle = start_regression_monitoring(
                         &config,
                         tracker_for_api.clone(),
                         sources_for_regression.clone(),
                         notifier_for_regression.clone(),
                     );
-                    let _deploy_qa_handle = start_deploy_qa_monitoring(
+                    let deploy_qa_handle = start_deploy_qa_monitoring(
                         &config,
                         tracker_for_api.clone(),
                         watcher.clone(),
                     );
 
-                    let shutdown_requested = async {
-                        interrupted().await;
-                        tracing::info!("\nReceived shutdown signal...");
-                        interrupt(watcher_ref);
+                    let daemon = Daemon {
+                        watcher: &watcher,
+                        ipc: None,
+                        runs: None,
+                        monitors: [regression_handle, deploy_qa_handle]
+                            .into_iter()
+                            .flatten()
+                            .collect(),
                     };
-
-                    if no_dashboard {
-                        tokio::select! {
-                            result = watcher.start(Some(interval)) => result?,
-                            () = shutdown_requested => {}
-                        }
-                    } else {
-                        let api_server = ApiServer::with_port(
+                    let poll = Service::new("poll", async {
+                        watcher
+                            .start(Some(interval))
+                            .await
+                            .map_err(anyhow::Error::from)
+                    });
+                    let http = (!no_dashboard).then(|| {
+                        let server = ApiServer::with_port(
                             config.clone(),
                             tracker_for_api.clone(),
                             port,
-                            std::path::PathBuf::from(config_path.clone()),
+                            std::path::PathBuf::from(&config_path),
                         );
-                        tokio::select! {
-                            result = watcher.start(Some(interval)) => result?,
-                            result = api_server.start() => result?,
-                            () = shutdown_requested => {}
-                        }
+                        Service::new("http", async move {
+                            server.start().await.map_err(anyhow::Error::from)
+                        })
+                    });
+                    let summary = daemon
+                        .serve([Some(poll), http].into_iter().flatten(), pending())
+                        .await?;
+                    if let Some(error) = summary.error {
+                        return Err(error);
                     }
-                    shut_down(watcher_ref).await;
                 }
 
                 Commands::Trigger { source, issue_id } => {
@@ -4682,4 +4741,27 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_mode_runs_a_server_only_for_what_is_enabled() {
+        assert_eq!(
+            http_mode(true, true),
+            Some(HttpMode::Webhooks { dashboard: true })
+        );
+        assert_eq!(
+            http_mode(true, false),
+            Some(HttpMode::Webhooks { dashboard: false })
+        );
+        assert_eq!(http_mode(false, true), Some(HttpMode::Dashboard));
+        assert_eq!(
+            http_mode(false, false),
+            None,
+            "with webhooks and the dashboard disabled there is no HTTP service to run"
+        );
+    }
 }
