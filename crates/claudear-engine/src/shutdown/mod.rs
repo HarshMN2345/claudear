@@ -160,7 +160,7 @@ mod tests {
         true
     }
 
-    fn limited<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    fn limited<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
         let mut future = Box::pin(future);
         let mut polls: usize = 0;
         poll_fn(move |context| {
