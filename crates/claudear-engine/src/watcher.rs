@@ -65,7 +65,7 @@ const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const STOPPING_REFUSAL: &str = "Watcher is stopping; not starting new runs";
 
 /// Why an issue triggered outside a poll is processed.
-pub(crate) const MANUAL_TRIGGER: &str = "Manual trigger";
+pub const MANUAL_TRIGGER: &str = "Manual trigger";
 
 /// Prefix of the error recorded on an attempt whose retry could not run.
 pub(crate) const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";

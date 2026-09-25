@@ -38,7 +38,7 @@ use claudear::{
     telemetry::{InstrumentedNotifier, InstrumentedRunner, InstrumentedScm, InstrumentedSource},
     types::{ActionKind, ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
-    watcher::{Watcher, WatcherOptions},
+    watcher::{RetryOutcome, Watcher, WatcherOptions, MANUAL_TRIGGER},
     webhook::{
         print_setup_result, GitHubWebhookHandler, GitLabIssueWebhookHandler,
         HelpScoutWebhookHandler, JiraWebhookHandler, LinearWebhookHandler, SentryWebhookHandler,
@@ -4175,17 +4175,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     break;
                 }
                 println!("\n  Retrying [{}] {}...", attempt.source, attempt.short_id);
-                retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
-                if let Err(error) = watcher
-                    .trigger_issue(&attempt.source, &attempt.issue_id)
-                    .await
-                {
-                    tracing::error!("Failed to retry {}: {}", attempt.short_id, error);
+                match watcher.retry(&attempt, MANUAL_TRIGGER).await {
+                    RetryOutcome::Ran => {}
+                    RetryOutcome::Busy => println!(
+                        "  Skipped {}: it is already being processed, so its retry was not spent",
+                        attempt.short_id
+                    ),
+                    RetryOutcome::Stopping => println!(
+                        "  Skipped {}: the watcher is stopping, so its retry was not spent",
+                        attempt.short_id
+                    ),
+                    RetryOutcome::Failed(error) => {
+                        tracing::error!("Failed to retry {}: {}", attempt.short_id, error);
+                    }
                 }
             }
-            anyhow::Ok(())
         })
-        .await?;
+        .await;
 
         println!("\nRetry processing complete.");
         return Ok(());
