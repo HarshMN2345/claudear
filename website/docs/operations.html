@@ -119,7 +119,7 @@ claudear resume     # resume issue processing
 claudear stop       # stop after in-flight runs finish (up to 30s)</code></pre>
 
         <h2 id="graceful-shutdown"><a class="anchor-link" href="#graceful-shutdown" aria-label="Link to Graceful shutdown">#</a>Graceful shutdown</h2>
-        <p><code>claudear start</code>, <code>claudear poll</code>, <code>claudear webhook</code>, and <code>claudear dry-run</code> shut down the same way on SIGTERM, SIGINT, or SIGHUP. Any of these signals that was already ignored when Claudear started stays ignored: a Claudear started under <code>nohup</code> keeps running when its terminal closes, and one that a script starts in the background keeps running on Ctrl+C, because the script&rsquo;s shell ignores SIGINT for it. <code>claudear stop</code> works only for a daemon started with <code>claudear start</code>; stop the other commands with a signal. Claudear then:</p>
+        <p><code>claudear start</code>, <code>claudear poll</code>, <code>claudear webhook</code>, and <code>claudear dry-run</code> shut down the same way on SIGTERM, SIGINT, or SIGHUP, so Ctrl+C in a terminal drains in-flight runs just as <code>claudear stop</code> or SIGTERM does: the agent CLIs Claudear starts lead process groups of their own, which the terminal&rsquo;s Ctrl+C does not reach. Any of these signals that was already ignored when Claudear started stays ignored: a Claudear started under <code>nohup</code> keeps running when its terminal closes, and one that a script starts in the background keeps running on Ctrl+C, because the script&rsquo;s shell ignores SIGINT for it. <code>claudear stop</code> works only for a daemon started with <code>claudear start</code>; stop the other commands with a signal. Claudear then:</p>
         <ol>
           <li>Stops taking new work:
             <ul>
@@ -129,17 +129,18 @@ claudear stop       # stop after in-flight runs finish (up to 30s)</code></pre>
             </ul>
           </li>
           <li>Waits up to 30 seconds for in-flight runs to finish.</li>
-          <li>Exits, even if some runs are still going, in which case it logs <code>Exiting with runs still in flight after 30s</code>. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends. A run cut off this way leaves its fix attempt <code>pending</code>, and Claudear does not pick the issue up again until you run <code>claudear reset &lt;source&gt; &lt;issue_id&gt;</code>.</li>
+          <li>Interrupts the agent CLIs still running after that, logging <code>Interrupting the agent CLIs of the runs still in flight after 30s</code>, and gives their runs up to 5 more seconds to record how they ended. A run that records a failure is retried later, like any failed run. Any agent process still running then is killed. Runs that background housekeeping started (retries, review runs, merge follow-ups, and release cascades) stop when the 30 seconds run out instead, and their agent CLIs are killed straight away.</li>
+          <li>Exits, logging <code>Exiting with runs still in flight</code> if any are left. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends. A run that could not record how it ended leaves its fix attempt <code>pending</code>, and Claudear does not pick the issue up again until you run <code>claudear reset &lt;source&gt; &lt;issue_id&gt;</code>.</li>
         </ol>
-        <p>While it drains, <code>claudear status</code> reports <code>Running: false</code>. <code>claudear stop</code> waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints <code>Daemon stopped.</code> and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. If it cannot read the daemon&rsquo;s PID file, it can only watch the control socket, so once the socket closes it prints <code>The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed.</code> instead. A signal that reaches Claudear during the drain, including after <code>claudear stop</code>, forces an immediate exit.</p>
+        <p>While it drains, <code>claudear status</code> reports <code>Running: false</code>. <code>claudear stop</code> waits up to 45 seconds for the daemon to exit and reports progress every 5 seconds. It prints <code>Daemon stopped.</code> and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 45 seconds. If it cannot read the daemon&rsquo;s PID file, it can only watch the control socket, so once the socket closes it prints <code>The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed.</code> instead. A signal that reaches Claudear while it shuts down, including after <code>claudear stop</code>, forces the exit: Claudear kills every agent CLI and dies of SIGINT at once.</p>
         <p>Exit codes:</p>
         <ul>
           <li><code>0</code> &mdash; graceful shutdown, including when the drain runs out of time</li>
-          <li><code>130</code> &mdash; a signal during the drain forced the exit</li>
+          <li><code>130</code> (death by SIGINT) &mdash; a signal during the shutdown forced the exit</li>
           <li><code>1</code> &mdash; a service failed or stopped on its own (<code>The &lt;name&gt; service stopped unexpectedly</code>), which started the shutdown</li>
         </ul>
-        <p>In a terminal, Ctrl+C also interrupts the agent CLIs that Claudear started. To let in-flight runs finish, send SIGTERM instead, or run <code>claudear stop</code> for a daemon started with <code>claudear start</code>.</p>
-        <p>Under launchd, systemd, or Docker, run <code>claudear start --foreground</code> so the manager keeps track of the process, and give Claudear 45 seconds to stop before it is sent SIGKILL: that covers the 30-second drain, up to 5 seconds for blocking work to stop, and a margin. The examples below are set up this way.</p>
+        <p>One-shot commands that run agents (<code>claudear trigger</code>, <code>claudear action</code>, and <code>claudear retries process</code>) work differently: Ctrl+C interrupts their agent CLIs, kills any still running 5 seconds later, and gives the command up to 30 seconds to record how its runs ended before it exits as interrupted. A second Ctrl+C exits at once.</p>
+        <p>Under launchd, systemd, or Docker, run <code>claudear start --foreground</code> so the manager keeps track of the process, and give Claudear 50 seconds to stop before it is sent SIGKILL: that covers the 30-second drain, up to 5 seconds for interrupted agent CLIs, up to 5 seconds for blocking work to stop, and a margin. The examples below are set up this way.</p>
 
         <h2 id="macos-launchd"><a class="anchor-link" href="#macos-launchd" aria-label="Link to macOS (launchd)">#</a>macOS (launchd)</h2>
         <p>Create a plist at <code>~/Library/LaunchAgents/com.claudear.daemon.plist</code>:</p>
@@ -175,7 +176,7 @@ claudear stop       # stop after in-flight runs finish (up to 30s)</code></pre>
   &lt;key&gt;KeepAlive&lt;/key&gt;
   &lt;true/&gt;
   &lt;key&gt;ExitTimeOut&lt;/key&gt;
-  &lt;integer&gt;45&lt;/integer&gt;
+  &lt;integer&gt;50&lt;/integer&gt;
 &lt;/dict&gt;
 &lt;/plist&gt;</code></pre>
         <p>Load and start the service:</p>
@@ -195,7 +196,7 @@ WorkingDirectory=/path/to/your/project
 EnvironmentFile=/etc/claudear/env
 ExecStart=/usr/local/bin/claudear start --poll --port 3100 --foreground
 KillMode=mixed
-TimeoutStopSec=45
+TimeoutStopSec=50
 Restart=on-failure
 RestartSec=5
 
@@ -209,7 +210,7 @@ CLAUDEAR_LINEAR_API_KEY=lin_api_...</code></pre>
 sudo systemctl enable claudear
 sudo systemctl start claudear
 sudo journalctl -u claudear -f   # follow logs</code></pre>
-        <p><code>KillMode=mixed</code> sends SIGTERM to Claudear only, so the agent CLIs it started keep running while it drains; systemd kills any that are left once Claudear exits. <code>TimeoutStopSec=45</code> is how long systemd waits for Claudear to exit before it sends SIGKILL.</p>
+        <p><code>KillMode=mixed</code> sends SIGTERM to Claudear only, so the agent CLIs it started keep running while it drains; systemd kills any that are left once Claudear exits. <code>TimeoutStopSec=50</code> is how long systemd waits for Claudear to exit before it sends SIGKILL.</p>
 
         <h2 id="docker"><a class="anchor-link" href="#docker" aria-label="Link to Docker">#</a>Docker</h2>
         <p>The image runs Claudear under <a href="https://github.com/krallin/tini">tini</a>, which forwards signals to it and reaps orphaned processes. Its default command is <code>claudear start --foreground</code>, which serves webhooks and the dashboard on port 3100.</p>
@@ -223,7 +224,7 @@ docker compose down</code></pre>
         <h3 id="standalone">Standalone</h3>
         <p>Run the container directly:</p>
         <pre><code class="language-bash">docker run -d --name claudear \
-  --stop-timeout 45 \
+  --stop-timeout 50 \
   -v $(pwd)/claudear.toml:/app/claudear.toml:ro \
   -v claudear-data:/app/data \
   -p 3100:3100 \
@@ -231,7 +232,7 @@ docker compose down</code></pre>
         <p>Health check: <code>GET /api/health</code> returns 200 when Claudear is up.</p>
 
         <h3 id="stopping-the-container">Stopping the container</h3>
-        <p><code>docker stop</code> sends SIGTERM, which tini forwards to Claudear, so it shuts down gracefully. Docker kills the container if it is still running when the stop timeout runs out, and the default timeout is shorter than the drain: Claudear&rsquo;s <code>docker-compose.yml</code> sets <code>stop_grace_period: 45s</code>, and the standalone example passes <code>--stop-timeout 45</code>. For a container started without either, use <code>docker stop -t 45</code>.</p>
+        <p><code>docker stop</code> sends SIGTERM, which tini forwards to Claudear, so it shuts down gracefully. Docker kills the container if it is still running when the stop timeout runs out, and the default timeout is shorter than the drain: Claudear&rsquo;s <code>docker-compose.yml</code> sets <code>stop_grace_period: 50s</code>, and the standalone example passes <code>--stop-timeout 50</code>. For a container started without either, use <code>docker stop -t 50</code>.</p>
         <p>Stop the container with <code>docker stop</code> (or <code>docker compose stop</code>) rather than running <code>claudear stop</code> inside it: the container ends as soon as Claudear exits, and a restart policy such as <code>unless-stopped</code> starts it again unless Docker itself stopped it.</p>
 
         <h2 id="environment-variables"><a class="anchor-link" href="#environment-variables" aria-label="Link to Environment variables">#</a>Environment variables</h2>
