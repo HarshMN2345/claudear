@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval_at, Duration};
 
 /// A candidate issue ready for dispatch: the issue, its match result, and the
 /// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
@@ -60,6 +60,10 @@ const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
 /// How often a drain re-reads the in-flight count, so a missed wake-up delays
 /// shutdown by at most this long.
 const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shortest wait between passes of the source polling loop, so sources with
+/// shorter intervals cannot make it busy-loop.
+const MIN_SOURCE_POLL_PERIOD: Duration = Duration::from_secs(1);
 
 /// Why a trigger is refused once [`Watcher::stop`] has been called.
 const STOPPING_REFUSAL: &str = "Watcher is stopping; not starting new runs";
@@ -1249,36 +1253,33 @@ impl Watcher {
     /// Housekeeping is handled separately by
     /// [`HousekeepingWorker`](crate::housekeeping::HousekeepingWorker).
     async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) {
-        // Build per-source timer state: (source index, interval_ms, last_poll)
         let now = std::time::Instant::now();
-        let mut source_timers: Vec<(usize, u64, std::time::Instant)> = self
+        let mut schedule: Vec<_> = self
             .sources
             .iter()
-            .enumerate()
-            .map(|(i, source)| {
-                let src_interval = self.config.poll_interval_ms_for(source.name()).max(1);
+            .map(|source| {
+                let interval_ms = self.config.poll_interval_ms_for(source.name()).max(1);
                 tracing::info!(
                     source = source.name(),
-                    interval_ms = src_interval,
+                    interval_ms,
                     "Per-source poll interval"
                 );
-                (i, src_interval, now)
+                (source, Duration::from_millis(interval_ms), now)
             })
             .collect();
 
-        // Determine the base tick: minimum source interval or global, whichever is smallest.
-        // Cap at 1s to avoid busy-looping when all intervals are large.
-        let min_source_interval = source_timers
+        let poll_interval = Duration::from_millis(poll_interval);
+        let period = schedule
             .iter()
-            .map(|(_, ms, _)| *ms)
+            .map(|(_, interval, _)| *interval)
             .min()
-            .unwrap_or(poll_interval);
-        let base_tick_ms = min_source_interval.min(poll_interval).max(1000);
-        let mut base_timer = interval(Duration::from_millis(base_tick_ms));
-        base_timer.tick().await; // Skip immediate first tick
+            .unwrap_or(poll_interval)
+            .min(poll_interval)
+            .max(MIN_SOURCE_POLL_PERIOD);
+        let mut timer = interval_at(tokio::time::Instant::now() + period, period);
 
         while self.is_running.load(Ordering::SeqCst) {
-            base_timer.tick().await;
+            timer.tick().await;
             if !self.is_running.load(Ordering::SeqCst) {
                 break;
             }
@@ -1286,15 +1287,13 @@ impl Watcher {
                 continue;
             }
 
-            for (src_idx, src_interval_ms, last_poll) in &mut source_timers {
-                let src_interval = Duration::from_millis(*src_interval_ms);
-                if last_poll.elapsed() >= src_interval {
-                    let source = &self.sources[*src_idx];
-                    if let Err(e) = self.poll_source(source).await {
+            for (source, interval, last_poll) in &mut schedule {
+                if last_poll.elapsed() >= *interval {
+                    if let Err(error) = self.poll_source(source).await {
                         tracing::error!(
                             component = "watcher",
                             source = source.name(),
-                            error = %e,
+                            error = %error,
                             "Error polling source"
                         );
                     }

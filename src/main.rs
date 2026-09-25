@@ -25,7 +25,7 @@ use claudear::{
     repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
-    runner::{process_group, AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
+    runner::{process_group, AgentRunner},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
     shutdown::{self, Outcome, Reason, Service, Signals, Summary},
     source::{
@@ -35,7 +35,7 @@ use claudear::{
     storage::{
         ActivityStore, EmbeddingStore, FixAttemptTracker, RepoStore, SqliteTracker, UserStore,
     },
-    telemetry::{InstrumentedNotifier, InstrumentedRunner, InstrumentedScm, InstrumentedSource},
+    telemetry::{InstrumentedNotifier, InstrumentedScm, InstrumentedSource},
     types::{ActionKind, ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
     watcher::{RetryOutcome, Watcher, WatcherOptions, MANUAL_TRIGGER},
@@ -1800,6 +1800,11 @@ fn http_mode(webhooks: bool, dashboard: bool) -> Option<HttpMode> {
         (false, false) => None,
     }
 }
+
+const IPC_SERVICE: &str = "ipc";
+const HTTP_SERVICE: &str = "http";
+const POLL_SERVICE: &str = "poll";
+const HOUSEKEEPING_SERVICE: &str = "housekeeping";
 
 /// What a daemon mode stops and waits for when it shuts down.
 struct Daemon<'a> {
@@ -3723,7 +3728,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let tracker = tracker.clone();
             let runs = runs.clone();
             let config_path = std::path::PathBuf::from(&config_path);
-            Service::new("http", async move {
+            Service::new(HTTP_SERVICE, async move {
                 match mode {
                     HttpMode::Webhooks { dashboard } => {
                         let handlers = create_webhook_handlers(&config);
@@ -3766,7 +3771,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             })
         });
         let poll = if enable_polling {
-            Service::new("poll", async {
+            Service::new(POLL_SERVICE, async {
                 watcher
                     .start(Some(*poll_interval))
                     .await
@@ -3774,9 +3779,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             })
         } else {
             let worker = HousekeepingWorker::new(watcher.clone(), *poll_interval);
-            Service::new("housekeeping", async move { worker.start().await })
+            Service::new(HOUSEKEEPING_SERVICE, async move { worker.start().await })
         };
-        let ipc = Service::new("ipc", async {
+        let ipc = Service::new(IPC_SERVICE, async {
             ipc_server.start().await.map_err(anyhow::Error::from)
         });
 
@@ -4070,16 +4075,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         println!("\nProcessing {} retries...", ready.len());
 
-        // Need sources and watcher for processing
         let sources = create_sources(&config, &tracker);
         if sources.is_empty() {
             anyhow::bail!("No sources were initialized");
         }
 
-        // Create GitHub client for API-based repo discovery
         let github_client = GitHubClient::new(config.github().clone());
-
-        // Build inferrer for retry processing (with embeddings for semantic matching)
         let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
             &config,
             Some(&github_client),
@@ -4087,17 +4088,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         )
         .await?;
 
-        // Create ReviewWatcher for PR review tracking
         let review_watcher = create_review_watcher(&config, tracker.clone());
 
         let issue_embedding_service =
             build_issue_embedding_service(&tracker, embedding_client.as_ref());
 
         let code_search_service = if config.code_index.enabled {
-            embedding_client.as_ref().map(|emb| {
+            embedding_client.as_ref().map(|client| {
                 Arc::new(claudear::repo::code_index::CodeSearchService::new(
                     tracker.clone(),
-                    emb.clone(),
+                    client.clone(),
                 ))
             })
         } else {
@@ -4105,51 +4105,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         };
 
         let agent: Arc<dyn AgentRunner> =
-            InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.agent.timeout_secs,
-                    model: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.model.clone()),
-                    instructions: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.instructions.clone()),
-                    permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.permissions.clone())
-                        .unwrap_or_default(),
-                    readonly_tools: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.readonly_tools.clone())
-                        .unwrap_or_default(),
-                    skip_permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.skip_permissions)
-                        .unwrap_or(false),
-                    binary: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.binary.clone())
-                        .unwrap_or_else(|| "claude".to_string()),
-                    env: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.env.clone())
-                        .unwrap_or_default(),
-                    mcp: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.mcp.clone())
-                        .unwrap_or_default(),
-                    debug_logging: config.debug_logging,
-                },
-                tracker.clone(),
-            )));
+            claudear::build_provider_runner(&config, tracker.clone(), None);
 
         let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
@@ -4451,10 +4407,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     .collect(),
             };
             let services = [
-                Service::new("http", async move {
+                Service::new(HTTP_SERVICE, async move {
                     server.start().await.map_err(anyhow::Error::from)
                 }),
-                Service::new("housekeeping", worker.start()),
+                Service::new(HOUSEKEEPING_SERVICE, worker.start()),
             ];
             let summary = daemon.serve(services, pending()).await?;
             if let Some(error) = summary.error {
@@ -4631,7 +4587,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         runs: None,
                         monitors: Vec::new(),
                     };
-                    let poll = Service::new("poll", async {
+                    let poll = Service::new(POLL_SERVICE, async {
                         watcher.start(None).await.map_err(anyhow::Error::from)
                     });
                     let summary = daemon.serve([poll], pending()).await?;
@@ -4680,7 +4636,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             .flatten()
                             .collect(),
                     };
-                    let poll = Service::new("poll", async {
+                    let poll = Service::new(POLL_SERVICE, async {
                         watcher
                             .start(Some(interval))
                             .await
@@ -4693,7 +4649,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             port,
                             std::path::PathBuf::from(&config_path),
                         );
-                        Service::new("http", async move {
+                        Service::new(HTTP_SERVICE, async move {
                             server.start().await.map_err(anyhow::Error::from)
                         })
                     });
@@ -4802,6 +4758,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use claudear::runner::{ClaudeAgentRunner, ClaudeRunnerConfig};
     use claudear::types::MatchResult;
     use futures::channel::mpsc::unbounded;
     use std::collections::HashMap;
