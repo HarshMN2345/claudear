@@ -20,13 +20,18 @@ use std::time::Duration;
 /// How long shutdown waits for in-flight runs to finish.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long interrupted agent CLIs get to end, and their runs to record how they ended, before
+/// whatever is left of them is killed.
+pub const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
+
 /// How long the runtime waits for blocking work, such as a local model call, after the drain
 /// before the process exits anyway.
 pub const RUNTIME_GRACE: Duration = Duration::from_secs(5);
 
-/// How long `claudear stop` waits for the daemon to exit: the drain and the runtime grace,
-/// plus a margin for the process to finish exiting.
+/// How long `claudear stop` waits for the daemon to exit: the drain, the agent CLIs' interrupt
+/// grace and the runtime grace, plus a margin for the process to finish exiting.
 pub const EXIT_TIMEOUT: Duration = DRAIN_TIMEOUT
+    .saturating_add(INTERRUPT_GRACE)
     .saturating_add(RUNTIME_GRACE)
     .saturating_add(EXIT_MARGIN);
 

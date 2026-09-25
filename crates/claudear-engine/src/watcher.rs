@@ -1345,9 +1345,9 @@ impl Watcher {
         false
     }
 
-    /// Wait until no run is in flight, waking on each release and at least
-    /// every [`DRAIN_RECHECK_INTERVAL`].
-    async fn wait_until_idle(&self) {
+    /// Wait until no run is [in flight](Self::in_flight), waking on each
+    /// release and re-checking at a short interval in case a wake-up is missed.
+    pub async fn wait_until_idle(&self) {
         let mut reported = 0;
         loop {
             let released = self.next_slot_release();

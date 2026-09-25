@@ -7,6 +7,7 @@ use claudear::shutdown;
 use sandbox::Sandbox;
 use std::fs;
 use std::io;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -21,7 +22,6 @@ const HANGUP_WAIT: Duration = Duration::from_secs(2);
 const SUSPEND_WAIT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(3600);
-const FORCED_EXIT_CODE: i32 = 130;
 const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 const DAEMON: &str = "daemon";
 const STOP: &str = "stop";
@@ -398,9 +398,9 @@ async fn second_signal_forces_the_exit_after_flushing_the_log() {
     let status = sandbox.wait_for_exit(&mut daemon).await;
 
     assert_eq!(
-        status.code(),
-        Some(FORCED_EXIT_CODE),
-        "the daemon exited with {status}\n{}",
+        status.signal(),
+        Some(libc::SIGINT),
+        "a forced daemon must die of SIGINT, so a calling shell stops too, but it exited with {status}\n{}",
         sandbox.diagnostics()
     );
     assert!(

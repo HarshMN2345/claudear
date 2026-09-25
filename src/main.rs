@@ -46,7 +46,7 @@ use claudear::{
         WebhookServer, WhatsAppWebhookHandler,
     },
 };
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde_json::json;
 use std::future::{pending, Future};
 use std::sync::Arc;
@@ -1709,9 +1709,6 @@ fn release_stale_deploy_qa_tips(tracker: &dyn FixAttemptTracker, stale_after: Du
     }
 }
 
-/// How long interrupted agent CLIs get to clean up before they are killed.
-const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
-
 /// How long an interrupted one-shot command gets to record how its runs ended.
 const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1743,11 +1740,11 @@ fn force_quit() -> ! {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
         libc::raise(libc::SIGINT);
     }
-    std::process::exit(130);
+    std::process::exit(FORCED_EXIT_CODE);
 }
 
 /// Run a one-shot command that may start agent runs. On interrupt, pass it on
-/// to the agent CLIs, kill whatever is left after [`INTERRUPT_GRACE`], and give
+/// to the agent CLIs, kill whatever is left after [`shutdown::INTERRUPT_GRACE`], and give
 /// the command up to [`WRAP_UP_TIMEOUT`] to record how its runs ended before
 /// force-quitting. The command must not start new runs once
 /// [`process_group::Registry::is_interrupted`].
@@ -1761,7 +1758,7 @@ async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
     let wrap_up = async {
         tokio::join!(
             &mut command,
-            process_group::Registry::global().shutdown(INTERRUPT_GRACE)
+            process_group::Registry::global().shutdown(shutdown::INTERRUPT_GRACE)
         )
     };
     tokio::select! {
@@ -1771,11 +1768,12 @@ async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
     force_quit();
 }
 
-/// Exit code for a shutdown forced by a second signal, as for any interrupted process.
+/// Exit code of a [`force_quit`] that raising SIGINT did not end, the status a shell reports
+/// for a process SIGINT killed.
 const FORCED_EXIT_CODE: i32 = 130;
 
-/// A second signal cut the drain short. `async_main` returns it instead of exiting in place,
-/// so its logging guard flushes the file log before `main` exits with [`FORCED_EXIT_CODE`].
+/// A second signal cut the shutdown short. `async_main` returns it instead of exiting in place,
+/// so its logging guard flushes the file log before `main` force-quits.
 #[derive(Debug, Error)]
 #[error("shutdown forced by a second signal")]
 struct ForcedShutdown;
@@ -1816,7 +1814,7 @@ struct Daemon<'a> {
 
 impl Daemon<'_> {
     /// Run `services` until a signal, `request` or a service ending starts the shutdown, then
-    /// stop taking new work and drain the runs in flight.
+    /// stop taking new work, drain the runs in flight and [wrap up](Self::wrap_up).
     ///
     /// Fails with [`ForcedShutdown`] when another signal forces the shutdown.
     async fn serve<'s>(
@@ -1825,13 +1823,21 @@ impl Daemon<'_> {
         request: impl Future<Output = ()>,
     ) -> anyhow::Result<Summary> {
         let mut signals = Signals::listen()?;
-        self.serve_with(&mut signals, services, request).await
+        self.serve_with(
+            &mut signals,
+            process_group::Registry::global(),
+            services,
+            request,
+        )
+        .await
     }
 
-    /// [`Self::serve`], reading the stop signals from `signals`.
+    /// [`Self::serve`], reading the stop signals from `signals` and wrapping up the agent CLIs
+    /// registered in `registry`.
     async fn serve_with<'s>(
         &self,
         signals: &mut (impl Stream<Item = Reason> + Unpin),
+        registry: &process_group::Registry,
         services: impl IntoIterator<Item = Service<'s>>,
         request: impl Future<Output = ()>,
     ) -> anyhow::Result<Summary> {
@@ -1845,12 +1851,41 @@ impl Daemon<'_> {
             Outcome::TimedOut => tracing::warn!(
                 watcher_runs = self.watcher_runs(),
                 webhook_runs = self.webhook_runs(),
-                "Exiting with runs still in flight after {}s",
+                "Interrupting the agent CLIs of the runs still in flight after {}s",
                 shutdown::DRAIN_TIMEOUT.as_secs()
             ),
             Outcome::Drained => {}
         }
+        tokio::select! {
+            biased;
+            Some(_) = signals.next() => {
+                tracing::warn!("Shutdown forced, exiting immediately");
+                return Err(ForcedShutdown.into());
+            }
+            () = self.wrap_up(registry) => {}
+        }
+        let (watcher_runs, webhook_runs) = (self.watcher_runs(), self.webhook_runs());
+        if watcher_runs > 0 || webhook_runs > 0 {
+            tracing::warn!(
+                watcher_runs,
+                webhook_runs,
+                "Exiting with runs still in flight"
+            );
+        }
         Ok(summary)
+    }
+
+    /// Interrupt the agent CLIs still running in `registry`, give their runs up to
+    /// [`shutdown::INTERRUPT_GRACE`] to record how they ended, and kill whatever is left. After
+    /// a drain that finished, nothing is left and this returns at once.
+    async fn wrap_up(&self, registry: &process_group::Registry) {
+        let runs_ended = async {
+            tokio::join!(self.watcher.wait_until_idle(), self.webhook_runs_ended());
+        };
+        let _ = tokio::join!(
+            registry.shutdown(shutdown::INTERRUPT_GRACE),
+            tokio::time::timeout(shutdown::INTERRUPT_GRACE, runs_ended),
+        );
     }
 
     fn stop(&self) {
@@ -1872,13 +1907,15 @@ impl Daemon<'_> {
     }
 
     async fn drain(&self) -> bool {
-        let webhooks = async {
-            if let Some(runs) = self.runs {
-                runs.wait().await;
-            }
-        };
-        let (watcher_drained, ()) = tokio::join!(self.watcher.stop_and_drain(), webhooks);
+        let (watcher_drained, ()) =
+            tokio::join!(self.watcher.stop_and_drain(), self.webhook_runs_ended());
         watcher_drained
+    }
+
+    async fn webhook_runs_ended(&self) {
+        if let Some(runs) = self.runs {
+            runs.wait().await;
+        }
     }
 
     /// The watcher runs the drain waits for, including retries and follow-ups that hold no
@@ -2075,7 +2112,7 @@ fn main() -> anyhow::Result<()> {
     if forced {
         runtime.shutdown_background();
         drop(sentry_guard);
-        std::process::exit(FORCED_EXIT_CODE);
+        force_quit();
     }
     runtime.shutdown_timeout(shutdown::RUNTIME_GRACE);
     result
@@ -4762,10 +4799,31 @@ mod tests {
     use claudear::types::MatchResult;
     use futures::channel::mpsc::unbounded;
     use std::collections::HashMap;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+    use tokio::process::{Child, ChildStdout, Command};
     use tokio::sync::Notify;
 
     const PARKED_SOURCE: &str = "parked";
     const PARKED_ISSUE: &str = "parked-1";
+
+    /// An agent CLI that exits with [`INTERRUPTED_CLI_STATUS`] on SIGINT. Perl, because a shell
+    /// cannot trap a signal it inherited as ignored, as a test runner a script backgrounds does.
+    const INTERRUPTIBLE_CLI: &str =
+        r#"$| = 1; $SIG{INT} = sub { exit 7 }; print "ready\n"; sleep 1 while 1"#;
+    const INTERRUPTED_CLI_STATUS: i32 = 7;
+
+    /// An agent CLI that reports SIGINT with [`CLI_INTERRUPTED`] and keeps running.
+    const STUBBORN_CLI: &str =
+        r#"$| = 1; $SIG{INT} = sub { print "interrupted\n" }; print "ready\n"; sleep 1 while 1"#;
+    const CLI_READY: &str = "ready";
+    const CLI_INTERRUPTED: &str = "interrupted";
+
+    /// How long an interrupted run takes to record how it ended.
+    const RECORDING_TIME: Duration = Duration::from_millis(200);
+
+    /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
+    const WRAP_UP_DEADLINE: Duration = Duration::from_secs(30);
 
     /// A source whose `get_issue` signals its arrival and then never returns.
     #[derive(Default)]
@@ -4857,11 +4915,131 @@ mod tests {
         sender.unbounded_send(Reason::Interrupted).unwrap();
 
         let result = daemon
-            .serve_with(&mut signals, [Service::new("idle", pending())], pending())
+            .serve_with(
+                &mut signals,
+                &process_group::Registry::new(),
+                [Service::new("idle", pending())],
+                pending(),
+            )
             .await;
 
         let error = result.expect_err("a forced shutdown must fail serve");
         assert!(error.is::<ForcedShutdown>(), "unexpected error {error:#}");
+    }
+
+    /// Spawn `script` as an agent CLI leading a process group registered in `registry`,
+    /// returning once it is ready, with the rest of its output.
+    async fn spawn_cli<'r>(
+        script: &str,
+        registry: &'r process_group::Registry,
+    ) -> (
+        Child,
+        process_group::Guard<'r>,
+        Lines<BufReader<ChildStdout>>,
+    ) {
+        let mut command = Command::new("perl");
+        command
+            .args(["-e", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let (mut cli, guard) =
+            process_group::Guard::spawn(&mut command, registry).expect("spawn the agent CLI");
+        let mut output = BufReader::new(cli.stdout.take().expect("the CLI's stdout")).lines();
+        let ready = output.next_line().await.expect("read the CLI's output");
+        assert_eq!(ready.as_deref(), Some(CLI_READY));
+        (cli, guard, output)
+    }
+
+    #[tokio::test]
+    async fn wrap_up_interrupts_agent_clis_and_waits_for_their_runs_to_end() {
+        let tracker = in_memory_tracker();
+        tracker
+            .record_attempt(PARKED_SOURCE, PARKED_ISSUE, PARKED_ISSUE)
+            .expect("record the attempt");
+        tracker
+            .mark_failed(PARKED_SOURCE, PARKED_ISSUE, "the first run failed")
+            .expect("mark the attempt failed");
+        let attempt = tracker
+            .get_attempt(PARKED_SOURCE, PARKED_ISSUE)
+            .expect("read the attempt")
+            .expect("the attempt is recorded");
+        let source = Arc::new(ParkedSource::default());
+        let watcher = watcher_with(tracker, vec![source.clone()]);
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: None,
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (mut cli, mut guard, _output) = spawn_cli(INTERRUPTIBLE_CLI, &registry).await;
+        let run = async {
+            let mut retry = std::pin::pin!(watcher.retry(&attempt, MANUAL_TRIGGER));
+            let status = tokio::select! {
+                outcome = &mut retry => panic!("the run ended before its agent CLI: {outcome:?}"),
+                status = guard.wait(&mut cli) => status.expect("wait for the agent CLI"),
+            };
+            tokio::time::sleep(RECORDING_TIME).await;
+            status
+        };
+        let wrap_up = async {
+            source.arrived.notified().await;
+            daemon.wrap_up(&registry).await;
+            watcher.in_flight()
+        };
+
+        let (status, in_flight) =
+            tokio::time::timeout(WRAP_UP_DEADLINE, async { tokio::join!(run, wrap_up) })
+                .await
+                .expect("the wrap-up must interrupt the agent CLI so its run can end");
+
+        assert_eq!(
+            status.code(),
+            Some(INTERRUPTED_CLI_STATUS),
+            "the agent CLI must be interrupted rather than killed, but exited with {status}"
+        );
+        assert_eq!(
+            in_flight, 0,
+            "the wrap-up must wait for the interrupted run to record how it ended"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_signal_during_the_wrap_up_forces_the_shutdown() {
+        let watcher = idle_watcher();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: None,
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (_cli, _guard, mut output) = spawn_cli(STUBBORN_CLI, &registry).await;
+        let (sender, mut signals) = unbounded();
+        sender.unbounded_send(Reason::Terminated).unwrap();
+        let started = Instant::now();
+
+        let (result, ()) = tokio::join!(
+            daemon.serve_with(
+                &mut signals,
+                &registry,
+                [Service::new("idle", pending())],
+                pending(),
+            ),
+            async {
+                let line = output.next_line().await.expect("read the CLI's output");
+                assert_eq!(line.as_deref(), Some(CLI_INTERRUPTED));
+                sender.unbounded_send(Reason::Interrupted).unwrap();
+            },
+        );
+
+        let error = result.expect_err("a signal during the wrap-up must force the shutdown");
+        assert!(error.is::<ForcedShutdown>(), "unexpected error {error:#}");
+        assert!(
+            started.elapsed() < shutdown::INTERRUPT_GRACE,
+            "the second signal must cut the wrap-up short instead of waiting out the grace"
+        );
     }
 
     #[tokio::test]
