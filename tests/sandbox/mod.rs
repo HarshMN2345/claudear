@@ -12,7 +12,8 @@ const TAIL_LINES: usize = 40;
 const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
 
 /// A home, config and database for the claudear binary, whose only source is a Jira nothing
-/// listens for. It lives under /tmp to keep the daemon's socket path short.
+/// listens for and whose retries are due at once. It lives under /tmp to keep the daemon's
+/// socket path short.
 pub struct Sandbox {
     root: TempDir,
 }
@@ -105,6 +106,10 @@ enabled = false
 
 [regression]
 enabled = false
+
+[retry]
+base_delay_ms = 0
+max_delay_ms = 0
 
 [issues.jira]
 enabled = true
