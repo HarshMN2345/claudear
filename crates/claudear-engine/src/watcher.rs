@@ -64,15 +64,49 @@ const DRAIN_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Why a trigger is refused once [`Watcher::stop`] has been called.
 const STOPPING_REFUSAL: &str = "Watcher is stopping; not starting new runs";
 
+/// Why an issue triggered outside a poll is processed.
+pub(crate) const MANUAL_TRIGGER: &str = "Manual trigger";
+
+/// Prefix of the error recorded on an attempt whose retry could not run.
+pub(crate) const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";
+
 /// How [`Watcher::process_issue`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IssueRun {
     /// The issue went through the processing pipeline.
     Processed,
-    /// The issue was skipped, such as one already being processed.
+    /// The issue was skipped, such as a `deploy_qa` tip that already has a
+    /// verdict or a run its [`Admission`] refused.
     Skipped,
+    /// The issue is already being processed, so no run started.
+    Busy,
     /// The watcher is stopping, so no run started.
     Stopping,
+    /// The watcher is paused for a rate limit, so no run started.
+    Paused,
+}
+
+/// Decides whether a run [`Watcher::process_issue`] admitted may start. It is
+/// called at most once, after the issue is claimed and the watcher is found
+/// not stopping, and before anything is recorded for the run.
+type Admission<'a> = Box<dyn FnOnce() -> bool + Send + 'a>;
+
+/// How [`Watcher::retry`] ended.
+#[derive(Debug)]
+pub enum RetryOutcome {
+    /// The issue went through the processing pipeline.
+    Ran,
+    /// The watcher is stopping, so the attempt is left as it was for the next
+    /// start.
+    Stopping,
+    /// The issue is already being processed, so the attempt is left as it was
+    /// for a later retry.
+    Busy,
+    /// The retry could not run. A transient error, such as a network error or
+    /// a pause for a rate limit, leaves the attempt as it was; any other error
+    /// spent the attempt's retry and marked it failed, unless the retry itself
+    /// could not be spent.
+    Failed(claudear_core::error::Error),
 }
 
 /// Whether a retry that failed to start should get its retry back.
@@ -255,8 +289,9 @@ impl Drop for ProcessingClaim<'_> {
     }
 }
 
-/// A housekeeping run's hold on the shutdown drain, released on drop. It takes
-/// no processing slot, so [`Watcher::active_count`] leaves it out.
+/// A retry's or housekeeping run's hold on the shutdown drain, released on
+/// drop. It takes no processing slot, so [`Watcher::active_count`] leaves it
+/// out.
 ///
 /// Take it before checking whether the watcher stopped: [`Watcher::stop`]
 /// sets `stopped` and clears `is_running` before the drain reads
@@ -1340,8 +1375,8 @@ impl Watcher {
     }
 
     /// Number of holds [`Self::stop_and_drain`] waits for: one per issue being
-    /// processed, and one per housekeeping retry, review run, merge follow-up
-    /// or release cascade in progress.
+    /// processed, and one per retry, review run, merge follow-up or release
+    /// cascade in progress.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
     }
@@ -2752,22 +2787,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
             let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
             if self.lock_processing().contains(&processing_key) {
-                self.record_source_decision(
-                    &attempt.source,
-                    "ready_retry_skipped_inflight",
-                    format!(
-                        "Retry skipped because {} is already in-flight",
-                        attempt.short_id
-                    ),
-                    json!({
-                        "issue_id": attempt.issue_id.clone(),
-                        "short_id": attempt.short_id.clone(),
-                    }),
-                );
-                tracing::debug!(
-                    short_id = %attempt.short_id,
-                    "Issue already being processed, skipping retry"
-                );
+                self.skip_inflight_retry(&attempt);
                 continue;
             }
 
@@ -2790,73 +2810,23 @@ Create a PR with your changes.{custom_instructions}"#,
                 released.await;
             }
 
-            let claim = self.claim_run();
-            if !self.is_running() {
-                break;
-            }
-
-            tracing::info!(
-                component = "watcher",
-                source = %attempt.source,
-                short_id = %attempt.short_id,
-                retry_count = attempt.retry_count,
-                "Retrying issue"
-            );
-
-            retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
-
-            let trigger_reason = {
-                let reason_detail = if attempt.status == FixAttemptStatus::Closed {
+            let reason = {
+                let detail = if attempt.status == FixAttemptStatus::Closed {
                     "PR closed without merge".to_string()
-                } else if let Some(ref err) = attempt.error_message {
-                    let truncated = if err.len() > 80 {
-                        format!("{}...", &err[..err.floor_char_boundary(77)])
+                } else if let Some(ref error) = attempt.error_message {
+                    if error.len() > 80 {
+                        format!("{}...", &error[..error.floor_char_boundary(77)])
                     } else {
-                        err.clone()
-                    };
-                    truncated
+                        error.clone()
+                    }
                 } else {
                     "previous failure".to_string()
                 };
-                format!(
-                    "Retry attempt {}: {}",
-                    attempt.retry_count + 1,
-                    reason_detail
-                )
+                format!("Retry attempt {}: {}", attempt.retry_count + 1, detail)
             };
 
-            match self
-                .trigger_issue_with_feedback(
-                    &attempt.source,
-                    &attempt.issue_id,
-                    None,
-                    None,
-                    Some(trigger_reason),
-                )
-                .await
-            {
-                Ok(()) => {
-                    // Only this path charges a retry, so only it refunds one: running
-                    // out of quota says nothing about the issue
-                    if let Ok(Some(after)) =
-                        self.tracker.get_attempt(&attempt.source, &attempt.issue_id)
-                    {
-                        let hit_rate_limit = after.status == FixAttemptStatus::Failed
-                            && after
-                                .error_message
-                                .as_deref()
-                                .is_some_and(runner::is_rate_limit_error);
-                        if hit_rate_limit {
-                            let error = after.error_message.unwrap_or_default();
-                            if let Err(e) = self.tracker.mark_failed_uncharged(
-                                &attempt.source,
-                                &attempt.issue_id,
-                                &error,
-                            ) {
-                                tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to refund retry after rate limit");
-                            }
-                        }
-                    }
+            match self.retry(&attempt, &reason).await {
+                RetryOutcome::Ran => {
                     self.record_source_decision(
                         &attempt.source,
                         "ready_retry_triggered",
@@ -2870,11 +2840,13 @@ Create a PR with your changes.{custom_instructions}"#,
                     retries_executed += 1;
                     let metric = ProcessingMetric::new("ready_retry_executed", 1.0)
                         .with_source(attempt.source.clone());
-                    if let Err(e) = self.tracker.record_metric(&metric) {
-                        tracing::debug!(error = %e, "Failed to record ready_retry_executed metric");
+                    if let Err(error) = self.tracker.record_metric(&metric) {
+                        tracing::debug!(error = %error, "Failed to record ready_retry_executed metric");
                     }
                 }
-                Err(e) => {
+                RetryOutcome::Busy => self.skip_inflight_retry(&attempt),
+                RetryOutcome::Stopping => break,
+                RetryOutcome::Failed(error) => {
                     self.record_source_decision(
                         &attempt.source,
                         "ready_retry_trigger_failed",
@@ -2883,48 +2855,26 @@ Create a PR with your changes.{custom_instructions}"#,
                             "issue_id": attempt.issue_id.clone(),
                             "short_id": attempt.short_id.clone(),
                             "retry_count": attempt.retry_count,
-                            "error": e.to_string(),
+                            "error": error.to_string(),
                         }),
                     );
                     retries_failed += 1;
-                    let retry_error = format!("Retry trigger failed: {}", e);
-                    // A network blip or in-flight clash says nothing about the issue, so
-                    // refund the retry; a permanent error like a deleted issue keeps its charge
-                    let marked = if retry_trigger_error_is_transient(&e) {
-                        self.tracker.mark_failed_uncharged(
-                            &attempt.source,
-                            &attempt.issue_id,
-                            &retry_error,
-                        )
-                    } else {
-                        self.tracker
-                            .mark_failed(&attempt.source, &attempt.issue_id, &retry_error)
-                    };
-                    if let Err(mark_err) = marked {
-                        tracing::warn!(
-                            component = "watcher",
-                            short_id = %attempt.short_id,
-                            error = %mark_err,
-                            "Failed to restore retry attempt state after trigger error"
-                        );
-                    }
                     let metric = ProcessingMetric::new("ready_retry_failed", 1.0)
                         .with_source(attempt.source.clone());
-                    if let Err(record_err) = self.tracker.record_metric(&metric) {
+                    if let Err(record_error) = self.tracker.record_metric(&metric) {
                         tracing::debug!(
-                            error = %record_err,
+                            error = %record_error,
                             "Failed to record ready_retry_failed metric"
                         );
                     }
                     tracing::error!(
                         component = "watcher",
                         short_id = %attempt.short_id,
-                        error = %e,
+                        error = %error,
                         "Failed to trigger retry"
                     );
                 }
             }
-            drop(claim);
 
             if i + 1 < ready_count && self.config.processing_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
@@ -2944,6 +2894,184 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         Ok(())
+    }
+
+    /// Record that `attempt` was not retried because its issue is already
+    /// being processed.
+    fn skip_inflight_retry(&self, attempt: &FixAttempt) {
+        self.record_source_decision(
+            &attempt.source,
+            "ready_retry_skipped_inflight",
+            format!(
+                "Retry skipped because {} is already in-flight",
+                attempt.short_id
+            ),
+            json!({
+                "issue_id": attempt.issue_id.clone(),
+                "short_id": attempt.short_id.clone(),
+            }),
+        );
+        tracing::debug!(
+            short_id = %attempt.short_id,
+            "Issue already being processed, skipping retry"
+        );
+    }
+
+    /// Retry `attempt`'s issue now, recording `reason` as why it runs again.
+    ///
+    /// The shutdown drain waits for the whole retry. The retry is spent once
+    /// its run is admitted, or when its issue cannot be loaded or run, so an
+    /// issue that keeps failing still runs out of retries. A failure that says
+    /// nothing about the issue costs no retry: a retry refused because the
+    /// watcher is stopping or paused for a rate limit, because the issue is
+    /// already being processed, or because loading it failed transiently, such
+    /// as on a network error, leaves the attempt as it was, and a run that ends
+    /// on a rate limit gets its retry back.
+    pub async fn retry(&self, attempt: &FixAttempt, reason: &str) -> RetryOutcome {
+        let _claim = self.claim_run();
+        if self.is_stopped() {
+            tracing::info!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                "Not retrying because the watcher is stopping"
+            );
+            return RetryOutcome::Stopping;
+        }
+        tracing::info!(
+            component = "watcher",
+            source = %attempt.source,
+            short_id = %attempt.short_id,
+            retry_count = attempt.retry_count,
+            "Retrying issue"
+        );
+
+        let retry_manager = RetryManager::new(self.config.retry.clone(), Arc::clone(&self.tracker));
+        let Some(source) = self
+            .sources
+            .iter()
+            .find(|source| source.name() == attempt.source)
+        else {
+            let error = claudear_core::error::Error::source(&attempt.source, "Unknown source");
+            return self.fail_retry(&retry_manager, attempt, error);
+        };
+        let mut issue = match source.get_issue(&attempt.issue_id).await {
+            Ok(issue) => issue,
+            Err(error) if retry_trigger_error_is_transient(&error) => {
+                return RetryOutcome::Failed(error)
+            }
+            Err(error) => return self.fail_retry(&retry_manager, attempt, error),
+        };
+        issue.set_metadata("trigger_reason", reason);
+
+        let mut spend = None;
+        let run = self
+            .process_issue(
+                Arc::clone(source),
+                issue,
+                MatchResult::matched(MANUAL_TRIGGER, MatchPriority::Urgent),
+                None,
+                None,
+                None,
+                // Spent only here, once admitted, so a stop or a busy issue costs no retry.
+                Some(Box::new(|| {
+                    spend
+                        .insert(retry_manager.prepare_retry(&attempt.source, &attempt.issue_id))
+                        .is_ok()
+                })),
+            )
+            .await;
+        let skipped =
+            || claudear_core::error::Error::Other(format!("{} was skipped", attempt.short_id));
+        match (run, spend) {
+            (IssueRun::Processed, Some(Ok(()))) => {
+                self.refund_rate_limited_retry(attempt);
+                RetryOutcome::Ran
+            }
+            (IssueRun::Processed, _) => RetryOutcome::Ran,
+            (IssueRun::Stopping, _) => RetryOutcome::Stopping,
+            (IssueRun::Busy, _) => RetryOutcome::Busy,
+            (IssueRun::Paused, _) => {
+                RetryOutcome::Failed(claudear_core::error::Error::Other(format!(
+                    "{} was not run while paused for a rate limit",
+                    attempt.short_id
+                )))
+            }
+            (IssueRun::Skipped, Some(Err(error))) => RetryOutcome::Failed(error),
+            (IssueRun::Skipped, Some(Ok(()))) => self.mark_retry_failed(attempt, skipped()),
+            (IssueRun::Skipped, None) => self.fail_retry(&retry_manager, attempt, skipped()),
+        }
+    }
+
+    /// Spend the retry of `attempt`, whose issue could not run, and mark it
+    /// failed with `error`, so an issue that keeps failing still runs out of
+    /// retries.
+    fn fail_retry(
+        &self,
+        retry_manager: &RetryManager,
+        attempt: &FixAttempt,
+        error: claudear_core::error::Error,
+    ) -> RetryOutcome {
+        if let Err(spend_error) = retry_manager.prepare_retry(&attempt.source, &attempt.issue_id) {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                error = %spend_error,
+                "Failed to spend the retry of an issue that could not run"
+            );
+            return RetryOutcome::Failed(error);
+        }
+        self.mark_retry_failed(attempt, error)
+    }
+
+    /// Mark `attempt`, whose retry was spent without a run, failed with
+    /// `error`: retries pick up only failed attempts, so it would otherwise
+    /// stay pending until the watcher next starts.
+    fn mark_retry_failed(
+        &self,
+        attempt: &FixAttempt,
+        error: claudear_core::error::Error,
+    ) -> RetryOutcome {
+        let message = format!("{RETRY_TRIGGER_FAILED}: {error}");
+        if let Err(mark_error) =
+            self.tracker
+                .mark_failed(&attempt.source, &attempt.issue_id, &message)
+        {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                error = %mark_error,
+                "Failed to restore retry attempt state after trigger error"
+            );
+        }
+        RetryOutcome::Failed(error)
+    }
+
+    /// Give back the retry `attempt` spent on a run that ended on a rate
+    /// limit: running out of quota says nothing about the issue.
+    fn refund_rate_limited_retry(&self, attempt: &FixAttempt) {
+        let Ok(Some(after)) = self.tracker.get_attempt(&attempt.source, &attempt.issue_id) else {
+            return;
+        };
+        let hit_rate_limit = after.status == FixAttemptStatus::Failed
+            && after
+                .error_message
+                .as_deref()
+                .is_some_and(runner::is_rate_limit_error);
+        if !hit_rate_limit {
+            return;
+        }
+        let error = after.error_message.unwrap_or_default();
+        if let Err(refund_error) =
+            self.tracker
+                .mark_failed_uncharged(&attempt.source, &attempt.issue_id, &error)
+        {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                error = %refund_error,
+                "Failed to refund retry after rate limit"
+            );
+        }
     }
 
     /// After a fix merges, post a human-sounding "fix shipped" reply back to the
@@ -3857,7 +3985,7 @@ Create a PR with your changes.{custom_instructions}"#,
             let source_clone = Arc::clone(source);
             let handle = tokio::spawn(async move {
                 watcher
-                    .process_issue(source_clone, issue, match_result, None, None, intent)
+                    .process_issue(source_clone, issue, match_result, None, None, intent, None)
                     .await;
             });
             self.spawn_handles.lock().await.push(handle);
@@ -4137,6 +4265,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     None,
                     None,
                     Some(Intent::Question),
+                    None,
                 )
                 .await;
             }
@@ -4262,7 +4391,9 @@ Create a PR with your changes.{custom_instructions}"#,
     ///
     /// Once [`Self::stop`] has been called no run starts and nothing is
     /// recorded, so a run dispatched or triggered before the stop cannot
-    /// start after the shutdown drain has finished.
+    /// start after the shutdown drain has finished. A run its `admission`
+    /// refuses does not start or record anything either.
+    #[expect(clippy::too_many_arguments)]
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -4271,6 +4402,7 @@ Create a PR with your changes.{custom_instructions}"#,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
         intent: Option<Intent>,
+        admission: Option<Admission<'_>>,
     ) -> IssueRun {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
@@ -4305,7 +4437,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Skipping issue processing while watcher is paused for Claude rate limit"
             );
-            return IssueRun::Skipped;
+            return IssueRun::Paused;
         }
 
         let processing_key = format!("{}:{}", source.name(), issue.id);
@@ -4318,7 +4450,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Issue already being processed, skipping"
             );
-            return IssueRun::Skipped;
+            return IssueRun::Busy;
         };
         // Checked only once claimed, so either this sees the stop or the drain sees the claim.
         if self.is_stopped() {
@@ -4327,6 +4459,9 @@ Create a PR with your changes.{custom_instructions}"#,
                 "Not starting issue processing because the watcher is stopping"
             );
             return IssueRun::Stopping;
+        }
+        if admission.is_some_and(|admit| !admit()) {
+            return IssueRun::Skipped;
         }
 
         if let Some(ref tip) = deploy_qa_tip {
@@ -5137,7 +5272,7 @@ Create a PR with your changes.{custom_instructions}"#,
             issue_id,
             None,
             None,
-            Some("Manual trigger".into()),
+            Some(MANUAL_TRIGGER.into()),
         )
         .await
     }
@@ -5195,7 +5330,7 @@ Create a PR with your changes.{custom_instructions}"#,
         );
 
         let mut issue = source.get_issue(issue_id).await?;
-        let match_result = MatchResult::matched("Manual trigger", MatchPriority::Urgent);
+        let match_result = MatchResult::matched(MANUAL_TRIGGER, MatchPriority::Urgent);
 
         if let Some(reason) = trigger_reason {
             issue.set_metadata("trigger_reason", reason);
@@ -5212,17 +5347,20 @@ Create a PR with your changes.{custom_instructions}"#,
                 review_feedback,
                 existing_pr_branch,
                 None,
+                None,
             )
             .await;
         match run {
             IssueRun::Processed => Ok(()),
-            IssueRun::Skipped => Err(claudear_core::error::Error::source(
-                source_name,
-                format!(
-                    "Issue {} is already being processed; trigger deferred",
-                    issue_id
-                ),
-            )),
+            IssueRun::Skipped | IssueRun::Busy | IssueRun::Paused => {
+                Err(claudear_core::error::Error::source(
+                    source_name,
+                    format!(
+                        "Issue {} is already being processed; trigger deferred",
+                        issue_id
+                    ),
+                ))
+            }
             IssueRun::Stopping => Err(claudear_core::error::Error::Other(
                 STOPPING_REFUSAL.to_string(),
             )),
@@ -8055,18 +8193,18 @@ mod tests {
             async move { watcher.process_ready_retries().await }
         });
         source.gate.arrival_during(&mut retries).await;
-        let retry_status = || {
-            tracker
+        let retry_state = || {
+            let attempt = tracker
                 .get_attempt(GATED_SOURCE, "retry-1")
                 .unwrap()
-                .expect("the retried attempt should be recorded")
-                .status
+                .expect("the retried attempt should be recorded");
+            (attempt.status, attempt.retry_count)
         };
 
         assert_eq!(
-            retry_status(),
-            FixAttemptStatus::Pending,
-            "the retry should have prepared its attempt before loading the issue"
+            retry_state(),
+            (FixAttemptStatus::Failed, 0),
+            "the retry must not spend its attempt while loading the issue"
         );
 
         let drain = watcher.stop_and_drain();
@@ -8092,8 +8230,8 @@ mod tests {
             "the drain must end once the retry finishes"
         );
         assert_eq!(
-            retry_status(),
-            FixAttemptStatus::Failed,
+            retry_state(),
+            (FixAttemptStatus::Failed, 1),
             "the drain must not end before the retry settles its attempt"
         );
         let retried = retries.await;
@@ -8152,6 +8290,369 @@ mod tests {
                 .retry_count,
             0,
             "a retry whose slot frees after the stop must not start"
+        );
+    }
+
+    fn retried_issue() -> Issue {
+        Issue::new(
+            "retry-1",
+            "RETRY-1",
+            "Crash on an empty list",
+            "https://example.com/issues/retry-1",
+            GATED_SOURCE,
+        )
+    }
+
+    /// A config that retries a failed attempt at once, and only once.
+    fn single_retry_config() -> Config {
+        let mut config = test_config();
+        config.retry.max_retries = 1;
+        config.retry.base_delay_ms = 0;
+        config.retry.max_delay_ms = 0;
+        config
+    }
+
+    fn record_failed_attempt(tracker: &SqliteTracker, issue: &Issue) {
+        tracker
+            .record_attempt(&issue.source, &issue.id, &issue.short_id)
+            .unwrap();
+        tracker
+            .mark_failed(&issue.source, &issue.id, "initial failure")
+            .unwrap();
+    }
+
+    /// Every field of `issue`'s attempt, to tell whether a retry changed it.
+    fn attempt_snapshot(tracker: &SqliteTracker, issue: &Issue) -> serde_json::Value {
+        serde_json::to_value(attempt_for(tracker, issue)).unwrap()
+    }
+
+    fn is_ready_to_retry(tracker: &Arc<SqliteTracker>, issue: &Issue) -> bool {
+        RetryManager::new(
+            single_retry_config().retry,
+            Arc::clone(tracker) as Arc<dyn FixAttemptTracker>,
+        )
+        .get_ready_retries()
+        .unwrap()
+        .iter()
+        .any(|attempt| attempt.issue_id == issue.id)
+    }
+
+    /// The decisions `tracker` recorded, most recent first.
+    fn decisions(tracker: &SqliteTracker) -> Vec<String> {
+        tracker
+            .get_recent_activities(100, None)
+            .unwrap()
+            .into_iter()
+            .filter_map(|activity| Some(activity.metadata?["decision"].as_str()?.to_string()))
+            .collect()
+    }
+
+    fn spawn_ready_retries(watcher: &Arc<Watcher>) -> tokio::task::JoinHandle<Result<()>> {
+        let watcher = Arc::clone(watcher);
+        tokio::spawn(async move { watcher.process_ready_retries().await })
+    }
+
+    #[tokio::test]
+    async fn test_retry_loading_its_issue_across_a_stop_keeps_its_attempt() {
+        let issue = retried_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        let mut retries = spawn_ready_retries(&watcher);
+        source.gate.arrival_during(&mut retries).await;
+
+        watcher.stop();
+        source.gate.open();
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry the stop refused must leave its attempt untouched"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a retry the stop refused must not run the agent"
+        );
+        assert!(
+            is_ready_to_retry(&tracker, &issue),
+            "a retry the stop refused must keep the attempt's only retry"
+        );
+        assert!(
+            tracker
+                .get_metrics("ready_retry_failed", None, 10)
+                .unwrap()
+                .is_empty(),
+            "a retry the stop refused must not count as a failed retry"
+        );
+        assert!(
+            !decisions(&tracker).contains(&"ready_retry_trigger_failed".to_string()),
+            "a retry the stop refused must not be recorded as a failed trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_spends_its_retry_only_once_its_issue_fails_to_load() {
+        let issue = retried_issue();
+        let source = Arc::new(GatedSource::default());
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        let mut retries = spawn_ready_retries(&watcher);
+        source.gate.arrival_during(&mut retries).await;
+
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry must not be spent while its issue is loading"
+        );
+
+        source.gate.open();
+        let retried = retries.await;
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        let attempt = attempt_for(&tracker, &issue);
+        assert_eq!(
+            (attempt.status, attempt.retry_count),
+            (FixAttemptStatus::Failed, 1),
+            "an issue that fails to load must spend its retry and stay failed"
+        );
+        assert!(
+            attempt
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with(RETRY_TRIGGER_FAILED)),
+            "unexpected error message: {:?}",
+            attempt.error_message
+        );
+        assert!(
+            !is_ready_to_retry(&tracker, &issue),
+            "an issue that keeps failing to load must run out of retries"
+        );
+        assert_eq!(
+            tracker
+                .get_metrics("ready_retry_failed", None, 10)
+                .unwrap()
+                .len(),
+            1,
+            "an issue that fails to load is a failed retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_of_an_issue_already_being_processed_keeps_its_attempt() {
+        let issue = retried_issue();
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        let mut retries = spawn_ready_retries(&watcher);
+        source.gate.arrival_during(&mut retries).await;
+
+        let processing = watcher
+            .claim_processing(format!("{GATED_SOURCE}:{}", issue.id), false)
+            .expect("nothing else should be processing the issue yet");
+        source.gate.open();
+        let retried = retries.await;
+        drop(processing);
+
+        assert!(
+            matches!(retried, Ok(Ok(()))),
+            "the retries should finish: {retried:?}"
+        );
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry of an issue already being processed must leave its attempt untouched"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a retry of an issue already being processed must not run the agent"
+        );
+        assert!(
+            is_ready_to_retry(&tracker, &issue),
+            "a retry of an issue already being processed must keep the attempt's only retry"
+        );
+        assert!(
+            decisions(&tracker).contains(&"ready_retry_skipped_inflight".to_string()),
+            "the retry should be recorded as skipped for an issue in flight"
+        );
+    }
+
+    /// Source named [`GATED_SOURCE`] that cannot be reached, so none of its
+    /// issues load.
+    struct UnreachableSource;
+
+    #[async_trait]
+    impl IssueSource for UnreachableSource {
+        fn name(&self) -> &str {
+            GATED_SOURCE
+        }
+        fn display_name(&self) -> &str {
+            GATED_SOURCE
+        }
+        async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            Ok(vec![])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Unreachable match", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
+            Ok(format!("Context for {}", issue.short_id))
+        }
+        async fn get_issue(&self, _id: &str) -> Result<Issue> {
+            Err(claudear_core::error::Error::network("connection refused"))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_keeps_its_retry_when_its_source_cannot_be_reached() {
+        let issue = retried_issue();
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::new(UnreachableSource) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+
+        watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry whose source cannot be reached must leave its attempt untouched"
+        );
+        assert!(
+            is_ready_to_retry(&tracker, &issue),
+            "a retry whose source cannot be reached must keep the attempt's only retry"
+        );
+        assert_eq!(
+            tracker
+                .get_metrics("ready_retry_failed", None, 10)
+                .unwrap()
+                .len(),
+            1,
+            "a retry whose source cannot be reached is still a failed retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_keeps_its_retry_while_paused_for_a_rate_limit() {
+        let issue = Issue::new(
+            "paused-1",
+            "PAUSED-1",
+            "Crash on an empty list",
+            "https://example.com/issues/paused-1",
+            "mock",
+        );
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let agent_calls = Arc::new(AtomicUsize::new(0));
+        let watcher = watcher_with_agent(
+            single_retry_config(),
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            }),
+        );
+        record_failed_attempt(&tracker, &issue);
+        let before = attempt_snapshot(&tracker, &issue);
+        watcher.set_running(true);
+        watcher.rate_limit_pause_until.write().await.insert(
+            "claude".to_string(),
+            Utc::now() + chrono::Duration::hours(1),
+        );
+
+        let outcome = watcher
+            .retry(&attempt_for(&tracker, &issue), "Retry attempt 1")
+            .await;
+
+        assert!(
+            matches!(outcome, RetryOutcome::Failed(_)),
+            "a retry refused while paused should report why it did not run: {outcome:?}"
+        );
+        assert_eq!(
+            attempt_snapshot(&tracker, &issue),
+            before,
+            "a retry refused while paused for a rate limit must leave its attempt untouched"
+        );
+        assert_eq!(
+            agent_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a retry refused while paused for a rate limit must not run the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_that_ends_on_a_rate_limit_gets_its_retry_back() {
+        let mut config = single_retry_config();
+        config.agent.default_provider = SCRIPTED_QA_PROVIDER.to_string();
+        let harness = DeployQaHarness::answering(
+            config,
+            QaAnswer::Fail("Claude rate limit hit: some error".to_string()),
+        );
+        let issue = harness.issue();
+        record_failed_attempt(&harness.tracker, &issue);
+        harness.watcher.set_running(true);
+
+        harness.watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(harness.agent_calls(), 1, "the retry should have run");
+        let attempt = attempt_for(&harness.tracker, &issue);
+        assert_eq!(
+            (attempt.status, attempt.retry_count),
+            (FixAttemptStatus::Failed, 0),
+            "a retry that ends on a rate limit must get its retry back"
         );
     }
 
@@ -10798,12 +11299,12 @@ mod tests {
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
 
         let result = watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
         assert_eq!(
             result,
-            IssueRun::Skipped,
-            "process_issue should skip an issue already in-flight"
+            IssueRun::Busy,
+            "process_issue should report an issue already in-flight as busy"
         );
     }
 
@@ -11089,7 +11590,15 @@ mod tests {
                 .expect("the seeded tip's issue should load");
             let match_result = self.source.matches_criteria(&issue);
             watcher
-                .process_issue(self.source.clone(), issue, match_result, None, None, None)
+                .process_issue(
+                    self.source.clone(),
+                    issue,
+                    match_result,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await
                 == IssueRun::Processed
         }
@@ -11137,7 +11646,15 @@ mod tests {
             let issue = pending.remove(0);
             let match_result = self.source.matches_criteria(&issue);
             self.watcher
-                .process_issue(self.source.clone(), issue, match_result, None, None, None)
+                .process_issue(
+                    self.source.clone(),
+                    issue,
+                    match_result,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await;
         }
 
@@ -11198,6 +11715,7 @@ mod tests {
                 None,
                 None,
                 Some(Intent::Question),
+                None,
             )
             .await;
 
@@ -11231,6 +11749,7 @@ mod tests {
                     None,
                     None,
                     Some(Intent::Question),
+                    None,
                 )
                 .await;
         }
@@ -11402,6 +11921,7 @@ mod tests {
                 None,
                 None,
                 Some(Intent::Question),
+                None,
             )
             .await;
 
@@ -11937,6 +12457,7 @@ mod tests {
                         None,
                         None,
                         Some(Intent::Question),
+                        None,
                     )
                     .await
             })
@@ -12020,6 +12541,7 @@ mod tests {
                         None,
                         None,
                         Some(Intent::Question),
+                        None,
                     )
                     .await
             }
@@ -13459,7 +13981,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let started = watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
         assert_eq!(
             started,
@@ -14100,7 +14622,7 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
 
         // Verify the attempt was recorded
@@ -16436,7 +16958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_issue_returns_false_when_rate_limited() {
+    async fn test_process_issue_is_paused_while_rate_limited() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
@@ -16455,12 +16977,12 @@ mod tests {
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
         let result = watcher
-            .process_issue(source, issue, match_result, None, None, None)
+            .process_issue(source, issue, match_result, None, None, None, None)
             .await;
         assert_eq!(
             result,
-            IssueRun::Skipped,
-            "process_issue should skip an issue while rate limited"
+            IssueRun::Paused,
+            "process_issue should report an issue skipped while rate limited as paused"
         );
     }
 

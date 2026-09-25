@@ -7,9 +7,9 @@ use super::{
     cleanup_stale_files, default_pid_path, default_socket_path, is_accepting, read_pid_file,
     write_pid_file,
 };
-use crate::watcher::Watcher;
+use crate::watcher::{RetryOutcome, Watcher, MANUAL_TRIGGER};
 use claudear_core::error::{Error, Result};
-use claudear_core::types::{ActivityLogEntry, FixAttempt, FixAttemptStatus};
+use claudear_core::types::{ActivityLogEntry, FixAttemptStatus};
 use claudear_integrations::notifier::Notifier;
 use claudear_integrations::source::IssueSource;
 use claudear_storage::FixAttemptTracker;
@@ -33,7 +33,6 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const SHUTDOWN_INITIATED: &str = "Shutdown initiated";
 const SHUTDOWN_IN_PROGRESS: &str = "Shutdown already in progress";
 const NEW_RUNS_REFUSED: &str = "Daemon is shutting down; not starting new runs";
-const RETRY_TRIGGER_FAILED: &str = "Retry trigger failed";
 const ALREADY_LISTENING: &str = "Another claudear daemon is already listening on";
 
 /// IPC server that listens on a Unix socket.
@@ -548,41 +547,18 @@ async fn process_retries(
             tracing::info!("Daemon is shutting down; not retrying the remaining attempts");
             break;
         }
-        if let Err(error) = tracker.prepare_for_retry(&attempt.source, &attempt.issue_id) {
-            tracing::warn!(
-                "Failed to prepare retry for {}: {}",
+        match watcher.retry(attempt, MANUAL_TRIGGER).await {
+            RetryOutcome::Ran => count += 1,
+            RetryOutcome::Busy => {}
+            RetryOutcome::Stopping => break,
+            RetryOutcome::Failed(error) => tracing::warn!(
+                "Failed to trigger retry for {}: {}",
                 attempt.short_id,
                 error
-            );
-            continue;
-        }
-        match watcher
-            .trigger_issue(&attempt.source, &attempt.issue_id)
-            .await
-        {
-            Ok(()) => count += 1,
-            Err(error) => restore_failed_retry(tracker, attempt, &error),
+            ),
         }
     }
     IpcResponse::ok_with(IpcData::RetriesProcessed { count })
-}
-
-/// Mark an attempt whose retry could not be triggered as failed again: retries only pick up
-/// failed or closed attempts, so it would otherwise stay pending for good.
-fn restore_failed_retry(tracker: &dyn FixAttemptTracker, attempt: &FixAttempt, error: &Error) {
-    tracing::warn!(
-        "Failed to trigger retry for {}: {}",
-        attempt.short_id,
-        error
-    );
-    let message = format!("{RETRY_TRIGGER_FAILED}: {error}");
-    if let Err(restore_error) = tracker.mark_failed(&attempt.source, &attempt.issue_id, &message) {
-        tracing::warn!(
-            short_id = %attempt.short_id,
-            error = %restore_error,
-            "Failed to restore retry attempt state after trigger error"
-        );
-    }
 }
 
 /// The socket and PID files a running [`IpcServer`] created.
@@ -712,12 +688,16 @@ impl IpcServerBuilder {
 mod tests {
     use super::*;
     use crate::ipc::{short_temporary_directory, IpcClient};
+    use crate::watcher::RETRY_TRIGGER_FAILED;
     use std::time::Duration;
+    use tokio::sync::Notify;
     use tokio::task::JoinHandle;
 
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
     const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+    /// How long a test lets a drain run before deciding it is waiting.
+    const DRAIN_WAIT: Duration = Duration::from_secs(3);
 
     #[test]
     fn test_server_state_defaults() {
@@ -755,23 +735,13 @@ mod tests {
     /// Minimal mock for `IssueSource`, which fails every issue fetch.
     struct MockSource {
         source_name: String,
-        fetches: AtomicUsize,
-        stopping: Option<Arc<ServerState>>,
     }
 
     impl MockSource {
         fn new(name: &str) -> Self {
             Self {
                 source_name: name.to_string(),
-                fetches: AtomicUsize::new(0),
-                stopping: None,
             }
-        }
-
-        /// Make each issue fetch start `state`'s shutdown, as a stop landing mid-fetch would.
-        fn stopping(mut self, state: Arc<ServerState>) -> Self {
-            self.stopping = Some(state);
-            self
         }
     }
 
@@ -793,13 +763,63 @@ mod tests {
             Ok(String::new())
         }
         async fn get_issue(&self, _id: &str) -> CrateResult<Issue> {
-            self.fetches.fetch_add(1, Ordering::SeqCst);
-            if let Some(state) = &self.stopping {
-                state.stopping.store(true, Ordering::SeqCst);
-            }
             Err(claudear_core::error::Error::issue_not_found(
                 &self.source_name,
                 "mock",
+            ))
+        }
+    }
+
+    /// The `linear` source, holding each issue fetch until [`GatedSource::open`] before
+    /// returning the issue.
+    #[derive(Default)]
+    struct GatedSource {
+        fetches: AtomicUsize,
+        arrived: Notify,
+        opened: Notify,
+    }
+
+    impl GatedSource {
+        /// Wait for a fetch to be held, failing instead of hanging when `task` ends first.
+        async fn arrival_during<T: std::fmt::Debug>(&self, task: &mut JoinHandle<T>) {
+            tokio::select! {
+                () = self.arrived.notified() => {}
+                ended = task => panic!("the task ended before fetching an issue: {ended:?}"),
+            }
+        }
+
+        fn open(&self) {
+            self.opened.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl IssueSource for GatedSource {
+        fn name(&self) -> &str {
+            "linear"
+        }
+        fn display_name(&self) -> &str {
+            "linear"
+        }
+        async fn fetch_issues(&self) -> CrateResult<Vec<Issue>> {
+            Ok(vec![])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("test", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, _issue: &Issue) -> CrateResult<String> {
+            Ok(String::new())
+        }
+        async fn get_issue(&self, id: &str) -> CrateResult<Issue> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.arrived.notify_one();
+            self.opened.notified().await;
+            Ok(Issue::new(
+                id,
+                id,
+                "Crash on an empty list",
+                "https://example.com/issues",
+                "linear",
             ))
         }
     }
@@ -910,6 +930,36 @@ mod tests {
         tracker
             .mark_failed("linear", issue_id, "build error")
             .unwrap();
+    }
+
+    /// Handle `ProcessRetries` on its own task, so the test can act while a retry is held.
+    fn spawn_process_retries(
+        tracker: &Arc<dyn FixAttemptTracker>,
+        watcher: &Arc<Watcher>,
+        state: &Arc<ServerState>,
+    ) -> JoinHandle<IpcResponse> {
+        let tracker = Arc::clone(tracker);
+        let watcher = Some(Arc::clone(watcher));
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            let (shutdown_tx, _) = broadcast::channel(1);
+            handle_command(
+                IpcCommand::ProcessRetries,
+                &tracker,
+                &mock_sources(),
+                &mock_notifier(),
+                &watcher,
+                &state,
+                &shutdown_tx,
+            )
+            .await
+        })
+    }
+
+    /// Start shutting down as the daemon does: refuse new IPC runs, then stop the watcher.
+    fn begin_shutdown(state: &ServerState, watcher: &Watcher) {
+        state.stopping.store(true, Ordering::SeqCst);
+        watcher.stop();
     }
 
     async fn handle(
@@ -2373,47 +2423,94 @@ mod tests {
     #[tokio::test]
     async fn test_process_retries_stops_at_the_attempt_where_shutdown_begins() {
         let state = test_state(100, 2);
-        let (shutdown_tx, _) = broadcast::channel(1);
         let tracker = mock_tracker();
         let issue_ids = ["LIN-1", "LIN-2"];
         for issue_id in issue_ids {
             record_failed_attempt(tracker.as_ref(), issue_id);
         }
-        let source = Arc::new(MockSource::new("linear").stopping(state.clone()));
+        let source = Arc::new(GatedSource::default());
         let watcher = running_watcher(tracker.clone(), source.clone());
+        let mut retries = spawn_process_retries(&tracker, &watcher, &state);
+        source.arrival_during(&mut retries).await;
 
-        let response = handle_command(
-            IpcCommand::ProcessRetries,
-            &tracker,
-            &mock_sources(),
-            &mock_notifier(),
-            &Some(watcher),
-            &state,
-            &shutdown_tx,
-        )
-        .await;
+        begin_shutdown(&state, &watcher);
+        source.open();
+        let response = retries.await.expect("processing retries should not panic");
 
-        assert!(matches!(
-            response,
-            IpcResponse::Ok(IpcData::RetriesProcessed { count: 0 })
-        ));
+        assert!(
+            matches!(
+                response,
+                IpcResponse::Ok(IpcData::RetriesProcessed { count: 0 })
+            ),
+            "unexpected response: {response:?}"
+        );
         assert_eq!(
             source.fetches.load(Ordering::SeqCst),
             1,
             "no retry should be triggered once the shutdown began"
         );
-        let untouched = issue_ids
-            .into_iter()
-            .filter(|issue_id| {
-                tracker
-                    .get_attempt("linear", issue_id)
-                    .unwrap()
-                    .is_some_and(|attempt| attempt.retry_count == 0)
-            })
-            .count();
+        for issue_id in issue_ids {
+            let attempt = tracker
+                .get_attempt("linear", issue_id)
+                .unwrap()
+                .expect("the attempt should still be tracked");
+            assert_eq!(
+                (attempt.status, attempt.retry_count),
+                (FixAttemptStatus::Failed, 0),
+                "{issue_id} should keep its retry budget across the shutdown"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_and_drain_waits_for_process_retries_and_leaves_its_attempt_failed() {
+        let state = test_state(100, 2);
+        let tracker = mock_tracker();
+        record_failed_attempt(tracker.as_ref(), "LIN-1");
+        let source = Arc::new(GatedSource::default());
+        let watcher = running_watcher(tracker.clone(), source.clone());
+        let mut retries = spawn_process_retries(&tracker, &watcher, &state);
+        source.arrival_during(&mut retries).await;
+
+        begin_shutdown(&state, &watcher);
+        let drain = watcher.stop_and_drain();
+        tokio::pin!(drain);
+        let while_fetching = tokio::time::timeout(DRAIN_WAIT, drain.as_mut()).await;
+
+        assert!(
+            while_fetching.is_err(),
+            "the drain must wait while the retry is fetching its issue"
+        );
         assert_eq!(
-            untouched, 1,
-            "the attempt after the stop should keep its retry budget"
+            watcher.in_flight(),
+            1,
+            "the retry must count as a run in flight"
+        );
+
+        source.open();
+        let drained = tokio::time::timeout(DRAIN_WAIT, drain).await;
+
+        assert_eq!(
+            drained,
+            Ok(true),
+            "the drain must end once the retry finishes"
+        );
+        let response = retries.await.expect("processing retries should not panic");
+        assert!(
+            matches!(
+                response,
+                IpcResponse::Ok(IpcData::RetriesProcessed { count: 0 })
+            ),
+            "unexpected response: {response:?}"
+        );
+        let attempt = tracker
+            .get_attempt("linear", "LIN-1")
+            .unwrap()
+            .expect("the attempt should still be tracked");
+        assert_eq!(
+            (attempt.status, attempt.retry_count),
+            (FixAttemptStatus::Failed, 0),
+            "a retry the shutdown refused must stay failed with its retry unspent"
         );
     }
 
@@ -2448,6 +2545,10 @@ mod tests {
             attempt.status,
             FixAttemptStatus::Failed,
             "a retry that never started must not stay pending"
+        );
+        assert_eq!(
+            attempt.retry_count, 1,
+            "an issue that fails to load must still spend its retry"
         );
         assert!(
             attempt
