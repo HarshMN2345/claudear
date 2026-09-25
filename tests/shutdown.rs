@@ -21,6 +21,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(3600);
 const TAIL_LINES: usize = 40;
 const FORCED_EXIT_CODE: i32 = 130;
+const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
 const DAEMON: &str = "daemon";
 const STOP: &str = "stop";
@@ -69,9 +70,12 @@ impl Sandbox {
         command
     }
 
+    /// The daemon's command, with the stop signals at their default disposition: the daemon
+    /// keeps ignoring any it inherits ignored, and a test runner that a non-interactive shell
+    /// starts in the background inherits SIGINT ignored.
     fn daemon(&self) -> Command {
         let poll_interval = DAEMON_POLL_INTERVAL.as_millis().to_string();
-        self.command(
+        let mut command = self.command(
             DAEMON,
             &[
                 "start",
@@ -82,20 +86,23 @@ impl Sandbox {
                 "--no-webhooks",
                 "--no-dashboard",
             ],
-        )
+        );
+        // SAFETY: the hook runs between fork and exec and only calls set_disposition, which is
+        // async-signal-safe.
+        unsafe { command.pre_exec(|| set_disposition(&STOP_SIGNALS, libc::SIG_DFL)) };
+        command
     }
 
     async fn start(&self) -> Child {
         self.launch(self.daemon()).await
     }
 
-    /// Starts the daemon with `disposition` for SIGHUP, which it inherits like the SIG_IGN that
-    /// `nohup` sets.
-    async fn start_with_hangup(&self, disposition: libc::sighandler_t) -> Child {
+    /// Starts the daemon with SIGHUP ignored, as `nohup` starts it.
+    async fn start_under_nohup(&self) -> Child {
         let mut command = self.daemon();
-        // SAFETY: the hook runs between fork and exec and only calls set_hangup, which is
+        // SAFETY: the hook runs between fork and exec and only calls set_disposition, which is
         // async-signal-safe.
-        unsafe { command.pre_exec(move || set_hangup(disposition)) };
+        unsafe { command.pre_exec(|| set_disposition(&[libc::SIGHUP], libc::SIG_IGN)) };
         self.launch(command).await
     }
 
@@ -336,11 +343,13 @@ fn send(daemon: &Child, signal: libc::c_int) {
     );
 }
 
-fn set_hangup(disposition: libc::sighandler_t) -> io::Result<()> {
-    // SAFETY: callers pass SIG_IGN or SIG_DFL, so no handler is installed, and signal is
-    // async-signal-safe.
-    if unsafe { libc::signal(libc::SIGHUP, disposition) } == libc::SIG_ERR {
-        return Err(io::Error::last_os_error());
+fn set_disposition(signals: &[libc::c_int], disposition: libc::sighandler_t) -> io::Result<()> {
+    for &signal in signals {
+        // SAFETY: callers pass SIG_IGN or SIG_DFL, so no handler is installed, and signal is
+        // async-signal-safe.
+        if unsafe { libc::signal(signal, disposition) } == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -444,7 +453,7 @@ async fn sigint_drains_and_exits_cleanly() {
 #[tokio::test]
 async fn sighup_drains_and_exits_cleanly() {
     let sandbox = Sandbox::new();
-    let mut daemon = sandbox.start_with_hangup(libc::SIG_DFL).await;
+    let mut daemon = sandbox.start().await;
 
     let status = sandbox.stop_with(&mut daemon, libc::SIGHUP).await;
 
@@ -455,7 +464,7 @@ async fn sighup_drains_and_exits_cleanly() {
 #[tokio::test]
 async fn sighup_under_nohup_leaves_the_daemon_running() {
     let sandbox = Sandbox::new();
-    let mut daemon = sandbox.start_with_hangup(libc::SIG_IGN).await;
+    let mut daemon = sandbox.start_under_nohup().await;
 
     send(&daemon, libc::SIGHUP);
 
