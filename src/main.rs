@@ -1707,16 +1707,20 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(5);
 /// How long an interrupted one-shot command gets to record how its runs ended.
 const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Resolves on Ctrl-C or a terminal hangup. Agent CLIs lead their own process
-/// groups, so neither signal reaches them unless claudear passes it on.
+/// Resolves on Ctrl-C, a terminal hangup or a termination request such as
+/// `kill`, `systemctl stop` or `docker stop`. Agent CLIs lead their own
+/// process groups, so none of these reaches them unless claudear passes it on.
 async fn interrupted() {
     #[cfg(unix)]
     {
-        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .expect("Failed to install signal handler");
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut hangup = signal(SignalKind::hangup()).expect("Failed to install signal handler");
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("Failed to install signal handler");
         tokio::select! {
             result = tokio::signal::ctrl_c() => result.expect("Failed to install signal handler"),
             _ = hangup.recv() => {}
+            _ = terminate.recv() => {}
         }
     }
     #[cfg(not(unix))]
@@ -4682,4 +4686,51 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    const SIGNAL_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Signals reach every test in the process, so one test's signal could
+    /// resolve another's wait.
+    static SIGNALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn assert_interrupted_by(kind: SignalKind) {
+        let _signals = SIGNALS.lock().await;
+        // Handling the signal here too keeps its default action from killing
+        // the test process if `interrupted` ignores it.
+        let _handled = signal(kind).unwrap();
+        let interrupted = interrupted();
+        tokio::pin!(interrupted);
+        assert!(
+            futures::poll!(&mut interrupted).is_pending(),
+            "interrupted resolved before any signal"
+        );
+
+        // SAFETY: kill takes no pointers and only sends a signal.
+        unsafe { libc::kill(libc::getpid(), kind.as_raw_value()) };
+
+        tokio::time::timeout(SIGNAL_DEADLINE, interrupted)
+            .await
+            .unwrap_or_else(|_| panic!("interrupted ignored signal {}", kind.as_raw_value()));
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_terminate() {
+        assert_interrupted_by(SignalKind::terminate()).await;
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_hangup() {
+        assert_interrupted_by(SignalKind::hangup()).await;
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_interrupt() {
+        assert_interrupted_by(SignalKind::interrupt()).await;
+    }
 }
