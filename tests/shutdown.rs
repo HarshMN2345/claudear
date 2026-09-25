@@ -1,13 +1,15 @@
 #![cfg(unix)]
 
+mod sandbox;
+
 use claudear::ipc::{IpcClient, IpcData, IpcResponse};
 use claudear::shutdown;
-use std::fs::{self, File};
+use sandbox::Sandbox;
+use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::time::Duration;
-use tempfile::TempDir;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout, Instant};
@@ -19,57 +21,15 @@ const HANGUP_WAIT: Duration = Duration::from_secs(2);
 const SUSPEND_WAIT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(3600);
-const TAIL_LINES: usize = 40;
 const FORCED_EXIT_CODE: i32 = 130;
 const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
-const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
 const DAEMON: &str = "daemon";
 const STOP: &str = "stop";
 const STOPPED: &str = "Daemon stopped.";
 const SOCKET_CLOSED: &str = "The daemon closed its control socket";
 const FORCED_NOTICE: &str = "Shutdown forced";
 
-struct Sandbox {
-    root: TempDir,
-}
-
 impl Sandbox {
-    fn new() -> Self {
-        let root = tempfile::Builder::new()
-            .prefix("claudear")
-            .tempdir_in("/tmp")
-            .expect("create a sandbox under /tmp");
-        fs::write(root.path().join("claudear.toml"), config(root.path()))
-            .expect("write the sandbox config");
-        Self { root }
-    }
-
-    fn path(&self) -> &Path {
-        self.root.path()
-    }
-
-    fn command(&self, name: &str, arguments: &[&str]) -> Command {
-        let output = File::create(self.output(name)).expect("create the output file");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_claudear"));
-        command
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", self.path())
-            .env("TMPDIR", self.path())
-            .env("XDG_RUNTIME_DIR", self.path())
-            .current_dir(self.path())
-            .arg("--config")
-            .arg(self.path().join("claudear.toml"))
-            .arg("--log-dir")
-            .arg(self.path().join("logs"))
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(output.try_clone().expect("share the output file"))
-            .stderr(output)
-            .kill_on_drop(true);
-        command
-    }
-
     /// The daemon's command, with the stop signals at their default disposition: the daemon
     /// keeps ignoring any it inherits ignored, and a test runner that a non-interactive shell
     /// starts in the background inherits SIGINT ignored.
@@ -245,10 +205,6 @@ impl Sandbox {
         self.runtime_directory().join("claudear.pid")
     }
 
-    fn output(&self, name: &str) -> PathBuf {
-        self.path().join(format!("{name}.out"))
-    }
-
     fn read(&self, name: &str) -> String {
         fs::read_to_string(self.output(name)).unwrap_or_default()
     }
@@ -266,60 +222,11 @@ impl Sandbox {
         );
     }
 
-    fn log_files(&self) -> impl Iterator<Item = PathBuf> {
-        fs::read_dir(self.path().join("logs"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-    }
-
     fn log(&self) -> String {
         self.log_files()
             .map(|path| fs::read_to_string(path).unwrap_or_default())
             .collect()
     }
-
-    fn diagnostics(&self) -> String {
-        [self.output(DAEMON), self.output(STOP)]
-            .into_iter()
-            .chain(self.log_files())
-            .filter(|path| path.is_file())
-            .map(|path| format!("{}:\n{}", path.display(), tail(&path)))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-fn config(root: &Path) -> String {
-    let root = root.display();
-    format!(
-        r#"workspace = "{root}/workspace"
-db_path = "{root}/claudear.db"
-storage_dir = "{root}/storage"
-known_orgs = []
-auto_discover_paths = []
-
-[code_index]
-enabled = false
-
-[regression]
-enabled = false
-
-[issues.jira]
-enabled = true
-base_url = "{UNREACHABLE_URL}"
-email = "shutdown@example.com"
-api_token = "unused"
-project_keys = ["SHUTDOWN"]
-"#
-    )
-}
-
-fn tail(path: &Path) -> String {
-    let content = fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<&str> = content.lines().collect();
-    lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n")
 }
 
 fn pid_of(daemon: &Child) -> libc::pid_t {
