@@ -222,6 +222,7 @@ pub fn start_docker(
         "/app/config.toml".to_string(),
         "--verbose".to_string(),
         "start".to_string(),
+        "--foreground".to_string(),
         "--poll".to_string(),
         "--poll-interval".to_string(),
         "5000".to_string(),
