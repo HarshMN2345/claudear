@@ -550,7 +550,7 @@ The `--setup` flag:
    - issue webhooks are answered with `503 Service Unavailable` and `Retry-After: 60`, and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)
    - IPC `Trigger` and `ProcessRetries` commands are refused
 2. Waits up to 30 seconds for in-flight runs to finish.
-3. Exits, even if some runs are still going, in which case it logs `Exiting with runs still in flight after 30s`. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends.
+3. Exits, even if some runs are still going, in which case it logs `Exiting with runs still in flight after 30s`. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends. A run cut off this way leaves its fix attempt `pending`, and Claudear does not pick the issue up again until you run `claudear reset <source> <issue_id>`.
 
 While it drains, `claudear status` reports `Running: false`. `claudear stop` waits up to 40 seconds for the daemon to exit and reports progress every 5 seconds. It prints `Daemon stopped.` and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 40 seconds. If it cannot read the daemon's PID file, it can only watch the control socket, so once the socket closes it prints `The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed.` instead. A signal that reaches Claudear during the drain, including after `claudear stop`, forces an immediate exit.
 
