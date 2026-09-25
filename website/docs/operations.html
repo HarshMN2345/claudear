@@ -116,6 +116,7 @@
 claudear pause      # pause issue processing
 claudear resume     # resume issue processing
 claudear stop       # gracefully shut down</code></pre>
+        <p><code>claudear stop</code> lets runs in progress finish for up to 30s, then interrupts the agent CLIs still running and kills any left 5s later. SIGTERM, as sent by <code>kill</code>, <code>systemctl stop</code> or <code>docker stop</code>, shuts down <code>start</code>, <code>webhook</code> and <code>poll</code> the same way, except that it interrupts the agent CLIs at once, as Ctrl-C does. Either way shutting down can take up to 35s, so give a service manager at least 40s before it kills Claudear.</p>
 
         <h2 id="macos-launchd"><a class="anchor-link" href="#macos-launchd" aria-label="Link to macOS (launchd)">#</a>macOS (launchd)</h2>
         <p>Create a plist at <code>~/Library/LaunchAgents/com.claudear.daemon.plist</code>:</p>
@@ -130,6 +131,7 @@ claudear stop       # gracefully shut down</code></pre>
   &lt;array&gt;
     &lt;string&gt;/usr/local/bin/claudear&lt;/string&gt;
     &lt;string&gt;start&lt;/string&gt;
+    &lt;string&gt;--foreground&lt;/string&gt;
     &lt;string&gt;--poll&lt;/string&gt;
     &lt;string&gt;--port&lt;/string&gt;
     &lt;string&gt;3100&lt;/string&gt;
@@ -149,6 +151,8 @@ claudear stop       # gracefully shut down</code></pre>
   &lt;string&gt;/tmp/claudear.err.log&lt;/string&gt;
   &lt;key&gt;KeepAlive&lt;/key&gt;
   &lt;true/&gt;
+  &lt;key&gt;ExitTimeOut&lt;/key&gt;
+  &lt;integer&gt;40&lt;/integer&gt;
 &lt;/dict&gt;
 &lt;/plist&gt;</code></pre>
         <p>Load and start the service:</p>
@@ -165,7 +169,7 @@ After=network.target
 Type=simple
 WorkingDirectory=/path/to/your/project
 EnvironmentFile=/etc/claudear/env
-ExecStart=/usr/local/bin/claudear start --poll --port 3100
+ExecStart=/usr/local/bin/claudear start --foreground --poll --port 3100
 Restart=on-failure
 RestartSec=5
 
@@ -187,14 +191,16 @@ sudo journalctl -u claudear -f   # follow logs</code></pre>
         <pre><code class="language-bash">docker compose up -d
 docker compose logs -f claudear
 docker compose down</code></pre>
+        <p>The image runs <code>claudear start --foreground</code> under <code>tini</code>, so <code>docker stop</code> and <code>docker compose down</code> shut it down gracefully. The bundled <code>docker-compose.yml</code> sets <code>stop_grace_period: 40s</code> to give it the time this can take.</p>
 
         <h3 id="standalone">Standalone</h3>
         <p>Run the container directly:</p>
         <pre><code class="language-bash">docker run -d --name claudear \
+  --stop-timeout 40 \
   -v $(pwd)/claudear.toml:/app/claudear.toml:ro \
   -v claudear-data:/app/data \
   -p 3100:3100 \
-  ghcr.io/abnegate/claudear:latest start --poll --port 3100</code></pre>
+  ghcr.io/abnegate/claudear:latest claudear start --foreground --poll --port 3100</code></pre>
         <p>Health check: <code>GET /api/health</code> returns 200 when Claudear is up.</p>
 
         <h2 id="environment-variables"><a class="anchor-link" href="#environment-variables" aria-label="Link to Environment variables">#</a>Environment variables</h2>
