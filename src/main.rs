@@ -1838,7 +1838,7 @@ impl Daemon<'_> {
                 return Err(ForcedShutdown.into());
             }
             Outcome::TimedOut => tracing::warn!(
-                watcher_runs = self.watcher.in_flight(),
+                watcher_runs = self.watcher_runs(),
                 webhook_runs = self.webhook_runs(),
                 "Exiting with runs still in flight after {}s",
                 shutdown::DRAIN_TIMEOUT.as_secs()
@@ -1860,7 +1860,7 @@ impl Daemon<'_> {
             monitor.abort();
         }
         tracing::warn!(
-            watcher_runs = self.watcher.in_flight(),
+            watcher_runs = self.watcher_runs(),
             webhook_runs = self.webhook_runs(),
             "Stopped taking new work, waiting for the runs in flight"
         );
@@ -1874,6 +1874,12 @@ impl Daemon<'_> {
         };
         let (watcher_drained, ()) = tokio::join!(self.watcher.stop_and_drain(), webhooks);
         watcher_drained
+    }
+
+    /// The watcher runs the drain waits for, including retries and follow-ups that hold no
+    /// processing slot and so are left out of [`Watcher::active_count`].
+    fn watcher_runs(&self) -> usize {
+        self.watcher.in_flight()
     }
 
     fn webhook_runs(&self) -> usize {
@@ -4795,15 +4801,64 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use claudear::types::MatchResult;
     use futures::channel::mpsc::unbounded;
     use std::collections::HashMap;
+    use tokio::sync::Notify;
+
+    const PARKED_SOURCE: &str = "parked";
+    const PARKED_ISSUE: &str = "parked-1";
+
+    /// A source whose `get_issue` signals its arrival and then never returns.
+    #[derive(Default)]
+    struct ParkedSource {
+        arrived: Notify,
+    }
+
+    #[async_trait]
+    impl IssueSource for ParkedSource {
+        fn name(&self) -> &str {
+            PARKED_SOURCE
+        }
+
+        fn display_name(&self) -> &str {
+            PARKED_SOURCE
+        }
+
+        async fn fetch_issues(&self) -> claudear::Result<Vec<Issue>> {
+            Ok(Vec::new())
+        }
+
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::not_matched("A parked source matches nothing")
+        }
+
+        async fn build_issue_context(&self, _issue: &Issue) -> claudear::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn get_issue(&self, _issue_id: &str) -> claudear::Result<Issue> {
+            self.arrived.notify_one();
+            pending().await
+        }
+    }
+
+    fn in_memory_tracker() -> Arc<dyn FixAttemptTracker> {
+        Arc::new(SqliteTracker::in_memory().expect("open an in-memory tracker"))
+    }
 
     fn idle_watcher() -> Watcher {
-        let tracker: Arc<dyn FixAttemptTracker> =
-            Arc::new(SqliteTracker::in_memory().expect("open an in-memory tracker"));
+        watcher_with(in_memory_tracker(), Vec::new())
+    }
+
+    fn watcher_with(
+        tracker: Arc<dyn FixAttemptTracker>,
+        sources: Vec<Arc<dyn IssueSource>>,
+    ) -> Watcher {
         Watcher::new(WatcherOptions {
             config: Config::default(),
-            sources: Vec::new(),
+            sources,
             notifier: Arc::new(ConsoleNotifier::new()),
             tracker: tracker.clone(),
             inferrer: None,
@@ -4850,6 +4905,46 @@ mod tests {
 
         let error = result.expect_err("a forced shutdown must fail serve");
         assert!(error.is::<ForcedShutdown>(), "unexpected error {error:#}");
+    }
+
+    #[tokio::test]
+    async fn watcher_runs_count_a_retry_that_holds_no_processing_slot() {
+        let tracker = in_memory_tracker();
+        tracker
+            .record_attempt(PARKED_SOURCE, PARKED_ISSUE, PARKED_ISSUE)
+            .expect("record the attempt");
+        tracker
+            .mark_failed(PARKED_SOURCE, PARKED_ISSUE, "the first run failed")
+            .expect("mark the attempt failed");
+        let attempt = tracker
+            .get_attempt(PARKED_SOURCE, PARKED_ISSUE)
+            .expect("read the attempt")
+            .expect("the attempt is recorded");
+        let source = Arc::new(ParkedSource::default());
+        let watcher = watcher_with(tracker, vec![source.clone()]);
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: None,
+            monitors: Vec::new(),
+        };
+
+        let mut retry = std::pin::pin!(watcher.retry(&attempt, MANUAL_TRIGGER));
+        tokio::select! {
+            outcome = &mut retry => panic!("the retry ended before loading its issue: {outcome:?}"),
+            () = source.arrived.notified() => {}
+        }
+
+        assert_eq!(
+            watcher.active_count(),
+            0,
+            "a retry loading its issue must hold no processing slot"
+        );
+        assert_eq!(
+            daemon.watcher_runs(),
+            1,
+            "the shutdown must report the retry its drain is waiting for"
+        );
     }
 
     #[test]
