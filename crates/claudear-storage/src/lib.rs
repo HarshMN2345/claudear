@@ -258,9 +258,17 @@ pub trait AttemptTracker: Send + Sync {
         self.mark_failed(source, issue_id, error_message)
     }
 
-    /// Fail recent `pending` attempts left behind by a previous process, without
-    /// spending a retry. Only safe at startup, before any run is in flight.
-    fn release_orphaned_pending_attempts(&self) -> Result<usize> {
+    /// Release attempts left `pending` for longer than `stale_after`,
+    /// returning how many were released.
+    ///
+    /// A live run cannot outlast `stale_after`, so an attempt still `pending`
+    /// past it was orphaned by a crash, restart or shutdown mid-run and would
+    /// otherwise block its issue for good. It is failed without spending a
+    /// retry, or closed as `cannot_fix` once it is more than three days old.
+    /// Nothing records which process runs an attempt, and fresher ones may
+    /// still be running in another process sharing the database, so they are
+    /// left alone.
+    fn release_orphaned_pending_attempts(&self, _stale_after: Duration) -> Result<usize> {
         Ok(0)
     }
 }

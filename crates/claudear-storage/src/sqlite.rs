@@ -1527,7 +1527,8 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
-    fn release_orphaned_pending_attempts(&self) -> Result<usize> {
+    fn release_orphaned_pending_attempts(&self, stale_after: Duration) -> Result<usize> {
+        let stale_before = format!("-{} seconds", stale_after.as_secs());
         let mut conn = self.acquire_lock()?;
         let tx = conn.transaction()?;
         // Cascade rows are resumed by record_cascade_attempt, so they stay pending
@@ -1538,9 +1539,10 @@ impl AttemptTracker for SqliteTracker {
                 error_message = 'Interrupted before completion (daemon restarted)',
                 retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
             WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
+              AND attempted_at <= datetime('now', ?1)
               AND attempted_at > datetime('now', '-3 days')
             "#,
-            [],
+            params![stale_before],
         )?;
         // Older orphans are stale; retrying them would spend runs on dead issues,
         // so give them a terminal state that a manual reset can still undo
@@ -1550,9 +1552,10 @@ impl AttemptTracker for SqliteTracker {
             SET status = 'cannot_fix',
                 error_message = 'Interrupted before completion; too old to retry automatically'
             WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
+              AND attempted_at <= datetime('now', ?1)
               AND attempted_at <= datetime('now', '-3 days')
             "#,
-            [],
+            params![stale_before],
         )?;
         tx.commit()?;
         Ok(released + closed)
@@ -10873,43 +10876,90 @@ mod tests {
         assert_eq!(attempt.retry_count, 0);
     }
 
+    /// How long the orphan-release tests treat a run as possibly live.
+    const ORPHANED_RUN_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+    /// Move the attempt rows of `issue_id` `seconds` into the past, as if
+    /// their runs started that long ago.
+    fn age_attempt(tracker: &SqliteTracker, issue_id: &str, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE fix_attempts SET attempted_at = datetime('now', ?1) WHERE issue_id = ?2",
+                params![format!("-{seconds} seconds"), issue_id],
+            )
+            .unwrap();
+    }
+
     #[test]
-    fn test_release_orphaned_pending_attempts_frees_recent_rows_only() {
+    fn test_release_orphaned_pending_attempts_frees_stale_rows_only() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker
-            .record_attempt("sentry", "fresh", "CLOUD-1")
+            .record_attempt("sentry", "orphaned", "CLOUD-1")
             .unwrap();
         tracker
-            .record_attempt("sentry", "stale", "CLOUD-2")
+            .record_attempt("sentry", "abandoned", "CLOUD-2")
             .unwrap();
         tracker.record_attempt("sentry", "done", "CLOUD-3").unwrap();
         tracker
             .mark_success("sentry", "done", "https://github.com/org/repo/pull/1")
             .unwrap();
-        {
-            let conn = tracker.acquire_lock().unwrap();
-            conn.execute(
-                "UPDATE fix_attempts SET attempted_at = datetime('now', '-30 days') WHERE issue_id = 'stale'",
-                [],
-            )
-            .unwrap();
-        }
+        age_attempt(&tracker, "orphaned", 2 * 60 * 60);
+        age_attempt(&tracker, "abandoned", 30 * 24 * 60 * 60);
 
-        tracker.release_orphaned_pending_attempts().unwrap();
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            2,
+            "both orphans must be released"
+        );
 
-        // A recent orphan goes back into the retry queue
         let retryable: Vec<String> = tracker
             .get_retryable_issues(2)
             .unwrap()
             .into_iter()
             .map(|a| a.issue_id)
             .collect();
-        assert_eq!(retryable, vec!["fresh".to_string()]);
-        // A stale one is closed out instead of staying pending forever
-        let stale = tracker.get_attempt("sentry", "stale").unwrap().unwrap();
-        assert_eq!(stale.status, FixAttemptStatus::CannotFix);
+        assert_eq!(
+            retryable,
+            vec!["orphaned".to_string()],
+            "an orphan from the last few days goes back into the retry queue"
+        );
+        let abandoned = tracker.get_attempt("sentry", "abandoned").unwrap().unwrap();
+        assert_eq!(
+            abandoned.status,
+            FixAttemptStatus::CannotFix,
+            "an older orphan is closed out instead of staying pending forever"
+        );
         let done = tracker.get_attempt("sentry", "done").unwrap().unwrap();
         assert_eq!(done.status, FixAttemptStatus::Success);
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_live_runs_alone() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "just_started", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "within_threshold", "CLOUD-2")
+            .unwrap();
+        age_attempt(&tracker, "within_threshold", 50 * 60);
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a run younger than the threshold may still be live in another process"
+        );
+        for issue_id in ["just_started", "within_threshold"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Pending, "{issue_id}");
+            assert!(attempt.error_message.is_none(), "{issue_id}");
+        }
     }
 
     #[test]
@@ -10924,16 +10974,24 @@ mod tests {
         let child = tracker
             .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
             .unwrap();
+        age_attempt(&tracker, "1", 2 * 60 * 60);
 
-        tracker.release_orphaned_pending_attempts().unwrap();
+        tracker
+            .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+            .unwrap();
 
-        // Not pushed into the retry queue, which would rerun the whole parent issue
-        assert!(tracker.get_retryable_issues(2).unwrap().is_empty());
-        // The next cascade trigger resumes the same row and can finish it
+        assert!(
+            tracker.get_retryable_issues(2).unwrap().is_empty(),
+            "a cascade row must not be pushed into the retry queue, which would rerun the \
+             whole parent issue"
+        );
         let resumed = tracker
             .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
             .unwrap();
-        assert_eq!(resumed, child);
+        assert_eq!(
+            resumed, child,
+            "the next cascade trigger must resume the same row"
+        );
         tracker
             .update_attempt_pr(resumed, "https://github.com/org/lib/pull/7", "org/lib", 7)
             .unwrap();

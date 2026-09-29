@@ -1031,24 +1031,41 @@ impl Watcher {
         self.is_running.store(running, Ordering::SeqCst);
     }
 
+    /// Release attempts whose runs were orphaned by a crash, restart or
+    /// shutdown, which otherwise stay `pending` and block their issues from
+    /// ever being picked or retried again.
+    ///
+    /// Nothing records which process runs an attempt, and a daemon, a
+    /// foreground `poll` and one-shot triggers can all be running attempts
+    /// against the same database. A live run cannot outlast
+    /// [`AgentConfig::stale_run_after`](claudear_config::config::AgentConfig::stale_run_after),
+    /// so only attempts pending for longer than that are released; fresher
+    /// ones are left to whichever process may still own them, and are
+    /// released by a later sweep once they are stale too. This runs on start
+    /// and every housekeeping cycle, so an orphan does not wait for the next
+    /// restart.
+    fn release_orphaned_attempts(&self) {
+        let stale_after = self.config.agent.stale_run_after();
+        match self.tracker.release_orphaned_pending_attempts(stale_after) {
+            Ok(0) => {}
+            Ok(released) => tracing::info!(
+                component = "watcher",
+                released,
+                stale_after_secs = stale_after.as_secs(),
+                "Released orphaned pending attempts"
+            ),
+            Err(e) => {
+                tracing::warn!(component = "watcher", error = %e, "Failed to release orphaned attempts")
+            }
+        }
+    }
+
     /// Start the watcher with polling.
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
-        // Runs killed by the last shutdown stay `pending`, which blocks the issue
-        // from ever being picked or retried again.
         if !self.dry_run {
-            match self.tracker.release_orphaned_pending_attempts() {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    component = "watcher",
-                    released = n,
-                    "Released attempts orphaned by the last shutdown"
-                ),
-                Err(e) => {
-                    tracing::warn!(component = "watcher", error = %e, "Failed to release orphaned attempts")
-                }
-            }
+            self.release_orphaned_attempts();
         }
 
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
@@ -2536,13 +2553,14 @@ Create a PR with your changes.{custom_instructions}"#,
         self.notifier.notify_repetitive_digest(&digest).await
     }
 
-    /// Run housekeeping tasks: retries, cascades, and metrics.
-    /// Called on the global timer, separate from per-source polling.
+    /// Run housekeeping tasks: orphaned-attempt release, retries, cascades,
+    /// and metrics. Called on the global timer, separate from per-source
+    /// polling.
     pub async fn run_housekeeping_cycle(&self) -> Result<()> {
         let housekeeping_started_at = std::time::Instant::now();
 
-        // Run retries, PR merge cascades, and release cascades concurrently
         if !self.dry_run {
+            self.release_orphaned_attempts();
             let (retries_result, pr_merges_result, releases_result) = tokio::join!(
                 self.process_ready_retries(),
                 self.check_pr_merges_and_cascade(),
