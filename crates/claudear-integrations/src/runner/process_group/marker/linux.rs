@@ -161,23 +161,15 @@ mod tests {
         let (marked_child, [marked_pid]) = spawn(&mut marked(SESSION_SLEEP, marker));
         let (unmarked, [unmarked_pid]) = spawn(&mut perl(SESSION_SLEEP));
 
-        let marked_signalled = fallback(marked_pid.cast_signed(), entry.as_bytes(), Signal::Kill);
-        let unmarked_signalled =
-            fallback(unmarked_pid.cast_signed(), entry.as_bytes(), Signal::Kill);
+        for pid in [marked_pid, unmarked_pid] {
+            fallback(pid.cast_signed(), entry.as_bytes(), Signal::Kill).unwrap();
+        }
         let exited = exits_within(marked_pid);
         let running = is_running(unmarked_pid);
         stop(marked_child);
         stop(unmarked);
 
-        assert!(
-            marked_signalled.unwrap(),
-            "marked process {marked_pid} must be signalled"
-        );
         assert!(exited, "marked process {marked_pid} outlived SIGKILL");
-        assert!(
-            !unmarked_signalled.unwrap(),
-            "unmarked process {unmarked_pid} must not be signalled"
-        );
         assert!(running, "unmarked process {unmarked_pid} was killed");
     }
 }

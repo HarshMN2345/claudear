@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn test_find_includes_a_marked_process_in_a_session_of_its_own() {
+    fn test_kill_ends_a_marked_process_in_a_session_of_its_own() {
         assert_perl_environment_readable();
         let marker = Marker::new();
         let (shell, [escaped]) = spawn(
@@ -144,52 +144,72 @@ mod tests {
                 .stdout(Stdio::piped()),
         );
 
-        let found = marker.find();
-        kill(escaped);
-        stop(shell);
+        marker.kill();
 
+        let exited = exits_within(escaped);
+        if !exited {
+            kill(escaped);
+        }
+        stop(shell);
         assert!(
-            found.contains(&escaped),
-            "process {escaped} carries the marker but was not found in {found:?}"
+            exited,
+            "process {escaped} carries the marker in a session of its own but outlived kill"
         );
     }
 
     #[test]
-    fn test_find_ignores_unmarked_and_near_miss_processes() {
+    fn test_kill_spares_near_misses_of_the_marker() {
         assert_perl_environment_readable();
         let marker = Marker::new();
-        let (unmarked, [_]) = spawn(&mut perl(SLEEP));
-        let (suffixed, [_]) = spawn(perl(SLEEP).env(Marker::VARIABLE, format!("{marker}x")));
-        let (other, [_]) = spawn(&mut marked(SLEEP, Marker::new()));
-        let (prefixed, [_]) =
-            spawn(perl(SLEEP).env(format!("X{}", Marker::VARIABLE), marker.to_string()));
-        let (exact, [pid]) = spawn(&mut marked(SLEEP, marker));
+        let near_misses: [(Child, [u32; 1]); 5] = [
+            spawn(&mut perl(SLEEP)),
+            spawn(perl(SLEEP).env(Marker::VARIABLE, format!("{marker}x"))),
+            spawn(&mut marked(SLEEP, Marker::new())),
+            spawn(perl(SLEEP).env(format!("X{}", Marker::VARIABLE), marker.to_string())),
+            spawn(perl(SLEEP).arg(format!("{}={marker}", Marker::VARIABLE))),
+        ];
+        let (exact, [_]) = spawn(marked(SLEEP, marker).arg(""));
 
-        let found = marker.find();
-        for child in [unmarked, suffixed, other, prefixed, exact] {
-            stop(child);
-        }
+        marker.kill();
 
-        assert_eq!(found, [pid], "only the exact entry may match");
+        let status = exit_status(exact);
+        std::thread::sleep(Duration::from_millis(200));
+        let killed: Vec<u32> = near_misses
+            .into_iter()
+            .filter_map(|(mut child, [pid])| {
+                let running = child.try_wait().unwrap().is_none();
+                stop(child);
+                (!running).then_some(pid)
+            })
+            .collect();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the process carrying the exact entry exited with {status} instead of being killed"
+        );
+        assert!(
+            killed.is_empty(),
+            "processes {killed:?} without the exact entry in their environment were killed"
+        );
     }
 
     #[test]
-    fn test_find_ignores_a_marked_zombie() {
+    fn test_terminate_does_not_wait_out_its_grace_on_a_zombie() {
         assert_perl_environment_readable();
         let marker = Marker::new();
         let (mut child, [pid]) = spawn(&mut marked(SLEEP, marker));
-        let alive = marker.find();
-
         child.kill().unwrap();
         let exited = exits_within(pid);
-        let dead = marker.find();
+
+        let start = Instant::now();
+        marker.terminate(EXIT_DEADLINE);
+        let elapsed = start.elapsed();
         child.wait().unwrap();
 
-        assert!(alive.contains(&pid), "process {pid} must be found alive");
         assert!(exited, "process {pid} outlived SIGKILL");
         assert!(
-            !dead.contains(&pid),
-            "zombie {pid} must not be found, or terminate waits out its grace on it"
+            elapsed < EXIT_DEADLINE / 2,
+            "terminate took {elapsed:?} waiting on zombie {pid}, which nothing may reap"
         );
     }
 
@@ -258,15 +278,8 @@ mod tests {
         assert_perl_environment_readable();
         let marker = Marker::new();
         let (unmarked, [unmarked_pid]) = spawn(&mut perl(SLEEP));
-        let (session, [leader, sibling]) =
+        let (session, [_, sibling]) =
             spawn(marked(SESSION_SLEEP_WITH_UNMARKED_CHILD, marker).arg(Marker::VARIABLE));
-        let found = marker.find();
-        if found != [leader] {
-            kill(sibling);
-            stop(unmarked);
-            stop(session);
-            panic!("only process {leader} carries the marker, but {found:?} were found");
-        }
 
         marker.kill();
 
