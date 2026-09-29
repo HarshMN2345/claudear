@@ -1,3 +1,4 @@
+use super::marker::Marker;
 use super::signal::Signal;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,12 +9,14 @@ static GLOBAL: Registry = Registry::new();
 
 const EMPTIED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Process groups of agent CLIs that are still running. Each CLI leads its own
-/// group, out of reach of the terminal's signals, so claudear passes them on
-/// itself and kills whatever is left before it exits.
+/// Process groups of agent CLIs that are still running, and the markers of runs
+/// whose processes may have left them. Each CLI leads its own group, out of
+/// reach of the terminal's signals, so claudear passes them on itself and kills
+/// whatever is left before it exits.
 #[derive(Debug, Default)]
 pub struct Registry {
     ids: Mutex<BTreeSet<u32>>,
+    markers: Mutex<BTreeSet<Marker>>,
     interrupted: AtomicBool,
 }
 
@@ -21,6 +24,7 @@ impl Registry {
     pub const fn new() -> Self {
         Self {
             ids: Mutex::new(BTreeSet::new()),
+            markers: Mutex::new(BTreeSet::new()),
             interrupted: AtomicBool::new(false),
         }
     }
@@ -48,6 +52,16 @@ impl Registry {
         }
     }
 
+    /// Track `marker` until its run has swept the processes that carry it, so
+    /// [`Self::kill_all`] still reaches them meanwhile.
+    pub(super) fn track(&self, marker: Marker) {
+        self.markers().insert(marker);
+    }
+
+    pub(super) fn release(&self, marker: Marker) {
+        self.markers().remove(&marker);
+    }
+
     /// Send every group, including any registered later, the SIGINT a terminal
     /// Ctrl-C would, so each CLI can clean up the shells it started in sessions
     /// of their own.
@@ -65,10 +79,15 @@ impl Registry {
         self.interrupted.load(Ordering::SeqCst)
     }
 
+    /// Kill every group and every process that carries a tracked marker.
     pub fn kill_all(&self) {
         let ids = std::mem::take(&mut *self.ids());
         for id in ids {
             Self::send(id, Signal::Kill);
+        }
+        let markers = std::mem::take(&mut *self.markers());
+        for marker in markers {
+            marker.kill();
         }
     }
 
@@ -80,8 +99,8 @@ impl Registry {
         self.kill_all();
     }
 
-    /// Resolves once every group has been killed, by its run or by
-    /// [`Self::kill_all`].
+    /// Resolves once every group has been killed and every marker swept, by its
+    /// run or by [`Self::kill_all`].
     pub async fn emptied(&self) {
         while !self.is_empty() {
             tokio::time::sleep(EMPTIED_POLL_INTERVAL).await;
@@ -89,11 +108,15 @@ impl Registry {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids().is_empty()
+        self.ids().is_empty() && self.markers().is_empty()
     }
 
     fn ids(&self) -> MutexGuard<'_, BTreeSet<u32>> {
         self.ids.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn markers(&self) -> MutexGuard<'_, BTreeSet<Marker>> {
+        self.markers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(unix)]
@@ -102,12 +125,8 @@ impl Registry {
         let Ok(group @ 1..) = libc::pid_t::try_from(id) else {
             return;
         };
-        let number = match signal {
-            Signal::Interrupt => libc::SIGINT,
-            Signal::Kill => libc::SIGKILL,
-        };
         // SAFETY: killpg takes no pointers and only sends a signal.
-        if unsafe { libc::killpg(group, number) } == 0 {
+        if unsafe { libc::killpg(group, signal.number()) } == 0 {
             return;
         }
         let error = std::io::Error::last_os_error();
@@ -141,6 +160,12 @@ mod tests {
         assert_interrupted, assert_killed, exits_within, is_running, spawn_group, BACKGROUND_SLEEP,
         EXIT_DEADLINE, INTERRUPTIBLE_LEADER,
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::runner::process_group::tests::{
+        assert_perl_environment_readable, background_pid, group_command, kill, ESCAPED_SLEEP,
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::runner::process_group::Guard;
 
     const INTERRUPT_IGNORING_LEADER: &str = "trap '' INT; sleep 300 & echo $!; exec sleep 300";
 
@@ -179,6 +204,50 @@ mod tests {
         assert!(
             registry.is_empty(),
             "a killed group must not be signalled again once the OS reuses its id"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_kill_all_kills_marked_processes_of_every_run() {
+        assert_perl_environment_readable();
+        let registry = Registry::new();
+        let (mut first, _first_guard) =
+            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
+        let (mut second, _second_guard) =
+            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
+        let escaped = [
+            background_pid(&mut first).await,
+            background_pid(&mut second).await,
+        ];
+
+        registry.kill_all();
+
+        let survivors: Vec<u32> = escaped
+            .into_iter()
+            .filter(|&pid| !exits_within(pid))
+            .collect();
+        for &pid in &survivors {
+            kill(pid);
+        }
+        assert!(
+            survivors.is_empty(),
+            "processes {survivors:?} that left their runs' groups survived kill_all"
+        );
+        assert_killed(&mut first).await;
+        assert_killed(&mut second).await;
+    }
+
+    #[test]
+    fn test_kill_all_forgets_tracked_markers() {
+        let registry = Registry::new();
+        registry.track(Marker::new());
+
+        registry.kill_all();
+
+        assert!(
+            registry.is_empty(),
+            "kill_all must forget the markers it swept"
         );
     }
 
@@ -287,5 +356,24 @@ mod tests {
             .await
             .expect("emptied must resolve once the last group is killed");
         assert_killed(&mut leader).await;
+    }
+
+    #[tokio::test]
+    async fn test_emptied_waits_for_tracked_markers() {
+        let registry = Registry::new();
+        let marker = Marker::new();
+        registry.track(marker);
+
+        let early = tokio::time::timeout(Duration::from_millis(200), registry.emptied()).await;
+        assert!(
+            early.is_err(),
+            "emptied resolved while a run was still sweeping its marker"
+        );
+
+        registry.release(marker);
+
+        tokio::time::timeout(EXIT_DEADLINE, registry.emptied())
+            .await
+            .expect("emptied must resolve once the last marker is released");
     }
 }

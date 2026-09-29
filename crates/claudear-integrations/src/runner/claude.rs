@@ -31,7 +31,7 @@ const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "W
 
 /// Timeout for read-only structured queries (classification-scale, not the long
 /// fix-run timeout).
-const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
+const STRUCTURED_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long to keep waiting for the CLI's output after its process group is
 /// killed. Its own output is already buffered by then, so this only bounds the
@@ -729,12 +729,13 @@ The PR title should include the issue ID: {}
 
     /// Run a read-only, schema-constrained query via `--json-schema` and return
     /// the object from the `result` stream event. Read-only tools, no permission
-    /// skipping, short classification-scale timeout.
+    /// skipping, and an error if the CLI outlives `timeout`.
     async fn run_structured_query(
         &self,
         prompt: &str,
         json_schema: &str,
         project_dir: &Path,
+        timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
         let mut args = vec![
             "--verbose".to_string(),
@@ -825,19 +826,23 @@ The PR title should include the issue ID: {}
             }
             structured
         };
-        let run = async { tokio::join!(collect, group.wait(&mut child)).0 };
-
-        let timeout = std::time::Duration::from_secs(STRUCTURED_QUERY_TIMEOUT_SECS);
-        let structured = match tokio::time::timeout(timeout, run).await {
-            Ok(structured) => structured,
-            Err(_) => {
-                group.kill();
-                return Err(Error::runner(format!(
-                    "structured query timed out after {}s",
-                    STRUCTURED_QUERY_TIMEOUT_SECS
-                )));
-            }
+        // The timeout bounds only the CLI: cancelling finish mid-sweep leaves
+        // its sweep running detached, and finishing again signals leftovers twice.
+        let reap = async {
+            let exited = tokio::time::timeout(timeout, group.wait(&mut child))
+                .await
+                .is_ok();
+            group.finish().await;
+            exited
         };
+
+        let (structured, exited) = tokio::join!(collect, reap);
+        if !exited {
+            return Err(Error::runner(format!(
+                "structured query timed out after {}s",
+                timeout.as_secs()
+            )));
+        }
 
         structured.ok_or_else(|| Error::runner("no structured output in response"))
     }
@@ -1750,7 +1755,7 @@ The PR title should include the issue ID: {}
                 }
             }
         };
-        group.kill();
+        group.finish().await;
 
         let mut forced_failure_msg: Option<String> = None;
         let (status, timed_out) = match outcome {
@@ -2383,7 +2388,7 @@ impl AgentRunner for ClaudeAgentRunner {
         json_schema: &str,
         project_dir: &Path,
     ) -> Result<serde_json::Value> {
-        self.run_structured_query(prompt, json_schema, project_dir)
+        self.run_structured_query(prompt, json_schema, project_dir, STRUCTURED_QUERY_TIMEOUT)
             .await
     }
 }
@@ -2653,10 +2658,13 @@ fn parse_verify_result(output: &str) -> VerifyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::runner::process_group::tests::assert_perl_environment_readable;
     #[cfg(unix)]
     use crate::runner::process_group::tests::{
-        exits_within, install_stub, is_running, kill, recorded_escaped_pid, recorded_pids,
-        wait_for_recorded_pids, BACKGROUND_PROCESS, ESCAPED_PROCESS, RUN_DEADLINE,
+        exits_within, install_stub, is_running, recorded_escaped_pid, recorded_pids,
+        stop_if_running, wait_for_recorded_pids, BACKGROUND_PROCESS, ESCAPED_PROCESS,
+        MARKER_VARIABLE, RUN_DEADLINE,
     };
 
     /// Create a runner with a no-op tracker for tests that don't need persistence.
@@ -2890,6 +2898,16 @@ mod tests {
         ]
     }
 
+    /// Like [`ESCAPED_PROCESS`], but it survives SIGTERM, appending a line to
+    /// `terms` for each one it receives.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const TERMINATE_COUNTING_PROCESS: &str = concat!(
+        r#"perl -e 'use POSIX; $SIG{TERM} = sub { open(my $f, ">>", "terms") or die; "#,
+        r#"print $f "TERM\n"; close $f }; setsid(); open(my $f, ">", "escaped") or die; "#,
+        r#"print $f "$$\n"; close $f; sleep 300 while 1' &"#,
+        "\nwhile [ ! -s escaped ]; do sleep 0.1; done\n",
+    );
+
     #[cfg(unix)]
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
@@ -2947,6 +2965,63 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn verdict() -> serde_json::Value {
+        json!({"verdict": "ok"})
+    }
+
+    #[cfg(unix)]
+    fn structured_result_event(output: &serde_json::Value) -> serde_json::Value {
+        json!({"type": "result", "is_error": false, "structured_output": output})
+    }
+
+    /// Run [`ClaudeAgentRunner::run_reply`] against a stub CLI that runs
+    /// `setup` and then replies [`REPLY_FINAL_ANSWER`]. Returns the reply, or
+    /// `None` if the run outlived [`RUN_DEADLINE`], the pid `setup` recorded in
+    /// `escaped`, and whether that process was still running afterwards, killing
+    /// it if so.
+    #[cfg(unix)]
+    fn reply_leaving(setup: &str) -> (Option<Result<String>>, u32, bool) {
+        let script = fake_cli_script(
+            setup,
+            &[
+                assistant_text_event(REPLY_FINAL_ANSWER),
+                result_event(REPLY_FINAL_ANSWER, false),
+            ],
+            0,
+        );
+        let (reply, escaped) = with_fake_cli(&script, |runner, directory| {
+            let reply = block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.run_reply(&verify_issue(), "ctx", None, ReplyKind::Answer, directory),
+                )
+                .await
+            });
+            (reply.ok(), recorded_escaped_pid(directory))
+        });
+        let escaped = escaped.expect("the stub records the escaped pid");
+        (reply, escaped, stop_if_running(escaped))
+    }
+
+    /// Like [`reply_leaving`], for a structured query answering [`verdict`].
+    #[cfg(unix)]
+    fn structured_query_leaving(setup: &str) -> (Option<Result<serde_json::Value>>, u32, bool) {
+        let script = fake_cli_script(setup, &[structured_result_event(&verdict())], 0);
+        let (structured, escaped) = with_fake_cli(&script, |runner, directory| {
+            let structured = block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.structured_query("prompt", "{}", directory),
+                )
+                .await
+            });
+            (structured.ok(), recorded_escaped_pid(directory))
+        });
+        let escaped = escaped.expect("the stub records the escaped pid");
+        (structured, escaped, stop_if_running(escaped))
+    }
+
+    #[cfg(unix)]
     #[test]
     fn test_run_reply_returns_while_a_background_process_holds_stdout() {
         let script = fake_cli_script(
@@ -2980,17 +3055,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_structured_query_returns_while_a_background_process_holds_stdout() {
-        let verdict = json!({"verdict": "ok"});
         let script = fake_cli_script(
             BACKGROUND_PROCESS,
-            &[json!({"type": "result", "is_error": false, "structured_output": verdict})],
+            &[structured_result_event(&verdict())],
             0,
         );
         let (structured, pids) = with_fake_cli(&script, |runner, directory| {
             let structured = block_on(async {
                 tokio::time::timeout(
                     RUN_DEADLINE,
-                    runner.run_structured_query("prompt", "{}", directory),
+                    runner.structured_query("prompt", "{}", directory),
                 )
                 .await
             });
@@ -3000,7 +3074,7 @@ mod tests {
 
         let structured =
             structured.expect("the query must not wait for background processes to close stdout");
-        assert_eq!(structured.unwrap(), verdict);
+        assert_eq!(structured.unwrap(), verdict());
         assert!(
             exits_within(background),
             "background process {background} outlived the query"
@@ -3040,65 +3114,122 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_run_reply_stops_reading_output_held_open_outside_the_process_group() {
-        let script = fake_cli_script(
-            ESCAPED_PROCESS,
-            &[
-                assistant_text_event("Thanks!"),
-                result_event("Thanks!", false),
-            ],
-            0,
-        );
-        let (reply, escaped) = with_fake_cli(&script, |runner, directory| {
-            let reply = block_on(async {
-                tokio::time::timeout(
-                    RUN_DEADLINE,
-                    runner.run_reply(&verify_issue(), "ctx", None, ReplyKind::Answer, directory),
-                )
-                .await
-            });
-            (reply, recorded_escaped_pid(directory))
-        });
-        let escaped = escaped.expect("the stub records the escaped pid");
-        let escaped_running = is_running(escaped);
-        kill(escaped);
+        let (reply, _, escaped_running) =
+            reply_leaving(&format!("env -u {MARKER_VARIABLE} {ESCAPED_PROCESS}"));
 
         let reply = reply.expect("the run must not wait on output held open outside its group");
-        assert_eq!(reply.unwrap(), "Thanks!");
+        assert_eq!(reply.unwrap(), REPLY_FINAL_ANSWER);
         assert!(
             escaped_running,
-            "the process must survive the group kill for this test to reach the drain deadline"
+            "the process must survive the group kill and the sweep for this test to reach the drain"
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn test_structured_query_stops_reading_output_held_open_outside_the_process_group() {
-        let verdict = json!({"verdict": "ok"});
-        let script = fake_cli_script(
-            ESCAPED_PROCESS,
-            &[json!({"type": "result", "is_error": false, "structured_output": verdict})],
-            0,
-        );
-        let (structured, escaped) = with_fake_cli(&script, |runner, directory| {
-            let structured = block_on(async {
-                tokio::time::timeout(
-                    RUN_DEADLINE,
-                    runner.run_structured_query("prompt", "{}", directory),
-                )
-                .await
-            });
-            (structured, recorded_escaped_pid(directory))
-        });
-        let escaped = escaped.expect("the stub records the escaped pid");
-        let escaped_running = is_running(escaped);
-        kill(escaped);
+        let (structured, _, escaped_running) =
+            structured_query_leaving(&format!("env -u {MARKER_VARIABLE} {ESCAPED_PROCESS}"));
 
         let structured =
             structured.expect("the query must not wait on output held open outside its group");
-        assert_eq!(structured.unwrap(), verdict);
+        assert_eq!(structured.unwrap(), verdict());
         assert!(
             escaped_running,
-            "the process must survive the group kill for this test to reach the drain deadline"
+            "the process must survive the group kill and the sweep for this test to reach the drain"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_run_reply_kills_processes_left_in_sessions_of_their_own() {
+        assert_perl_environment_readable();
+        let (reply, escaped, escaped_running) = reply_leaving(ESCAPED_PROCESS);
+
+        let reply = reply.expect("the run must end within its deadline");
+        assert_eq!(reply.unwrap(), REPLY_FINAL_ANSWER);
+        assert!(
+            !escaped_running,
+            "process {escaped} that left the CLI's process group outlived the run"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_structured_query_kills_processes_left_in_sessions_of_their_own() {
+        assert_perl_environment_readable();
+        let (structured, escaped, escaped_running) = structured_query_leaving(ESCAPED_PROCESS);
+
+        let structured = structured.expect("the query must end within its deadline");
+        assert_eq!(structured.unwrap(), verdict());
+        assert!(
+            !escaped_running,
+            "process {escaped} that left the CLI's process group outlived the query"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_structured_query_finishes_its_sweep_past_the_timeout() {
+        assert_perl_environment_readable();
+        // Shorter than the sweep's SIGTERM grace, so the sweep outlasts it.
+        let timeout = std::time::Duration::from_secs(2);
+        let script = fake_cli_script(
+            TERMINATE_COUNTING_PROCESS,
+            &[structured_result_event(&verdict())],
+            0,
+        );
+        let (structured, escaped, terms) = with_fake_cli(&script, |runner, directory| {
+            let structured = block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.run_structured_query("prompt", "{}", directory, timeout),
+                )
+                .await
+            });
+            let terms = std::fs::read_to_string(directory.join("terms")).unwrap_or_default();
+            (structured.ok(), recorded_escaped_pid(directory), terms)
+        });
+        let escaped = escaped.expect("the stub records the escaped pid");
+        let escaped_running = stop_if_running(escaped);
+
+        let structured = structured.expect("the query must end within its deadline");
+        assert_eq!(
+            terms, "TERM\n",
+            "process {escaped} must get SIGTERM once, from a single sweep"
+        );
+        assert_eq!(
+            structured.expect("a CLI that exited before the timeout must not time out"),
+            verdict()
+        );
+        assert!(
+            !escaped_running,
+            "process {escaped} that ignores SIGTERM outlived the sweep's grace"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_structured_query_times_out_when_the_cli_outlives_its_timeout() {
+        let script = format!("{STUB_HEADER}exec sleep 300\n");
+        let timeout = std::time::Duration::from_secs(1);
+        let structured = with_fake_cli(&script, |runner, directory| {
+            block_on(async {
+                tokio::time::timeout(
+                    RUN_DEADLINE,
+                    runner.run_structured_query("prompt", "{}", directory, timeout),
+                )
+                .await
+            })
+        });
+
+        let error = structured
+            .expect("the query must end within its deadline")
+            .expect_err("a CLI that outlives the timeout must time out")
+            .to_string();
+        assert!(
+            error.contains("structured query timed out after 1s"),
+            "got: {error}"
         );
     }
 

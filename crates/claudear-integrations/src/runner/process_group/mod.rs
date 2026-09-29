@@ -1,8 +1,11 @@
 //! Agent CLIs lead process groups of their own, so a run can kill whatever it
-//! leaves behind and claudear can reach every CLI when it shuts down.
+//! leaves behind and claudear can reach every CLI when it shuts down. Each run
+//! also marks its CLI's environment, so the processes it started in sessions of
+//! their own can be found and killed too.
 
 mod drain;
 mod guard;
+mod marker;
 mod registry;
 mod signal;
 
@@ -12,6 +15,7 @@ pub use registry::Registry;
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
+    use super::marker::Marker;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
@@ -26,7 +30,17 @@ pub(crate) mod tests {
     /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
     pub(crate) const RUN_DEADLINE: Duration = Duration::from_secs(60);
 
+    /// The environment variable carrying a run's marker, which tests scrub with
+    /// `env -u` to start a process the run cannot find.
+    pub(crate) const MARKER_VARIABLE: &str = Marker::VARIABLE;
+
     pub(crate) const BACKGROUND_SLEEP: &str = "sleep 300 & echo $!; exec sleep 300";
+
+    /// Like [`BACKGROUND_SLEEP`], but the background process moves to a session
+    /// of its own, out of reach of a group kill, before printing its pid.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) const ESCAPED_SLEEP: &str =
+        r#"perl -e 'use POSIX; $| = 1; setsid() or die; print "$$\n"; sleep 300' & exec sleep 300"#;
 
     /// Stub CLI setup that leaves `sleep 300` running in the background,
     /// holding the stub's stdout, and records "<background pid> <stub pid>" in
@@ -35,7 +49,10 @@ pub(crate) mod tests {
 
     /// Stub CLI setup that leaves `sleep 300` running in a session of its own,
     /// beyond the reach of a process group kill, holding the stub's stdout. It
-    /// records its pid in `escaped` once it has left the group.
+    /// records its pid in `escaped` once it has left the group. It keeps the
+    /// run's marker, so the run can find and kill it, unless the setup is
+    /// prefixed with `env -u` [`MARKER_VARIABLE`], in which case only the drain
+    /// ends the read.
     pub(crate) const ESCAPED_PROCESS: &str = concat!(
         r#"perl -e 'use POSIX; setsid(); open(my $f, ">", "escaped") or die; "#,
         r#"print $f "$$\n"; close $f; sleep 300' &"#,
@@ -185,8 +202,86 @@ pub(crate) mod tests {
         assert_eq!(status.code(), Some(7), "the leader exited with {status}");
     }
 
+    /// Sweep tests spawn `perl`, so it must run with an environment
+    /// [`Marker::find`] can read.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn assert_perl_environment_readable() {
+        let marker = Marker::new();
+        let mut perl = std::process::Command::new("perl")
+            .args(["-e", "sleep 300"])
+            .env(Marker::VARIABLE, marker.to_string())
+            .spawn()
+            .expect("perl must be on PATH");
+        let pid = perl.id();
+        let start = Instant::now();
+        while !marker.find().contains(&pid) && start.elapsed() < EXIT_DEADLINE {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let readable = marker.find().contains(&pid);
+        let _ = perl.kill();
+        let _ = perl.wait();
+        assert!(
+            readable,
+            "perl's environment must be readable; on macOS install Homebrew perl (Apple platform binaries hide theirs)"
+        );
+    }
+
+    /// A [`perl`] script that moves to a session of its own, then prints its pid.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) const SESSION_SLEEP: &str =
+        r#"use POSIX; $| = 1; setsid() or die; print "$$\n"; sleep 300"#;
+
+    /// Perl running `script`, which prints pids on stdout, without a marker.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn perl(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("perl");
+        command
+            .args(["-e", script])
+            .env_remove(Marker::VARIABLE)
+            .stdout(Stdio::piped());
+        command
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn marked(script: &str, marker: Marker) -> std::process::Command {
+        let mut command = perl(script);
+        command.env(Marker::VARIABLE, marker.to_string());
+        command
+    }
+
+    /// Spawn `command` and read the first `COUNT` pids it prints, one per line.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn spawn<const COUNT: usize>(
+        command: &mut std::process::Command,
+    ) -> (std::process::Child, [u32; COUNT]) {
+        use std::io::BufRead;
+
+        let mut child = command.spawn().unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let pids = std::array::from_fn(|_| {
+            let line = lines.next().expect("the process must print a pid").unwrap();
+            line.trim().parse().unwrap()
+        });
+        (child, pids)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn stop(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     pub(crate) fn kill(pid: u32) {
         // SAFETY: kill takes no pointers and only sends a signal.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// Whether `pid` is still running, killing it if so.
+    pub(crate) fn stop_if_running(pid: u32) -> bool {
+        let running = is_running(pid);
+        if running {
+            kill(pid);
+        }
+        running
     }
 }

@@ -1,3 +1,4 @@
+use super::marker::Marker;
 use super::{Drain, Registry};
 use std::future::Future;
 use std::io;
@@ -9,29 +10,41 @@ use tokio::sync::watch;
 #[cfg(unix)]
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long processes a run left behind get to exit on SIGTERM before they are
+/// killed.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
 /// The process group an agent CLI leads, killed with everything left running in
-/// it once the CLI exits ([`Self::wait`]), on [`Self::kill`] or on drop.
-/// Processes in the group inherit the CLI's stdout and stderr, so until they die
-/// a reader never sees EOF.
+/// it once the CLI exits ([`Self::wait`]), on [`Self::finish`] or on drop.
+/// Finishing or dropping the guard also kills every process that left the group
+/// but still carries the run's marker in its environment. Processes in the group
+/// inherit the CLI's stdout and stderr, so until they die a reader never sees
+/// EOF.
 pub struct Guard<'a> {
     id: Option<u32>,
+    marker: Option<Marker>,
     registry: &'a Registry,
     killed: watch::Sender<bool>,
 }
 
 impl<'a> Guard<'a> {
-    /// Spawn `command` as the leader of a new process group, registered in
-    /// `registry` until the guard kills it.
+    /// Spawn `command` as the leader of a new process group, with a fresh
+    /// marker in its environment, both registered in `registry` until the guard
+    /// finishes or drops.
     pub fn spawn(command: &mut Command, registry: &'a Registry) -> io::Result<(Child, Self)> {
         #[cfg(unix)]
         command.process_group(0);
+        let marker = Marker::new();
+        marker.apply(command);
         let child = command.kill_on_drop(true).spawn()?;
         let id = child.id();
         if let Some(id) = id {
             registry.insert(id);
         }
+        registry.track(marker);
         let guard = Self {
             id,
+            marker: Some(marker),
             registry,
             killed: watch::Sender::new(false),
         };
@@ -45,7 +58,7 @@ impl<'a> Guard<'a> {
         #[cfg(unix)]
         if let Some(id) = self.id {
             match Self::exited(id).await {
-                Ok(()) => self.kill(),
+                Ok(()) => self.kill_group(),
                 Err(error) => tracing::warn!(
                     component = "runner",
                     process_group = id,
@@ -55,11 +68,35 @@ impl<'a> Guard<'a> {
             }
         }
         let status = child.wait().await;
-        self.kill();
+        self.kill_group();
         status
     }
 
-    pub fn kill(&mut self) {
+    /// Kill the group, then give marked processes that left it a grace period
+    /// to exit on SIGTERM before killing whatever is left.
+    pub async fn finish(&mut self) {
+        self.kill_group();
+        // Left in place until the sweep ends, so dropping a cancelled finish
+        // still sweeps.
+        if let Some(marker) = self.marker {
+            let terminate = tokio::task::spawn_blocking(move || marker.terminate(TERMINATE_GRACE));
+            if let Err(error) = terminate.await {
+                tracing::warn!(
+                    component = "runner",
+                    marker = %marker,
+                    error = %error,
+                    "Failed to terminate processes an agent run left behind, killing them instead"
+                );
+                marker.kill();
+            }
+            self.registry.release(marker);
+            self.marker = None;
+        }
+    }
+
+    /// Kill the group alone, so marked processes that left it still get their
+    /// SIGTERM grace from [`Self::finish`].
+    fn kill_group(&mut self) {
         if let Some(id) = self.id.take() {
             self.registry.kill(id);
         }
@@ -118,7 +155,11 @@ impl Guard<'_> {
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        self.kill();
+        self.kill_group();
+        if let Some(marker) = self.marker.take() {
+            marker.kill();
+            self.registry.release(marker);
+        }
     }
 }
 
@@ -129,6 +170,31 @@ mod tests {
         assert_killed, background_pid, exits_within, group_command, is_running, BACKGROUND_SLEEP,
         EXIT_DEADLINE,
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::runner::process_group::tests::{
+        assert_perl_environment_readable, kill, stop_if_running, ESCAPED_SLEEP,
+    };
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[tokio::test]
+    async fn test_spawn_marks_the_child() {
+        let registry = Registry::new();
+        let script = format!(r#"echo "${}"; exec sleep 300"#, Marker::VARIABLE);
+        let (mut leader, guard) = Guard::spawn(&mut group_command(&script), &registry).unwrap();
+        let mut line = String::new();
+        BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            line.trim_end(),
+            guard.marker.unwrap().to_string(),
+            "the CLI's environment must carry the run's marker"
+        );
+        drop(guard);
+        assert_killed(&mut leader).await;
+    }
 
     #[tokio::test]
     async fn test_wait_kills_the_group_and_returns_the_leader_status() {
@@ -147,7 +213,12 @@ mod tests {
             exits_within(background),
             "background process {background} outlived its leader"
         );
-        assert!(registry.is_empty(), "a waited-for group must unregister");
+        assert!(
+            !registry.is_empty(),
+            "wait must leave the run's marker registered for finish to sweep"
+        );
+        guard.finish().await;
+        assert!(registry.is_empty(), "a finished guard must unregister");
     }
 
     #[tokio::test]
@@ -184,6 +255,84 @@ mod tests {
             "background process {background} survived the guard's drop"
         );
         assert!(registry.is_empty(), "a dropped guard must unregister");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_drop_kills_a_marked_process_in_a_session_of_its_own() {
+        assert_perl_environment_readable();
+        let registry = Registry::new();
+        let (mut leader, guard) =
+            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
+        let escaped = background_pid(&mut leader).await;
+
+        drop(guard);
+
+        let exited = exits_within(escaped);
+        if !exited {
+            kill(escaped);
+        }
+        assert!(
+            exited,
+            "process {escaped} that left the group outlived the guard's drop"
+        );
+        assert_killed(&mut leader).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_finish_terminates_a_marked_process_in_a_session_of_its_own() {
+        assert_perl_environment_readable();
+        let registry = Registry::new();
+        let (mut leader, mut guard) =
+            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
+        let escaped = background_pid(&mut leader).await;
+
+        guard.finish().await;
+
+        let running = stop_if_running(escaped);
+        assert!(
+            !running,
+            "process {escaped} that left the group outlived finish"
+        );
+        assert!(registry.is_empty(), "a finished guard must unregister");
+        assert_killed(&mut leader).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_finish_kills_a_marked_process_when_its_sweep_fails() {
+        assert_perl_environment_readable();
+        let registry = Registry::new();
+        let (mut leader, mut guard) =
+            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
+        let escaped = background_pid(&mut leader).await;
+        let stopped = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = stopped.handle().clone();
+        stopped.shutdown_background();
+        let finish = tokio::time::timeout(EXIT_DEADLINE, guard.finish());
+
+        {
+            // A runtime that has shut down cancels blocking work, so the sweep
+            // never runs.
+            let _context = handle.enter();
+            finish.await.expect(
+                "finish hung: spawn_blocking on a shut-down runtime no longer resolves as cancelled",
+            );
+        }
+
+        let exited = exits_within(escaped);
+        if !exited {
+            kill(escaped);
+        }
+        assert!(
+            exited,
+            "process {escaped} that left the group outlived a finish whose sweep failed"
+        );
+        assert!(registry.is_empty(), "a finished guard must unregister");
+        assert_killed(&mut leader).await;
     }
 
     #[tokio::test]
