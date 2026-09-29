@@ -226,11 +226,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A [`perl`] script that moves to a session of its own, then prints its pid.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(super) const SESSION_SLEEP: &str =
-        r#"use POSIX; $| = 1; setsid() or die; print "$$\n"; sleep 300"#;
-
     /// Perl running `script`, which prints pids on stdout, without a marker.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn perl(script: &str) -> std::process::Command {

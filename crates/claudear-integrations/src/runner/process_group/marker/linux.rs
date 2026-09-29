@@ -150,8 +150,10 @@ mod tests {
     use crate::runner::process_group::marker::Marker;
     use crate::runner::process_group::tests::{
         assert_perl_environment_readable, exits_within, is_running, marked, perl, spawn, stop,
-        SESSION_SLEEP,
     };
+
+    /// A perl script that moves to a session of its own, then prints its pid.
+    const SESSION_SLEEP: &str = r#"use POSIX; $| = 1; setsid() or die; print "$$\n"; sleep 300"#;
 
     #[test]
     fn test_fallback_kills_only_a_marked_process() {

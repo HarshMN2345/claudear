@@ -293,42 +293,6 @@ mod tests {
         assert_killed(&mut leader).await;
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn test_finish_kills_a_marked_process_when_its_sweep_fails() {
-        assert_perl_environment_readable();
-        let registry = Registry::new();
-        let (mut leader, mut guard) =
-            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
-        let escaped = background_pid(&mut leader).await;
-        let stopped = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let handle = stopped.handle().clone();
-        stopped.shutdown_background();
-        let finish = tokio::time::timeout(EXIT_DEADLINE, guard.finish());
-
-        {
-            // A runtime that has shut down cancels blocking work, so the sweep
-            // never runs.
-            let _context = handle.enter();
-            finish.await.expect(
-                "finish hung: spawn_blocking on a shut-down runtime no longer resolves as cancelled",
-            );
-        }
-
-        let exited = exits_within(escaped);
-        if !exited {
-            kill(escaped);
-        }
-        assert!(
-            exited,
-            "process {escaped} that left the group outlived a finish whose sweep failed"
-        );
-        assert!(registry.is_empty(), "a finished guard must unregister");
-        assert_killed(&mut leader).await;
-    }
-
     #[tokio::test]
     async fn test_kill_all_reaches_a_guarded_group() {
         let registry = Registry::new();

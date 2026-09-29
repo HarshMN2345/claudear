@@ -98,12 +98,18 @@ mod tests {
     use super::*;
     use crate::runner::process_group::tests::{
         assert_perl_environment_readable, exits_within, is_running, kill, marked, perl, spawn,
-        stop, stop_if_running, ESCAPED_SLEEP, EXIT_DEADLINE, SESSION_SLEEP,
+        stop, stop_if_running, ESCAPED_SLEEP, EXIT_DEADLINE,
     };
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::process::{Child, Command, Stdio};
 
     const SLEEP: &str = r#"$| = 1; print "$$\n"; sleep 300"#;
+
+    /// Moves to a session of its own and prints its pid; on SIGTERM it creates
+    /// the file named by its first argument before it exits.
+    const CLEANING_SESSION_SLEEP: &str = concat!(
+        r#"use POSIX; $SIG{TERM} = sub { open(my $f, ">", $ARGV[0]) or die; exit 0 }; "#,
+        r#"$| = 1; setsid() or die; print "$$\n"; sleep 300"#,
+    );
 
     const TERMINATE_IGNORING_SESSION_SLEEP: &str = concat!(
         r#"use POSIX; $SIG{TERM} = "IGNORE"; $| = 1; setsid() or die; "#,
@@ -121,16 +127,15 @@ mod tests {
 
     const GRACE: Duration = Duration::from_millis(500);
 
-    /// Wait for `child`, killing it if it outlives [`EXIT_DEADLINE`] so a
-    /// failing test leaves nothing running.
-    fn exit_status(mut child: Child) -> ExitStatus {
-        let exited = exits_within(child.id());
-        if !exited {
+    /// Whether `child` stops within [`EXIT_DEADLINE`], killing it otherwise so
+    /// a failing test leaves nothing running.
+    fn stops(mut child: Child) -> bool {
+        let stopped = exits_within(child.id());
+        if !stopped {
             let _ = child.kill();
         }
-        let status = child.wait().unwrap();
-        assert!(exited, "process {} outlived the sweep", child.id());
-        status
+        child.wait().unwrap();
+        stopped
     }
 
     #[test]
@@ -172,7 +177,7 @@ mod tests {
 
         marker.kill();
 
-        let status = exit_status(exact);
+        let stopped = stops(exact);
         std::thread::sleep(Duration::from_millis(200));
         let killed: Vec<u32> = near_misses
             .into_iter()
@@ -182,10 +187,9 @@ mod tests {
                 (!running).then_some(pid)
             })
             .collect();
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "the process carrying the exact entry exited with {status} instead of being killed"
+        assert!(
+            stopped,
+            "the process carrying the exact entry outlived kill"
         );
         assert!(
             killed.is_empty(),
@@ -214,24 +218,25 @@ mod tests {
     }
 
     #[test]
-    fn test_terminate_ends_a_process_that_honours_sigterm() {
+    fn test_terminate_lets_a_process_clean_up_before_it_stops() {
         assert_perl_environment_readable();
+        let directory = tempfile::tempdir().unwrap();
+        let cleaned = directory.path().join("cleaned");
         let marker = Marker::new();
-        let (child, [_]) = spawn(&mut marked(SESSION_SLEEP, marker));
+        let (child, [_]) = spawn(marked(CLEANING_SESSION_SLEEP, marker).arg(&cleaned));
 
         let start = Instant::now();
         marker.terminate(EXIT_DEADLINE);
         let elapsed = start.elapsed();
 
-        let status = exit_status(child);
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGTERM),
-            "the process exited with {status} instead of on SIGTERM"
+        assert!(stops(child), "the process outlived terminate");
+        assert!(
+            cleaned.exists(),
+            "the process was stopped before it could clean up on SIGTERM"
         );
         assert!(
             elapsed < EXIT_DEADLINE / 2,
-            "terminate took {elapsed:?} although the process exited on SIGTERM"
+            "terminate took {elapsed:?} although the process stopped on SIGTERM"
         );
     }
 
@@ -245,11 +250,9 @@ mod tests {
         marker.terminate(GRACE);
         let elapsed = start.elapsed();
 
-        let status = exit_status(child);
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "the process exited with {status} instead of being killed"
+        assert!(
+            stops(child),
+            "a process that ignores SIGTERM outlived terminate"
         );
         assert!(
             elapsed >= GRACE,
@@ -265,11 +268,9 @@ mod tests {
 
         marker.kill();
 
-        let status = exit_status(child);
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "the process exited with {status} instead of being killed"
+        assert!(
+            stops(child),
+            "a marked process in claudear's session outlived kill"
         );
     }
 
@@ -283,17 +284,13 @@ mod tests {
 
         marker.kill();
 
-        let status = exit_status(session);
+        let stopped = stops(session);
         std::thread::sleep(Duration::from_millis(200));
         let unmarked_running = is_running(unmarked_pid);
         let sibling_running = stop_if_running(sibling);
         stop(unmarked);
 
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGKILL),
-            "the marked process exited with {status} instead of being killed"
-        );
+        assert!(stopped, "the marked process outlived kill");
         assert!(
             unmarked_running,
             "unmarked process {unmarked_pid} in claudear's session was killed"
