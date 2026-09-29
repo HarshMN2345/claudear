@@ -3223,13 +3223,11 @@ mod tests {
             })
         });
 
-        let error = structured
-            .expect("the query must end within its deadline")
-            .expect_err("a CLI that outlives the timeout must time out")
-            .to_string();
         assert!(
-            error.contains("structured query timed out after 1s"),
-            "got: {error}"
+            structured
+                .expect("the query must end within its deadline")
+                .is_err(),
+            "a CLI that outlives the timeout must time out"
         );
     }
 

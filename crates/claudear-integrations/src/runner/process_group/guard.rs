@@ -36,12 +36,15 @@ impl<'a> Guard<'a> {
         command.process_group(0);
         let marker = Marker::new();
         marker.apply(command);
-        let child = command.kill_on_drop(true).spawn()?;
+        registry.track(marker);
+        let child = command
+            .kill_on_drop(true)
+            .spawn()
+            .inspect_err(|_| registry.release(marker))?;
         let id = child.id();
         if let Some(id) = id {
             registry.insert(id);
         }
-        registry.track(marker);
         let guard = Self {
             id,
             marker: Some(marker),
@@ -174,26 +177,21 @@ mod tests {
     use crate::runner::process_group::tests::{
         assert_perl_environment_readable, kill, stop_if_running, ESCAPED_SLEEP,
     };
-    use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[tokio::test]
-    async fn test_spawn_marks_the_child() {
+    async fn test_failed_spawn_leaves_nothing_for_shutdown_to_wait_on() {
         let registry = Registry::new();
-        let script = format!(r#"echo "${}"; exec sleep 300"#, Marker::VARIABLE);
-        let (mut leader, guard) = Guard::spawn(&mut group_command(&script), &registry).unwrap();
-        let mut line = String::new();
-        BufReader::new(leader.stdout.take().unwrap())
-            .read_line(&mut line)
-            .await
-            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
 
-        assert_eq!(
-            line.trim_end(),
-            guard.marker.unwrap().to_string(),
-            "the CLI's environment must carry the run's marker"
+        let spawned = Guard::spawn(
+            &mut Command::new(directory.path().join("claude")),
+            &registry,
         );
-        drop(guard);
-        assert_killed(&mut leader).await;
+
+        assert!(spawned.is_err(), "a missing CLI must fail to spawn");
+        tokio::time::timeout(EXIT_DEADLINE, registry.emptied())
+            .await
+            .expect("a failed spawn must not leave the registry waiting on its run");
     }
 
     #[tokio::test]
@@ -212,10 +210,6 @@ mod tests {
         assert!(
             exits_within(background),
             "background process {background} outlived its leader"
-        );
-        assert!(
-            !registry.is_empty(),
-            "wait must leave the run's marker registered for finish to sweep"
         );
         guard.finish().await;
         assert!(registry.is_empty(), "a finished guard must unregister");

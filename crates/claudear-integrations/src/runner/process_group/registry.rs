@@ -18,6 +18,7 @@ pub struct Registry {
     ids: Mutex<BTreeSet<u32>>,
     markers: Mutex<BTreeSet<Marker>>,
     interrupted: AtomicBool,
+    killed: AtomicBool,
 }
 
 impl Registry {
@@ -26,6 +27,7 @@ impl Registry {
             ids: Mutex::new(BTreeSet::new()),
             markers: Mutex::new(BTreeSet::new()),
             interrupted: AtomicBool::new(false),
+            killed: AtomicBool::new(false),
         }
     }
 
@@ -35,9 +37,14 @@ impl Registry {
     }
 
     /// Register group `id`, interrupting it straight away if the registry has
-    /// been interrupted: a run can spawn its CLI after claudear was told to stop.
+    /// been interrupted, or killing it if every group already was: a run can
+    /// spawn its CLI after claudear was told to stop.
     pub(super) fn insert(&self, id: u32) {
         let mut ids = self.ids();
+        if self.killed.load(Ordering::SeqCst) {
+            Self::send(id, Signal::Kill);
+            return;
+        }
         ids.insert(id);
         if self.interrupted.load(Ordering::SeqCst) {
             Self::send(id, Signal::Interrupt);
@@ -79,9 +86,14 @@ impl Registry {
         self.interrupted.load(Ordering::SeqCst)
     }
 
-    /// Kill every group and every process that carries a tracked marker.
+    /// Kill every group, including any registered later, and every process
+    /// that carries a tracked marker.
     pub fn kill_all(&self) {
-        let ids = std::mem::take(&mut *self.ids());
+        let ids = {
+            let mut ids = self.ids();
+            self.killed.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *ids)
+        };
         for id in ids {
             Self::send(id, Signal::Kill);
         }
@@ -157,17 +169,23 @@ impl Registry {
 mod tests {
     use super::*;
     use crate::runner::process_group::tests::{
-        assert_interrupted, assert_killed, exits_within, is_running, spawn_group, BACKGROUND_SLEEP,
-        EXIT_DEADLINE, INTERRUPTIBLE_LEADER,
+        assert_interrupted, assert_killed, exits_within, group_command, is_running, spawn_group,
+        BACKGROUND_SLEEP, EXIT_DEADLINE, INTERRUPTIBLE_LEADER,
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::runner::process_group::tests::{
-        assert_perl_environment_readable, background_pid, group_command, kill, ESCAPED_SLEEP,
+        assert_perl_environment_readable, background_pid, kill, stop_if_running, ESCAPED_SLEEP,
     };
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::runner::process_group::Guard;
 
     const INTERRUPT_IGNORING_LEADER: &str = "trap '' INT; sleep 300 & echo $!; exec sleep 300";
+
+    /// Like [`ESCAPED_SLEEP`], but the background process ignores SIGTERM.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const TERMINATE_IGNORING_ESCAPED_SLEEP: &str = concat!(
+        r#"perl -e 'use POSIX; $SIG{TERM} = "IGNORE"; $| = 1; setsid() or die; "#,
+        r#"print "$$\n"; sleep 300' & exec sleep 300"#,
+    );
 
     #[tokio::test]
     async fn test_kill_all_kills_every_registered_group() {
@@ -238,17 +256,29 @@ mod tests {
         assert_killed(&mut second).await;
     }
 
-    #[test]
-    fn test_kill_all_forgets_tracked_markers() {
+    #[tokio::test]
+    async fn test_kill_all_lets_shutdown_stop_waiting_on_guarded_runs() {
         let registry = Registry::new();
-        registry.track(Marker::new());
+        let (mut leader, _guard) =
+            Guard::spawn(&mut group_command(BACKGROUND_SLEEP), &registry).unwrap();
 
         registry.kill_all();
 
-        assert!(
-            registry.is_empty(),
-            "kill_all must forget the markers it swept"
-        );
+        tokio::time::timeout(EXIT_DEADLINE, registry.emptied())
+            .await
+            .expect("emptied must resolve once kill_all has swept every run");
+        assert_killed(&mut leader).await;
+    }
+
+    #[tokio::test]
+    async fn test_runs_spawned_after_kill_all_are_killed() {
+        let registry = Registry::new();
+        registry.kill_all();
+
+        let (mut leader, _guard) =
+            Guard::spawn(&mut group_command(BACKGROUND_SLEEP), &registry).unwrap();
+
+        assert_killed(&mut leader).await;
     }
 
     #[tokio::test]
@@ -358,22 +388,36 @@ mod tests {
         assert_killed(&mut leader).await;
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn test_emptied_waits_for_tracked_markers() {
+    async fn test_emptied_waits_for_a_run_still_sweeping() {
+        assert_perl_environment_readable();
         let registry = Registry::new();
-        let marker = Marker::new();
-        registry.track(marker);
+        let (mut leader, mut guard) = Guard::spawn(
+            &mut group_command(TERMINATE_IGNORING_ESCAPED_SLEEP),
+            &registry,
+        )
+        .unwrap();
+        let escaped = background_pid(&mut leader).await;
 
-        let early = tokio::time::timeout(Duration::from_millis(200), registry.emptied()).await;
+        let ((), emptied_while_sweeping) = tokio::join!(guard.finish(), async {
+            tokio::time::timeout(Duration::from_millis(500), registry.emptied())
+                .await
+                .is_ok()
+        });
+
+        let running = stop_if_running(escaped);
         assert!(
-            early.is_err(),
-            "emptied resolved while a run was still sweeping its marker"
+            !emptied_while_sweeping,
+            "emptied resolved while a run was still sweeping the processes it left behind"
         );
-
-        registry.release(marker);
-
+        assert!(
+            !running,
+            "process {escaped} that ignores SIGTERM outlived the sweep's grace"
+        );
         tokio::time::timeout(EXIT_DEADLINE, registry.emptied())
             .await
-            .expect("emptied must resolve once the last marker is released");
+            .expect("emptied must resolve once the run's sweep finishes");
+        assert_killed(&mut leader).await;
     }
 }
