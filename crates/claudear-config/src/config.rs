@@ -110,11 +110,17 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
-    /// How long an agent run waits, once its CLI has exited or been killed,
-    /// for the CLI's stdout and stderr to close before it stops reading them.
-    /// A command the CLI started can hold them open long after the CLI is
-    /// gone.
-    pub const OUTPUT_GRACE_PERIOD: Duration = Duration::from_secs(5);
+    /// How long an agent run keeps waiting for its CLI's output after the
+    /// CLI's process group is killed. The CLI's own output is already buffered
+    /// by then, so this only bounds the wait on processes that escaped the
+    /// group while holding the pipes.
+    pub const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// When an agent run stops reading its CLI's output after the CLI's
+    /// process group is killed, even while a process that escaped the group
+    /// keeps writing to the pipes: the longest a run reads output once its
+    /// CLI is gone.
+    pub const OUTPUT_DRAIN_CUTOFF: Duration = Duration::from_secs(10);
 
     /// Get the default provider's config.
     pub fn default_provider_config(&self) -> Option<&ProviderConfig> {
@@ -2182,12 +2188,11 @@ const DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE: Duration = Duration::from_secs(60);
 const DEPLOY_QA_BACKSTOP_SLACK: Duration = Duration::from_secs(5);
 
 /// Least grace [`DeployQaConfig::backstop_timeout`] gives the agent runner past
-/// the live-QA limit: long enough to wait out
-/// [`AgentConfig::OUTPUT_GRACE_PERIOD`] for a finished CLI's output and record
-/// the run, so a run that finished within even a one-second limit is never
-/// abandoned.
+/// the live-QA limit: long enough to read a finished CLI's output until
+/// [`AgentConfig::OUTPUT_DRAIN_CUTOFF`] and record the run, so a run that
+/// finished within even a one-second limit is never abandoned.
 const DEPLOY_QA_BACKSTOP_MINIMUM_GRACE: Duration =
-    AgentConfig::OUTPUT_GRACE_PERIOD.saturating_add(DEPLOY_QA_BACKSTOP_SLACK);
+    AgentConfig::OUTPUT_DRAIN_CUTOFF.saturating_add(DEPLOY_QA_BACKSTOP_SLACK);
 
 /// Smallest margin [`DeployQaConfig::stale_run_after`] leaves past the live-QA
 /// timeout, covering the backstop grace plus setup and delivery around the
@@ -2241,9 +2246,9 @@ impl DeployQaConfig {
     /// this only fires when the runner fails to. Past that limit it allows the
     /// timeout again, capped at a minute, for the runner to kill the agent CLI
     /// and record the timed-out run first, and never less than the runner may
-    /// take to return a run that finished within the limit, after waiting
-    /// [`AgentConfig::OUTPUT_GRACE_PERIOD`] for output a command the CLI
-    /// started held open.
+    /// take to return a run that finished within the limit, after reading
+    /// output a process that escaped the CLI's process group held open until
+    /// [`AgentConfig::OUTPUT_DRAIN_CUTOFF`].
     pub fn backstop_timeout(&self) -> Duration {
         let timeout = Duration::from_secs(self.effective_timeout_secs());
         let grace = timeout
@@ -5307,7 +5312,7 @@ monitoring_duration_hours = 12
     fn test_deploy_qa_backstop_outlasts_a_run_that_finished_within_its_limit() {
         for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
             let config = deploy_qa_with_timeout(timeout_secs);
-            let longest_finished_run = runner_limit(&config) + AgentConfig::OUTPUT_GRACE_PERIOD;
+            let longest_finished_run = runner_limit(&config) + AgentConfig::OUTPUT_DRAIN_CUTOFF;
 
             assert!(
                 config.backstop_timeout() > longest_finished_run,

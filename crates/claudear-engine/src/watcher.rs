@@ -32,8 +32,10 @@ use claudear_storage::FixAttemptTracker;
 use futures::future::join_all;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use tokio::sync::futures::Notified;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
 
@@ -44,6 +46,25 @@ type QueuedIssue = (Issue, MatchResult, Option<Intent>);
 /// How many times a PR review comment may fail processing before it is given up
 /// on (marked handled) instead of re-triggering the fix agent every cycle.
 const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
+
+/// Issue metadata carrying the reviewed PR's repo into a review rerun.
+const REVIEW_PR_REPO_KEY: &str = "review_pr_repo";
+
+/// How many review-driven reruns a PR gets before claudear stops answering
+/// review feedback on it and leaves the PR to humans.
+const MAX_REVIEW_CYCLES: i32 = 3;
+
+const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
+
+/// Whether a retry that failed to start should get its retry back.
+fn retry_trigger_error_is_transient(e: &claudear_core::error::Error) -> bool {
+    use claudear_core::error::Error;
+    match e {
+        Error::Http(_) | Error::Network(_) => true,
+        Error::Source { message, .. } => message.contains("already being processed"),
+        _ => false,
+    }
+}
 
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
@@ -1014,6 +1035,22 @@ impl Watcher {
     pub async fn start(self: &Arc<Self>, interval_ms: Option<u64>) -> Result<()> {
         self.clear_rate_limit_pause().await;
 
+        // Runs killed by the last shutdown stay `pending`, which blocks the issue
+        // from ever being picked or retried again.
+        if !self.dry_run {
+            match self.tracker.release_orphaned_pending_attempts() {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    component = "watcher",
+                    released = n,
+                    "Released attempts orphaned by the last shutdown"
+                ),
+                Err(e) => {
+                    tracing::warn!(component = "watcher", error = %e, "Failed to release orphaned attempts")
+                }
+            }
+        }
+
         let configured_poll_interval = interval_ms.unwrap_or(self.config.poll_interval_ms);
         let poll_interval = configured_poll_interval.max(1000);
         if configured_poll_interval < 1000 {
@@ -1198,7 +1235,11 @@ impl Watcher {
         let max_wait = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
 
-        while self.active_processing.load(Ordering::SeqCst) > 0 {
+        loop {
+            let released = self.next_slot_release();
+            if self.active_processing.load(Ordering::SeqCst) == 0 {
+                break;
+            }
             if start.elapsed() > max_wait {
                 tracing::warn!(
                     remaining = self.active_processing.load(Ordering::SeqCst),
@@ -1210,10 +1251,8 @@ impl Watcher {
                 active_count = self.active_processing.load(Ordering::SeqCst),
                 "Waiting for active tasks to complete..."
             );
-            // Wait for a task to finish (notifies via slot_available) or fall back
-            // to a periodic check in case the notification was missed.
             let remaining = max_wait.saturating_sub(start.elapsed());
-            let _ = tokio::time::timeout(remaining, self.slot_available.notified()).await;
+            let _ = tokio::time::timeout(remaining, released).await;
         }
 
         tracing::info!("Claude Watcher stopped gracefully");
@@ -1436,8 +1475,52 @@ impl Watcher {
 
         // Increment the review_cycles count
         if let Some(ref pr_url) = attempt.pr_url {
+            // Cascade PRs are watched without a PR record; create one so the cap counts them too
+            let pr_record = match self.tracker.get_pr(pr_url) {
+                Ok(Some(record)) => Some(record),
+                Ok(None) => match (&attempt.scm_repo, attempt.scm_pr_number) {
+                    (Some(repo), Some(number)) => {
+                        let mut record = claudear_core::types::PrRecord::new(pr_url, repo, number);
+                        record.attempt_id = Some(attempt.id);
+                        record.issue_id = Some(attempt.issue_id.clone());
+                        record.issue_source = Some(attempt.source.clone());
+                        Some(record)
+                    }
+                    _ => None,
+                },
+                Err(e) => {
+                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to load PR record for review cycle cap");
+                    None
+                }
+            };
             // Update the PR record with incremented review_cycles
-            if let Ok(Some(mut pr_record)) = self.tracker.get_pr(pr_url) {
+            if let Some(mut pr_record) = pr_record {
+                if pr_record.review_cycles >= MAX_REVIEW_CYCLES {
+                    tracing::warn!(
+                        pr_url = %pr_url,
+                        short_id = %attempt.short_id,
+                        review_cycles = pr_record.review_cycles,
+                        "Review cycle cap reached; leaving PR to humans"
+                    );
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                "review_cycle_cap_reached",
+                                format!(
+                                    "Stopped addressing review feedback for {} after {} cycles",
+                                    attempt.short_id, pr_record.review_cycles
+                                ),
+                            )
+                            .with_source(attempt.source.clone())
+                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                            .with_metadata(json!({ "pr_url": pr_url })),
+                        )
+                        .ok();
+                    if let Some(rw) = &self.review_watcher {
+                        rw.unwatch_pr(pr_url);
+                    }
+                    return Ok(());
+                }
                 pr_record.review_cycles += 1;
                 pr_record.last_review_at = Some(chrono::Utc::now());
                 if let Err(e) = self.tracker.upsert_pr(&pr_record) {
@@ -1593,12 +1676,13 @@ impl Watcher {
             }
 
             match self
-                .trigger_issue_with_feedback(
+                .trigger_issue_inner(
                     &attempt.source,
                     &attempt.issue_id,
                     Some(feedback.to_string()),
                     existing_pr_branch.clone(),
                     Some("Review feedback received".into()),
+                    attempt.scm_repo.as_deref(),
                 )
                 .await
             {
@@ -2609,11 +2693,15 @@ Create a PR with your changes.{custom_instructions}"#,
                     "max_concurrent_for source evaluated to 0, clamping to 1"
                 );
             }
-            while self.active_processing_for_source(&attempt.source) >= retry_max_concurrent {
+            loop {
+                let released = self.next_slot_release();
+                if self.active_processing_for_source(&attempt.source) < retry_max_concurrent {
+                    break;
+                }
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                self.slot_available.notified().await;
+                released.await;
             }
 
             tracing::info!(
@@ -2660,6 +2748,27 @@ Create a PR with your changes.{custom_instructions}"#,
                 .await
             {
                 Ok(()) => {
+                    // Only this path charges a retry, so only it refunds one: running
+                    // out of quota says nothing about the issue
+                    if let Ok(Some(after)) =
+                        self.tracker.get_attempt(&attempt.source, &attempt.issue_id)
+                    {
+                        let hit_rate_limit = after.status == FixAttemptStatus::Failed
+                            && after
+                                .error_message
+                                .as_deref()
+                                .is_some_and(runner::is_rate_limit_error);
+                        if hit_rate_limit {
+                            let error = after.error_message.unwrap_or_default();
+                            if let Err(e) = self.tracker.mark_failed_uncharged(
+                                &attempt.source,
+                                &attempt.issue_id,
+                                &error,
+                            ) {
+                                tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to refund retry after rate limit");
+                            }
+                        }
+                    }
                     self.record_source_decision(
                         &attempt.source,
                         "ready_retry_triggered",
@@ -2691,10 +2800,19 @@ Create a PR with your changes.{custom_instructions}"#,
                     );
                     retries_failed += 1;
                     let retry_error = format!("Retry trigger failed: {}", e);
-                    if let Err(mark_err) =
+                    // A network blip or in-flight clash says nothing about the issue, so
+                    // refund the retry; a permanent error like a deleted issue keeps its charge
+                    let marked = if retry_trigger_error_is_transient(&e) {
+                        self.tracker.mark_failed_uncharged(
+                            &attempt.source,
+                            &attempt.issue_id,
+                            &retry_error,
+                        )
+                    } else {
                         self.tracker
                             .mark_failed(&attempt.source, &attempt.issue_id, &retry_error)
-                    {
+                    };
+                    if let Err(mark_err) = marked {
                         tracing::warn!(
                             component = "watcher",
                             short_id = %attempt.short_id,
@@ -2860,8 +2978,16 @@ Create a PR with your changes.{custom_instructions}"#,
             match pr_status {
                 Ok(PrStatus::Merged) => {
                     pr_status_merged += 1;
-                    self.tracker
-                        .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    // A cascade row shares the parent's issue id: marking by issue id
+                    // updated the parent and left this row pending, so every poll saw
+                    // the merge again and re-fired the cascade
+                    let is_cascade = attempt.cascade_repo.is_some();
+                    if is_cascade {
+                        self.tracker.mark_cascade_pr_outcome(attempt.id, true)?;
+                    } else {
+                        self.tracker
+                            .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    }
                     // Timeline: PR merged.
                     self.tracker
                         .record_activity(
@@ -2890,7 +3016,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     }
 
                     // For bug-type issues, create a regression watch instead of immediate auto-resolve.
-                    let regression_watch_id = if attempt.is_bug() {
+                    // A downstream cascade merge does not fix the parent issue, so it
+                    // neither watches for regressions nor resolves it.
+                    let regression_watch_id = if !is_cascade && attempt.is_bug() {
                         let issue_type = match attempt.source.as_str() {
                             "sentry" => IssueType::SentryIssue,
                             "linear" => IssueType::LinearBug,
@@ -2930,8 +3058,9 @@ Create a PR with your changes.{custom_instructions}"#,
                     };
 
                     // Auto-resolve only when enabled and no regression watch is active.
-                    let should_resolve =
-                        regression_watch_id.is_none() && self.config.github().auto_resolve_on_merge;
+                    let should_resolve = !is_cascade
+                        && regression_watch_id.is_none()
+                        && self.config.github().auto_resolve_on_merge;
                     if should_resolve {
                         if let Some(source) =
                             self.sources.iter().find(|s| s.name() == attempt.source)
@@ -2967,7 +3096,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
                     // Action pipeline: once the fix is live, post a human-sounding
                     // "fix shipped" reply back to the originating ticket.
-                    self.maybe_send_fix_shipped_reply(attempt).await;
+                    if !is_cascade {
+                        self.maybe_send_fix_shipped_reply(attempt).await;
+                    }
 
                     // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
@@ -3009,8 +3140,12 @@ Create a PR with your changes.{custom_instructions}"#,
                 }
                 Ok(PrStatus::Closed) => {
                     pr_status_closed += 1;
-                    self.tracker
-                        .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    if attempt.cascade_repo.is_some() {
+                        self.tracker.mark_cascade_pr_outcome(attempt.id, false)?;
+                    } else {
+                        self.tracker
+                            .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    }
                     // Timeline: PR closed without merging.
                     self.tracker
                         .record_activity(
@@ -3522,6 +3657,17 @@ Create a PR with your changes.{custom_instructions}"#,
         self.lock_processing().qa_source_count(source_name)
     }
 
+    /// Resolve on the next processing slot release or [`Self::stop`].
+    ///
+    /// `notify_waiters` wakes only futures that already exist, so callers take
+    /// this before checking whether a slot is free: a release between that
+    /// check and the await then still wakes them.
+    fn next_slot_release(&self) -> Pin<Box<Notified<'_>>> {
+        let mut released = Box::pin(self.slot_available.notified());
+        released.as_mut().enable();
+        released
+    }
+
     /// Lock the processing set, recovering it from a poisoned lock: its
     /// methods keep keys and counts in step without panicking, so a holder
     /// that panicked cannot leave it inconsistent.
@@ -3579,6 +3725,7 @@ Create a PR with your changes.{custom_instructions}"#,
 
             // Wait for a concurrency slot in THIS lane.
             loop {
+                let released = self.next_slot_release();
                 let in_flight = if is_qa {
                     self.active_qa_for_source(source.name())
                 } else {
@@ -3598,7 +3745,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     );
                     return;
                 }
-                self.slot_available.notified().await;
+                released.await;
             }
 
             // Carry the trusted routing intent (classified upstream on trusted
@@ -4167,9 +4314,23 @@ Create a PR with your changes.{custom_instructions}"#,
             self.link_deploy_qa_tip_attempt(tip, attempt_id);
         }
 
-        // Infer the target repository using the shared resolution function
-        let mut resolution =
-            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
+        // A review rerun must work in the repo the PR lives in; re-inferring
+        // lands on the same wrong repo a previous run already swapped away from.
+        let pr_repo = review_feedback
+            .as_ref()
+            .and_then(|_| issue.get_metadata::<String>(REVIEW_PR_REPO_KEY));
+        let pinned = pr_repo.and_then(|repo| {
+            match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
+                r @ RepoResolution::Resolved { .. } => Some(r),
+                RepoResolution::Skip { reason } => {
+                    tracing::warn!(short_id = %issue.short_id, repo = %repo, reason = %reason, "PR repo not resolvable, falling back to inference");
+                    None
+                }
+            }
+        });
+        let mut resolution = pinned.unwrap_or_else(|| {
+            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker))
+        });
 
         // Log resolution decision (watcher-specific verbose logging)
         match &resolution {
@@ -4424,12 +4585,16 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     fn extract_rate_limit_reset_time(error: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        Self::extract_rate_limit_reset_from_resets_at(error)
+        Self::extract_rate_limit_reset_from_resets_at(error, now)
+            .or_else(|| Self::extract_rate_limit_reset_from_usage_limit(error, now))
             .or_else(|| Self::extract_rate_limit_reset_from_banner_utc(error, now))
             .or_else(|| Self::extract_rate_limit_reset_from_retry_after(error, now))
     }
 
-    fn extract_rate_limit_reset_from_resets_at(error: &str) -> Option<DateTime<Utc>> {
+    fn extract_rate_limit_reset_from_resets_at(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
         let key = "\"resetsAt\"";
         let mut start = 0usize;
 
@@ -4445,12 +4610,40 @@ Create a PR with your changes.{custom_instructions}"#,
                             return Some(parsed.with_timezone(&Utc));
                         }
                     }
+                } else if let Some(reset) = Self::parse_leading_digits(after_colon)
+                    .and_then(|seconds| Self::plausible_rate_limit_reset(seconds, now))
+                {
+                    return Some(reset);
                 }
             }
             start = idx;
         }
 
         None
+    }
+
+    fn extract_rate_limit_reset_from_usage_limit(
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let marker = "usage limit reached|";
+        let lower = error.to_ascii_lowercase();
+        let idx = lower.find(marker)?;
+        let seconds = Self::parse_leading_digits(&lower[idx + marker.len()..])?;
+        Self::plausible_rate_limit_reset(seconds, now)
+    }
+
+    fn plausible_rate_limit_reset(epoch_seconds: i64, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let reset = DateTime::<Utc>::from_timestamp(epoch_seconds, 0)?;
+        let horizon = now + chrono::Duration::days(MAX_RATE_LIMIT_RESET_DAYS_AHEAD);
+        (reset > now && reset <= horizon).then_some(reset)
+    }
+
+    fn parse_leading_digits(text: &str) -> Option<i64> {
+        let end = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
+        text[..end].parse().ok()
     }
 
     fn extract_rate_limit_reset_from_banner_utc(
@@ -4516,11 +4709,7 @@ Create a PR with your changes.{custom_instructions}"#,
         let idx = lower.find("retry-after")?;
         let tail = &lower[idx + "retry-after".len()..];
         let digits_start = tail.find(|c: char| c.is_ascii_digit())?;
-        let digit_slice = &tail[digits_start..];
-        let digits_end = digit_slice
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(digit_slice.len());
-        let seconds: i64 = digit_slice[..digits_end].parse().ok()?;
+        let seconds = Self::parse_leading_digits(&tail[digits_start..])?;
         if seconds <= 0 {
             return None;
         }
@@ -4861,6 +5050,28 @@ Create a PR with your changes.{custom_instructions}"#,
         existing_pr_branch: Option<String>,
         trigger_reason: Option<String>,
     ) -> Result<()> {
+        self.trigger_issue_inner(
+            source_name,
+            issue_id,
+            review_feedback,
+            existing_pr_branch,
+            trigger_reason,
+            None,
+        )
+        .await
+    }
+
+    /// `pr_repo` pins a review rerun to the repo of the PR under review. It must
+    /// come from the reviewed attempt: a cascade row shares its parent's issue id.
+    async fn trigger_issue_inner(
+        &self,
+        source_name: &str,
+        issue_id: &str,
+        review_feedback: Option<String>,
+        existing_pr_branch: Option<String>,
+        trigger_reason: Option<String>,
+        pr_repo: Option<&str>,
+    ) -> Result<()> {
         let source = self
             .sources
             .iter()
@@ -4879,6 +5090,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
         if let Some(reason) = trigger_reason {
             issue.set_metadata("trigger_reason", reason);
+        }
+        if let Some(repo) = pr_repo {
+            issue.set_metadata(REVIEW_PR_REPO_KEY, repo);
         }
 
         let started = self
@@ -5189,13 +5403,6 @@ mod tests {
         fn get_call_count(&self) -> usize {
             self.call_count.load(AtomicOrdering::SeqCst)
         }
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_json() {
-        let msg = r#"Claude rate limit hit: {"type":"rate_limit_event","resetsAt":"2026-02-23T06:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg).unwrap();
-        assert_eq!(parsed.to_rfc3339(), "2026-02-23T06:00:00+00:00");
     }
 
     #[test]
@@ -6421,6 +6628,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dispatch_lane_wakes_for_slot_freed_during_rate_limit_check() {
+        let issue = Issue::new("1", "T-1", "Test Issue", "http://example.com/1", "mock");
+        let source =
+            Arc::new(MockSource::with_issues("mock", vec![issue.clone()])) as Arc<dyn IssueSource>;
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = create_test_watcher(
+            Arc::new(MockNotifier::new(true)),
+            tracker.clone(),
+            vec![source.clone()],
+            true,
+        );
+        watcher.set_running(true);
+        let items = vec![(
+            issue,
+            MatchResult::matched("Test", MatchPriority::Normal),
+            None,
+        )];
+        let inflight = watcher
+            .claim_processing("mock:inflight".to_string(), false)
+            .expect("the in-flight key should be free");
+        let pauses = watcher.rate_limit_pause_until.write().await;
+        // The lane queues on the rate-limit lock for its pause check. Handing
+        // it the lock and queuing again parks the lane on the same lock in its
+        // slot wait, after it has seen the lane full, where the slot is freed.
+        let free_slot_during_wait = async {
+            tokio::task::yield_now().await;
+            drop(pauses);
+            let pauses = watcher.rate_limit_pause_until.write().await;
+            drop(inflight);
+            drop(pauses);
+        };
+
+        let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                watcher.dispatch_lane(&source, items, 1, false),
+                free_slot_during_wait,
+            )
+        })
+        .await;
+
+        assert!(
+            dispatched.is_ok(),
+            "a slot freed while the lane checks for a rate-limit pause must wake the lane"
+        );
+        watcher.drain_spawned_tasks().await;
+        assert!(
+            tracker.get_attempt("mock", "1").unwrap().is_some(),
+            "the lane should process its issue in the freed slot"
+        );
+    }
+
+    #[tokio::test]
     async fn test_watcher_poll_source_zero_max_concurrent_does_not_deadlock() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
@@ -6796,6 +7055,61 @@ mod tests {
             updated_attempt.status,
             claudear_core::types::FixAttemptStatus::Failed,
             "review rerun should execute after lock release (repo resolution fails in test setup, marking failed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_feedback_stops_triggering_reruns_after_the_cycle_cap() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_url = "https://github.com/org/repo/pull/1";
+        // No PR record exists, like a cascade PR that is watched without one
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+
+        let source = Arc::new(MockSource::with_issues(
+            "mock",
+            vec![Issue::new(
+                "1",
+                "MOCK-1",
+                "Mock issue",
+                "http://example.com/mock/1",
+                "mock",
+            )],
+        )) as Arc<dyn IssueSource>;
+        let watcher = Arc::new(create_test_watcher(
+            notifier,
+            tracker.clone(),
+            vec![source],
+            false,
+        ));
+        watcher.is_running.store(true, Ordering::SeqCst);
+
+        // Each allowed rerun fails on repo resolution in this setup; reset to the
+        // open-PR state before the next round of feedback arrives
+        for _ in 0..MAX_REVIEW_CYCLES {
+            let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+            watcher
+                .process_review_action(&attempt, "Please add a test")
+                .await
+                .unwrap();
+            assert_eq!(
+                tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+                claudear_core::types::FixAttemptStatus::Failed,
+                "a rerun under the cap should run"
+            );
+            tracker.mark_success("mock", "1", pr_url).unwrap();
+        }
+
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        watcher
+            .process_review_action(&attempt, "Please add a test")
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.get_attempt("mock", "1").unwrap().unwrap().status,
+            claudear_core::types::FixAttemptStatus::Success,
+            "feedback past the cap must not start another run"
         );
     }
 
@@ -8879,11 +9193,13 @@ mod tests {
     }
 
     const CUSTOMER_REPLY: &str = "Thanks for reaching out, we are looking into this for you.";
+    const SCRIPTED_QA_PROVIDER: &str = "scripted-qa-agent";
 
     /// How [`ScriptedQaAgent`] answers a QA question.
     enum QaAnswer {
         Report(String),
         Crash,
+        Fail(String),
         Panic,
         /// Panics on the first question, then answers with the report.
         PanicOnce(String),
@@ -8905,7 +9221,7 @@ mod tests {
     #[async_trait]
     impl AgentRunner for ScriptedQaAgent {
         fn name(&self) -> &str {
-            "scripted-qa-agent"
+            SCRIPTED_QA_PROVIDER
         }
         fn capabilities(&self) -> claudear_integrations::runner::ProviderCapabilities {
             claudear_integrations::runner::ProviderCapabilities::default()
@@ -8942,6 +9258,7 @@ mod tests {
                 QaAnswer::Crash => {
                     Err(claudear_core::error::Error::runner("live QA probe crashed"))
                 }
+                QaAnswer::Fail(message) => Err(claudear_core::error::Error::runner(message)),
                 QaAnswer::Panic => panic!("live QA probe panicked"),
                 QaAnswer::PanicOnce(report) => {
                     if self.calls.load(AtomicOrdering::SeqCst) == 1 {
@@ -9040,7 +9357,12 @@ mod tests {
     impl DeployQaHarness {
         /// A mock `deploy_qa` source whose QA agent crashes.
         fn new(config: Config) -> Self {
-            Self::build(config, QaAnswer::Crash, |_, tip| {
+            Self::answering(config, QaAnswer::Crash)
+        }
+
+        /// A mock `deploy_qa` source whose QA agent answers as `answer`.
+        fn answering(config: Config, answer: QaAnswer) -> Self {
+            Self::build(config, answer, |_, tip| {
                 Arc::new(MockSource::with_issues(
                     DEPLOY_QA_SOURCE,
                     vec![deploy_qa_issue(tip)],
@@ -9276,6 +9598,160 @@ mod tests {
                 .unwrap(),
             "an errored tip must not block the track"
         );
+    }
+
+    async fn run_rate_limited_deploy_qa(failure: String) -> (usize, DateTime<Utc>) {
+        let mut config = test_config();
+        config.agent.default_provider = SCRIPTED_QA_PROVIDER.to_string();
+        let harness = DeployQaHarness::answering(config, QaAnswer::Fail(failure));
+
+        for _ in 0..2 {
+            harness
+                .watcher
+                .process_issue(
+                    harness.source.clone(),
+                    harness.issue(),
+                    MatchResult::matched("deploy_qa pending tip", MatchPriority::High),
+                    None,
+                    None,
+                    Some(Intent::Question),
+                )
+                .await;
+        }
+
+        let pause_until = harness
+            .tracker
+            .get_recent_activities(50, None)
+            .unwrap()
+            .into_iter()
+            .find(|activity| activity.activity_type == "watcher_paused")
+            .and_then(|activity| activity.metadata)
+            .and_then(|metadata| metadata["pause_until"].as_str().map(str::to_string))
+            .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+            .expect("the rate limit should be logged as a pause")
+            .with_timezone(&Utc);
+        (harness.agent_calls(), pause_until)
+    }
+
+    async fn assert_deploy_qa_deferred_until(failure: String, reset: DateTime<Utc>) {
+        let (agent_calls, pause_until) = run_rate_limited_deploy_qa(failure).await;
+        assert_eq!(
+            agent_calls, 1,
+            "a rate-limited provider must not be asked again before its reset"
+        );
+        assert!(
+            pause_until >= reset,
+            "the pause must last until the limit resets at {reset}, got {pause_until}"
+        );
+    }
+
+    async fn assert_deploy_qa_briefly_deferred(failure: String) {
+        let (agent_calls, pause_until) = run_rate_limited_deploy_qa(failure).await;
+        assert_eq!(
+            agent_calls, 1,
+            "a rate-limited provider must stay paused when its reset cannot be trusted"
+        );
+        assert!(
+            pause_until < Utc::now() + chrono::Duration::hours(1),
+            "an untrusted reset must not hold the provider past a short pause, got {pause_until}"
+        );
+    }
+
+    fn usage_limit_failure(reset: DateTime<Utc>) -> String {
+        format!("Claude AI usage limit reached|{}", reset.timestamp())
+    }
+
+    fn rate_limit_event_failure(resets_at: serde_json::Value) -> String {
+        format!(
+            "Claude rate limit hit: {}",
+            json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": { "status": "rejected", "resetsAt": resets_at },
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(usage_limit_failure(reset), reset).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_epoch_reset_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(rate_limit_event_failure(json!(reset.timestamp())), reset)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_rfc3339_reset_defers_qa_until_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_deferred_until(rate_limit_event_failure(json!(reset.to_rfc3339())), reset)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_falls_back_to_top_level_reset() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        let failure = format!(
+            "Claude rate limit hit: {}",
+            json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": { "status": "rejected", "resetsAt": "invalid" },
+                "resetsAt": reset.to_rfc3339(),
+            })
+        );
+        assert_deploy_qa_deferred_until(failure, reset).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_invalid_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!("not-a-valid-date")))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_empty_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!(""))).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_without_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred("Claude rate limit hit: some error".to_string()).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_elapsed_reset_still_defers_qa() {
+        let reset = Utc::now() - chrono::Duration::hours(1);
+        assert_deploy_qa_briefly_deferred(usage_limit_failure(reset)).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_rate_limit_event_with_elapsed_reset_still_defers_qa() {
+        let reset = Utc::now() - chrono::Duration::hours(1);
+        assert_deploy_qa_briefly_deferred(rate_limit_event_failure(json!(reset.timestamp()))).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_implausibly_distant_reset_defers_qa_briefly() {
+        let reset = Utc::now() + chrono::Duration::days(30);
+        assert_deploy_qa_briefly_deferred(usage_limit_failure(reset)).await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_with_millisecond_reset_defers_qa_briefly() {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        assert_deploy_qa_briefly_deferred(format!(
+            "Claude AI usage limit reached|{}",
+            reset.timestamp_millis()
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_deploy_qa_usage_limit_without_reset_defers_qa_briefly() {
+        assert_deploy_qa_briefly_deferred("Claude AI usage limit reached|".to_string()).await;
     }
 
     #[tokio::test]
@@ -11284,6 +11760,142 @@ mod tests {
 
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
+    }
+
+    /// SCM stub that reports the given PR numbers as merged and the rest as open.
+    struct MergedPrs(Vec<i64>);
+
+    #[async_trait::async_trait]
+    impl claudear_integrations::scm::ScmProvider for MergedPrs {
+        fn name(&self) -> &str {
+            "github"
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+        fn review_trigger(&self) -> &str {
+            "@claudear"
+        }
+        async fn get_pr_status(
+            &self,
+            _project: &str,
+            number: i64,
+        ) -> claudear_core::error::Result<PrStatus> {
+            Ok(if self.0.contains(&number) {
+                PrStatus::Merged
+            } else {
+                PrStatus::Open
+            })
+        }
+        async fn get_pr_info(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<claudear_integrations::scm::PrInfo> {
+            Ok(claudear_integrations::scm::PrInfo {
+                head_branch: None,
+                base_branch: None,
+                title: None,
+                author: None,
+            })
+        }
+        async fn get_pr_diff(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn get_reviews(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::CodeReview>> {
+            Ok(Vec::new())
+        }
+        async fn get_review_comments(
+            &self,
+            _project: &str,
+            _number: i64,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::ReviewComment>> {
+            Ok(Vec::new())
+        }
+        async fn list_repos(
+            &self,
+            _org: &str,
+        ) -> claudear_core::error::Result<Vec<claudear_integrations::scm::RemoteRepo>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merged_cascade_pr_is_handled_once_and_leaves_the_parent_alone() {
+        let notifier = Arc::new(MockNotifier::new(true));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        tracker.record_attempt("discord", "1", "D-1").unwrap();
+        tracker
+            .mark_success("discord", "1", "https://github.com/org/app/pull/1")
+            .unwrap();
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        let child = tracker
+            .record_cascade_attempt(
+                "discord",
+                "1",
+                "D-1",
+                parent.id,
+                "git@github.com:org/lib.git",
+            )
+            .unwrap();
+        tracker
+            .update_attempt_pr(child, "https://github.com/org/lib/pull/120", "org/lib", 120)
+            .unwrap();
+
+        let mut config = test_config();
+        config.cascade.enabled = false;
+        let watcher = Watcher::new(WatcherOptions {
+            config,
+            sources: vec![],
+            notifier,
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: Some(Arc::new(MergedPrs(vec![120]))),
+            user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            agent: Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
+                claudear_integrations::runner::ClaudeRunnerConfig::default(),
+                tracker.clone(),
+            )),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        });
+
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+        watcher.check_pr_merges_and_cascade().await.unwrap();
+
+        // Before, the parent was marked merged and the cascade row stayed pending,
+        // so every poll saw the merge again
+        let merged_per_poll: Vec<f64> = tracker
+            .get_metrics("pr_status_merged", None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.metric_value)
+            .collect();
+        assert_eq!(merged_per_poll.iter().sum::<f64>(), 1.0);
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        assert_eq!(
+            parent.status,
+            claudear_core::types::FixAttemptStatus::Success
+        );
     }
 
     #[tokio::test]
@@ -13542,38 +14154,6 @@ mod tests {
         assert!(parsed.is_none());
     }
 
-    // --- Rate limit extraction: resets_at edge cases ---
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_no_key() {
-        let msg = "Claude rate limit hit: some error";
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_invalid_timestamp() {
-        let msg = r#"{"resetsAt": "not-a-valid-date"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_empty_key() {
-        let msg = r#"{"resetsAt": ""}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_extract_rate_limit_reset_from_resets_at_multiple_keys() {
-        // Multiple occurrences: first invalid, second valid
-        let msg = r#"{"resetsAt": "invalid"} and {"resetsAt": "2026-03-01T12:00:00Z"}"#;
-        let parsed = Watcher::extract_rate_limit_reset_from_resets_at(msg);
-        assert!(parsed.is_some());
-        assert_eq!(parsed.unwrap().to_rfc3339(), "2026-03-01T12:00:00+00:00");
-    }
-
     // --- extract_rate_limit_reset_time combined ---
 
     #[test]
@@ -14099,7 +14679,7 @@ mod tests {
     // --- process_ready_retries closed PR trigger reason ---
 
     #[tokio::test]
-    async fn test_process_ready_retries_closed_pr_builds_trigger_reason() {
+    async fn test_process_ready_retries_skips_human_closed_pr() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
@@ -14150,8 +14730,13 @@ mod tests {
         let result = watcher.process_ready_retries().await;
         assert!(result.is_ok());
 
+        // A human closing the PR is a verdict on the fix, not a failure to retry
         let attempt = tracker.get_attempt("mock", "closed-1").unwrap().unwrap();
-        assert_eq!(attempt.retry_count, 1);
+        assert_eq!(attempt.retry_count, 0);
+        assert_eq!(
+            attempt.status,
+            claudear_core::types::FixAttemptStatus::Closed
+        );
     }
 
     // --- Resolved status in fix attempt ---
