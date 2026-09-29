@@ -4233,6 +4233,11 @@ Create a PR with your changes.{custom_instructions}"#,
     /// [is runnable](DeployQaTipStatus::is_runnable) and this process
     /// [claims](Self::claim_deploy_qa_tip) it, so no retry, trigger or other
     /// daemon re-runs a tip that is running or already has a verdict.
+    ///
+    /// A review rerun is skipped, leaving its attempt untouched, when the
+    /// repository of the PR under review cannot be resolved from the index,
+    /// so the feedback is retried later instead of being addressed in a
+    /// repository inferred from the issue.
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -4382,23 +4387,36 @@ Create a PR with your changes.{custom_instructions}"#,
             self.link_deploy_qa_tip_attempt(tip, attempt_id);
         }
 
-        // A review rerun must work in the repo the PR lives in; re-inferring
-        // lands on the same wrong repo a previous run already swapped away from.
+        // A review rerun must work in the repo the PR lives in, never one
+        // inferred from the issue: inference lands on the same wrong repo a
+        // previous run already swapped away from.
         let pr_repo = review_feedback
             .as_ref()
             .and_then(|_| issue.get_metadata::<String>(REVIEW_PR_REPO_KEY));
-        let pinned = pr_repo.and_then(|repo| {
-            match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
-                r @ RepoResolution::Resolved { .. } => Some(r),
+        let mut resolution = match pr_repo {
+            Some(repo) => match resolve_repo_for_cascade(self.inferrer.as_ref(), &repo) {
+                resolved @ RepoResolution::Resolved { .. } => resolved,
                 RepoResolution::Skip { reason } => {
-                    tracing::warn!(short_id = %issue.short_id, repo = %repo, reason = %reason, "PR repo not resolvable, falling back to inference");
-                    None
+                    tracing::warn!(
+                        short_id = %issue.short_id,
+                        repo = %repo,
+                        reason = %reason,
+                        "PR repo not resolvable, deferring review rerun"
+                    );
+                    self.record_issue_decision(
+                        &issue,
+                        "review_rerun_deferred",
+                        format!(
+                            "Deferred review rerun for {}: PR repository {} is not resolvable",
+                            issue.short_id, repo
+                        ),
+                        json!({ "pr_repo": repo, "reason": reason }),
+                    );
+                    return false;
                 }
-            }
-        });
-        let mut resolution = pinned.unwrap_or_else(|| {
-            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker))
-        });
+            },
+            None => resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker)),
+        };
 
         // Log resolution decision (watcher-specific verbose logging)
         match &resolution {
@@ -7149,12 +7167,13 @@ mod tests {
             )],
         )) as Arc<dyn IssueSource>;
 
-        let watcher = Arc::new(create_test_watcher(
+        let checkout = tempfile::tempdir().unwrap();
+        let watcher = create_test_watcher_with_inferrer(
             notifier,
             tracker.clone(),
             vec![source],
-            false,
-        ));
+            inferrer_indexing(IndexedRepo::new("org/repo", checkout.path())),
+        );
         watcher.is_running.store(true, Ordering::SeqCst);
 
         watcher.lock_processing().insert("mock:1".to_string());
@@ -7181,7 +7200,7 @@ mod tests {
         assert_eq!(
             updated_attempt.status,
             claudear_core::types::FixAttemptStatus::Failed,
-            "review rerun should execute after lock release (repo resolution fails in test setup, marking failed)"
+            "review rerun should execute after lock release (fetching the repo fails in test setup, marking failed)"
         );
     }
 
@@ -7204,15 +7223,16 @@ mod tests {
                 "mock",
             )],
         )) as Arc<dyn IssueSource>;
-        let watcher = Arc::new(create_test_watcher(
+        let checkout = tempfile::tempdir().unwrap();
+        let watcher = create_test_watcher_with_inferrer(
             notifier,
             tracker.clone(),
             vec![source],
-            false,
-        ));
+            inferrer_indexing(IndexedRepo::new("org/repo", checkout.path())),
+        );
         watcher.is_running.store(true, Ordering::SeqCst);
 
-        // Each allowed rerun fails on repo resolution in this setup; reset to the
+        // Each allowed rerun fails fetching the repo in this setup; reset to the
         // open-PR state before the next round of feedback arrives
         for _ in 0..MAX_REVIEW_CYCLES {
             let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
