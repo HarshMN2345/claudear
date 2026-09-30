@@ -1,3 +1,4 @@
+use super::marker::Marker;
 use super::signal::Signal;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,20 +9,25 @@ static GLOBAL: Registry = Registry::new();
 
 const EMPTIED_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Process groups of agent CLIs that are still running. Each CLI leads its own
-/// group, out of reach of the terminal's signals, so claudear passes them on
-/// itself and kills whatever is left before it exits.
+/// Process groups of agent CLIs that are still running, and the markers of runs
+/// whose processes may have left them. Each CLI leads its own group, out of
+/// reach of the terminal's signals, so claudear passes them on itself and kills
+/// whatever is left before it exits.
 #[derive(Debug, Default)]
 pub struct Registry {
     ids: Mutex<BTreeSet<u32>>,
+    markers: Mutex<BTreeSet<Marker>>,
     interrupted: AtomicBool,
+    killed: AtomicBool,
 }
 
 impl Registry {
     pub const fn new() -> Self {
         Self {
             ids: Mutex::new(BTreeSet::new()),
+            markers: Mutex::new(BTreeSet::new()),
             interrupted: AtomicBool::new(false),
+            killed: AtomicBool::new(false),
         }
     }
 
@@ -31,9 +37,14 @@ impl Registry {
     }
 
     /// Register group `id`, interrupting it straight away if the registry has
-    /// been interrupted: a run can spawn its CLI after claudear was told to stop.
+    /// been interrupted, or killing it if every group already was: a run can
+    /// spawn its CLI after claudear was told to stop.
     pub(super) fn insert(&self, id: u32) {
         let mut ids = self.ids();
+        if self.killed.load(Ordering::SeqCst) {
+            Self::send(id, Signal::Kill);
+            return;
+        }
         ids.insert(id);
         if self.interrupted.load(Ordering::SeqCst) {
             Self::send(id, Signal::Interrupt);
@@ -46,6 +57,16 @@ impl Registry {
         if self.ids().remove(&id) {
             Self::send(id, Signal::Kill);
         }
+    }
+
+    /// Track `marker` until its run has swept the processes that carry it, so
+    /// [`Self::kill_all`] still reaches them meanwhile.
+    pub(super) fn track(&self, marker: Marker) {
+        self.markers().insert(marker);
+    }
+
+    pub(super) fn release(&self, marker: Marker) {
+        self.markers().remove(&marker);
     }
 
     /// Send every group, including any registered later, the SIGINT a terminal
@@ -65,10 +86,20 @@ impl Registry {
         self.interrupted.load(Ordering::SeqCst)
     }
 
+    /// Kill every group, including any registered later, and every process
+    /// that carries a tracked marker.
     pub fn kill_all(&self) {
-        let ids = std::mem::take(&mut *self.ids());
+        let ids = {
+            let mut ids = self.ids();
+            self.killed.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *ids)
+        };
         for id in ids {
             Self::send(id, Signal::Kill);
+        }
+        let markers = std::mem::take(&mut *self.markers());
+        for marker in markers {
+            marker.kill();
         }
     }
 
@@ -80,8 +111,8 @@ impl Registry {
         self.kill_all();
     }
 
-    /// Resolves once every group has been killed, by its run or by
-    /// [`Self::kill_all`].
+    /// Resolves once every group has been killed and every marker swept, by its
+    /// run or by [`Self::kill_all`].
     pub async fn emptied(&self) {
         while !self.is_empty() {
             tokio::time::sleep(EMPTIED_POLL_INTERVAL).await;
@@ -89,11 +120,15 @@ impl Registry {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids().is_empty()
+        self.ids().is_empty() && self.markers().is_empty()
     }
 
     fn ids(&self) -> MutexGuard<'_, BTreeSet<u32>> {
         self.ids.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn markers(&self) -> MutexGuard<'_, BTreeSet<Marker>> {
+        self.markers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(unix)]
@@ -102,12 +137,8 @@ impl Registry {
         let Ok(group @ 1..) = libc::pid_t::try_from(id) else {
             return;
         };
-        let number = match signal {
-            Signal::Interrupt => libc::SIGINT,
-            Signal::Kill => libc::SIGKILL,
-        };
         // SAFETY: killpg takes no pointers and only sends a signal.
-        if unsafe { libc::killpg(group, number) } == 0 {
+        if unsafe { libc::killpg(group, signal.number()) } == 0 {
             return;
         }
         let error = std::io::Error::last_os_error();
@@ -138,11 +169,23 @@ impl Registry {
 mod tests {
     use super::*;
     use crate::runner::process_group::tests::{
-        assert_interrupted, assert_killed, exits_within, is_running, spawn_group, BACKGROUND_SLEEP,
-        EXIT_DEADLINE, INTERRUPTIBLE_LEADER,
+        assert_interrupted, assert_killed, exits_within, group_command, is_running, spawn_group,
+        BACKGROUND_SLEEP, EXIT_DEADLINE, INTERRUPTIBLE_LEADER,
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::runner::process_group::tests::{
+        assert_perl_environment_readable, background_pid, kill, stop_if_running, ESCAPED_SLEEP,
+    };
+    use crate::runner::process_group::Guard;
 
     const INTERRUPT_IGNORING_LEADER: &str = "trap '' INT; sleep 300 & echo $!; exec sleep 300";
+
+    /// Like [`ESCAPED_SLEEP`], but the background process ignores SIGTERM.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const TERMINATE_IGNORING_ESCAPED_SLEEP: &str = concat!(
+        r#"perl -e 'use POSIX; $SIG{TERM} = "IGNORE"; $| = 1; setsid() or die; "#,
+        r#"print "$$\n"; sleep 300' & exec sleep 300"#,
+    );
 
     #[tokio::test]
     async fn test_kill_all_kills_every_registered_group() {
@@ -180,6 +223,62 @@ mod tests {
             registry.is_empty(),
             "a killed group must not be signalled again once the OS reuses its id"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_kill_all_kills_marked_processes_of_every_run() {
+        assert_perl_environment_readable();
+        let registry = Registry::new();
+        let (mut first, _first_guard) =
+            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
+        let (mut second, _second_guard) =
+            Guard::spawn(&mut group_command(ESCAPED_SLEEP), &registry).unwrap();
+        let escaped = [
+            background_pid(&mut first).await,
+            background_pid(&mut second).await,
+        ];
+
+        registry.kill_all();
+
+        let survivors: Vec<u32> = escaped
+            .into_iter()
+            .filter(|&pid| !exits_within(pid))
+            .collect();
+        for &pid in &survivors {
+            kill(pid);
+        }
+        assert!(
+            survivors.is_empty(),
+            "processes {survivors:?} that left their runs' groups survived kill_all"
+        );
+        assert_killed(&mut first).await;
+        assert_killed(&mut second).await;
+    }
+
+    #[tokio::test]
+    async fn test_kill_all_lets_shutdown_stop_waiting_on_guarded_runs() {
+        let registry = Registry::new();
+        let (mut leader, _guard) =
+            Guard::spawn(&mut group_command(BACKGROUND_SLEEP), &registry).unwrap();
+
+        registry.kill_all();
+
+        tokio::time::timeout(EXIT_DEADLINE, registry.emptied())
+            .await
+            .expect("emptied must resolve once kill_all has swept every run");
+        assert_killed(&mut leader).await;
+    }
+
+    #[tokio::test]
+    async fn test_runs_spawned_after_kill_all_are_killed() {
+        let registry = Registry::new();
+        registry.kill_all();
+
+        let (mut leader, _guard) =
+            Guard::spawn(&mut group_command(BACKGROUND_SLEEP), &registry).unwrap();
+
+        assert_killed(&mut leader).await;
     }
 
     #[tokio::test]
@@ -286,6 +385,39 @@ mod tests {
         tokio::time::timeout(EXIT_DEADLINE, registry.emptied())
             .await
             .expect("emptied must resolve once the last group is killed");
+        assert_killed(&mut leader).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_emptied_waits_for_a_run_still_sweeping() {
+        assert_perl_environment_readable();
+        let registry = Registry::new();
+        let (mut leader, mut guard) = Guard::spawn(
+            &mut group_command(TERMINATE_IGNORING_ESCAPED_SLEEP),
+            &registry,
+        )
+        .unwrap();
+        let escaped = background_pid(&mut leader).await;
+
+        let ((), emptied_while_sweeping) = tokio::join!(guard.finish(), async {
+            tokio::time::timeout(Duration::from_millis(500), registry.emptied())
+                .await
+                .is_ok()
+        });
+
+        let running = stop_if_running(escaped);
+        assert!(
+            !emptied_while_sweeping,
+            "emptied resolved while a run was still sweeping the processes it left behind"
+        );
+        assert!(
+            !running,
+            "process {escaped} that ignores SIGTERM outlived the sweep's grace"
+        );
+        tokio::time::timeout(EXIT_DEADLINE, registry.emptied())
+            .await
+            .expect("emptied must resolve once the run's sweep finishes");
         assert_killed(&mut leader).await;
     }
 }
