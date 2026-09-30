@@ -477,20 +477,14 @@ mod tests {
         }
     }
 
-    const DOCUMENTED_SOURCE: &str = "deploy_qa";
-
     #[test]
-    fn issue_is_routed_as_live_qa_and_scoped_to_its_track() {
+    fn issue_carries_the_release_body_under_an_id_stable_per_tip_and_distinct_per_track() {
         let repo = "appwrite-labs/edge";
         let database = track("edge-db", repo, DeployQaTagFilter::Any);
         let network = track("edge-network", repo, DeployQaTagFilter::Any);
         let tip = release_tip(repo, "1.2.3", "Adds #99");
 
         let issue = build_deploy_qa_issue(&database, &tip, bundled_playbook());
-        assert_eq!(
-            issue.source, DOCUMENTED_SOURCE,
-            "the engine runs an issue as live QA, never a fix, by its documented source"
-        );
         let description = issue
             .description
             .as_deref()

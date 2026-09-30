@@ -10962,6 +10962,101 @@ mod tests {
         }
     }
 
+    /// Set the heartbeat of `issue_id`'s attempt `seconds` into the past, as if
+    /// its run last showed it was alive then.
+    fn beat_attempt(tracker: &SqliteTracker, issue_id: &str, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE fix_attempts SET heartbeat_at = datetime('now', ?1) WHERE issue_id = ?2",
+                params![format!("-{seconds} seconds"), issue_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_runs_that_still_beat_alone() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "awaiting_approval", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "long_agent_run", "CLOUD-2")
+            .unwrap();
+        age_attempt(&tracker, "awaiting_approval", 2 * 24 * 60 * 60);
+        age_attempt(&tracker, "long_agent_run", 30 * 24 * 60 * 60);
+        beat_attempt(&tracker, "awaiting_approval", 0);
+        beat_attempt(&tracker, "long_agent_run", 0);
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a run that still shows it is alive is live, however long ago it started"
+        );
+        for issue_id in ["awaiting_approval", "long_agent_run"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Pending, "{issue_id}");
+            assert!(attempt.error_message.is_none(), "{issue_id}");
+        }
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_frees_runs_that_stopped_beating() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "crashed", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "never_beat", "CLOUD-2")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "retried", "CLOUD-3")
+            .unwrap();
+        age_attempt(&tracker, "crashed", 3 * 60 * 60);
+        beat_attempt(&tracker, "crashed", 2 * 60 * 60);
+        age_attempt(&tracker, "never_beat", 2 * 60 * 60);
+        age_attempt(&tracker, "retried", 3 * 60 * 60);
+        beat_attempt(&tracker, "retried", 2 * 60 * 60);
+        tracker
+            .mark_failed("sentry", "retried", "agent crashed")
+            .unwrap();
+        tracker.prepare_for_retry("sentry", "retried").unwrap();
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            2,
+            "runs silent for longer than the window must be released"
+        );
+        let mut retryable: Vec<String> = tracker
+            .get_retryable_issues(2)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.issue_id)
+            .collect();
+        retryable.sort();
+        assert_eq!(
+            retryable,
+            vec!["crashed".to_string(), "never_beat".to_string()],
+            "a run whose heartbeat went stale, or that never sent one since it was recorded \
+             long ago, goes back into the retry queue"
+        );
+        assert_eq!(
+            tracker
+                .get_attempt("sentry", "retried")
+                .unwrap()
+                .unwrap()
+                .status,
+            FixAttemptStatus::Pending,
+            "a retry that just started must not be swept for the heartbeat its previous run \
+             left behind"
+        );
+    }
+
     #[test]
     fn test_release_orphaned_pending_attempts_leaves_cascades_resumable() {
         let tracker = SqliteTracker::in_memory().unwrap();

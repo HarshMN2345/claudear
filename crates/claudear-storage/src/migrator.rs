@@ -234,6 +234,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_deploy_qa, 1);
+
+        let has_heartbeat: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('fix_attempts') WHERE name = 'heartbeat_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_heartbeat, 1,
+            "fix_attempts must record when each live run last showed it is alive"
+        );
     }
 
     #[test]
