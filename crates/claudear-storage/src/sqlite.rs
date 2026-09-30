@@ -1527,6 +1527,19 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn record_attempt_heartbeat(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET heartbeat_at = datetime('now')
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL AND status = 'pending'
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
     fn release_orphaned_pending_attempts(&self, stale_after: Duration) -> Result<usize> {
         let stale_before = format!("-{} seconds", stale_after.as_secs());
         let mut conn = self.acquire_lock()?;
@@ -1539,7 +1552,7 @@ impl AttemptTracker for SqliteTracker {
                 error_message = 'Interrupted before completion (daemon restarted)',
                 retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
             WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
-              AND attempted_at <= datetime('now', ?1)
+              AND MAX(attempted_at, COALESCE(heartbeat_at, attempted_at)) <= datetime('now', ?1)
               AND attempted_at > datetime('now', '-3 days')
             "#,
             params![stale_before],
@@ -1552,7 +1565,7 @@ impl AttemptTracker for SqliteTracker {
             SET status = 'cannot_fix',
                 error_message = 'Interrupted before completion; too old to retry automatically'
             WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
-              AND attempted_at <= datetime('now', ?1)
+              AND MAX(attempted_at, COALESCE(heartbeat_at, attempted_at)) <= datetime('now', ?1)
               AND attempted_at <= datetime('now', '-3 days')
             "#,
             params![stale_before],

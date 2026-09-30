@@ -70,6 +70,7 @@ pub use claudear_integrations::tls;
 pub use claudear_engine::api;
 pub use claudear_engine::api_events;
 pub use claudear_engine::discord_index;
+pub use claudear_engine::heartbeat;
 pub use claudear_engine::housekeeping;
 pub use claudear_engine::ipc;
 pub use claudear_engine::processing;

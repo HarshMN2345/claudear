@@ -258,16 +258,25 @@ pub trait AttemptTracker: Send + Sync {
         self.mark_failed(source, issue_id, error_message)
     }
 
-    /// Release attempts left `pending` for longer than `stale_after`,
-    /// returning how many were released.
+    /// Record that the run holding `issue_id`'s `pending` attempt is still
+    /// alive, so [`Self::release_orphaned_pending_attempts`] leaves the attempt
+    /// to it however long the run takes.
+    fn record_attempt_heartbeat(&self, source: &str, issue_id: &str) -> Result<()> {
+        let _ = (source, issue_id);
+        Ok(())
+    }
+
+    /// Release `pending` attempts whose runs have shown no sign of life for
+    /// longer than `stale_after`, returning how many were released.
     ///
-    /// A live run cannot outlast `stale_after`, so an attempt still `pending`
-    /// past it was orphaned by a crash, restart or shutdown mid-run and would
-    /// otherwise block its issue for good. It is failed without spending a
+    /// A live run, in whichever process shares the database, refreshes its
+    /// attempt's [heartbeat](Self::record_attempt_heartbeat) well within
+    /// `stale_after`, so an attempt silent for longer was orphaned by a crash,
+    /// restart or shutdown mid-run and would otherwise block its issue for
+    /// good. A run's last sign of life is its latest heartbeat, or when its
+    /// attempt was recorded if that is later, as it is for a retry whose run
+    /// has not sent one yet. A released attempt is failed without spending a
     /// retry, or closed as `cannot_fix` once it is more than three days old.
-    /// Nothing records which process runs an attempt, and fresher ones may
-    /// still be running in another process sharing the database, so they are
-    /// left alone.
     fn release_orphaned_pending_attempts(&self, _stale_after: Duration) -> Result<usize> {
         Ok(0)
     }

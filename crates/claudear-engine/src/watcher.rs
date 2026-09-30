@@ -1,5 +1,6 @@
 //! Main watcher that coordinates sources, Claude, and notifications.
 
+use crate::heartbeat::{Heartbeat, Liveness};
 use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
@@ -315,6 +316,9 @@ pub struct Watcher {
     /// so overlapping dispatches never start the same tip twice. Each id is
     /// held by a [`DeployQaTipClaim`], whose `Drop` needs a synchronous lock.
     dispatched_deploy_qa_tips: Mutex<HashSet<String>>,
+    /// How often this watcher's runs send heartbeats, and how long its orphan
+    /// sweeps let a run stay silent before releasing its attempt.
+    liveness: Liveness,
 }
 
 /// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
@@ -407,6 +411,7 @@ impl Watcher {
             intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
             dispatched_deploy_qa_tips: Mutex::new(HashSet::new()),
+            liveness: Liveness::default(),
         }
     }
 
@@ -1035,17 +1040,15 @@ impl Watcher {
     /// shutdown, which otherwise stay `pending` and block their issues from
     /// ever being picked or retried again.
     ///
-    /// Nothing records which process runs an attempt, and a daemon, a
-    /// foreground `poll` and one-shot triggers can all be running attempts
-    /// against the same database. A live run cannot outlast
-    /// [`AgentConfig::stale_run_after`](claudear_config::config::AgentConfig::stale_run_after),
-    /// so only attempts pending for longer than that are released; fresher
-    /// ones are left to whichever process may still own them, and are
-    /// released by a later sweep once they are stale too. This runs on start
-    /// and every housekeeping cycle, so an orphan does not wait for the next
-    /// restart.
+    /// A daemon, a foreground `poll`, one-shot triggers and the webhook server
+    /// can all be running attempts against the same database, and every run
+    /// keeps its attempt's [`Heartbeat`] going until it ends. Only attempts
+    /// silent for longer than [`Liveness::stale_after`] are released, so a
+    /// live run is never swept however long it waits on approval, a question
+    /// or its agent, and a run that died is recovered within minutes. This
+    /// runs on start and every housekeeping cycle.
     fn release_orphaned_attempts(&self) {
-        let stale_after = self.config.agent.stale_run_after();
+        let stale_after = self.liveness.stale_after;
         match self.tracker.release_orphaned_pending_attempts(stale_after) {
             Ok(0) => {}
             Ok(released) => tracing::info!(
@@ -4238,6 +4241,10 @@ Create a PR with your changes.{custom_instructions}"#,
     /// repository of the PR under review cannot be resolved from the index,
     /// so the feedback is retried later instead of being addressed in a
     /// repository inferred from the issue.
+    ///
+    /// From the moment the attempt is recorded until the run ends, a
+    /// [`Heartbeat`] shows orphan sweeps in every process that the run is
+    /// alive.
     async fn process_issue(
         &self,
         source: Arc<dyn IssueSource>,
@@ -4339,6 +4346,12 @@ Create a PR with your changes.{custom_instructions}"#,
         ) {
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
+        let _heartbeat = Heartbeat::start(
+            Arc::clone(&self.tracker),
+            source.name(),
+            &issue.id,
+            self.liveness.interval,
+        );
 
         // Timeline: attempt created (pending).
         self.tracker
@@ -15994,13 +16007,23 @@ mod tests {
     /// not mistaken for a dead run.
     const ORPHAN_SWEEP_WINDOW: Duration = Duration::from_secs(5);
 
-    /// A watcher that asks for approval before every run and waits up to a
-    /// minute for the answer.
+    /// How often the orphan-sweep tests' runs send heartbeats: many times
+    /// within [`ORPHAN_SWEEP_WINDOW`].
+    const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// A watcher that asks for approval before every run, waits up to a
+    /// minute for the answer, and sends heartbeats and sweeps orphans on
+    /// test-sized timing.
     fn approval_gated_watcher(
         notifier: Arc<ApprovalMockNotifier>,
         tracker: Arc<SqliteTracker>,
     ) -> Arc<Watcher> {
-        Arc::new(create_approval_watcher(notifier, tracker, true, Some(60)))
+        let mut watcher = create_approval_watcher(notifier, tracker, true, Some(60));
+        watcher.liveness = Liveness {
+            interval: TEST_HEARTBEAT_INTERVAL,
+            stale_after: ORPHAN_SWEEP_WINDOW,
+        };
+        Arc::new(watcher)
     }
 
     /// Process `issue` in the background until its run stops to wait for

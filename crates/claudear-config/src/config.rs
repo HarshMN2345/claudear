@@ -109,12 +109,6 @@ impl Default for AgentConfig {
     }
 }
 
-/// Smallest margin [`AgentConfig::stale_run_after`] leaves past the agent
-/// timeout, covering repo setup and the approval and question waits around a
-/// fix run's agent runs, so an attempt with a small timeout is never swept
-/// while its run is live.
-const AGENT_STALE_RUN_MINIMUM_MARGIN: Duration = Duration::from_secs(60 * 60);
-
 impl AgentConfig {
     /// How long an agent run keeps waiting for its CLI's output after the
     /// CLI's process group is killed. The CLI's own output is already buffered
@@ -127,15 +121,6 @@ impl AgentConfig {
     /// keeps writing to the pipes: the longest a run reads output once its
     /// CLI is gone.
     pub const OUTPUT_DRAIN_CUTOFF: Duration = Duration::from_secs(10);
-
-    /// How long an attempt may stay `pending` before a sweep treats its run as
-    /// orphaned by a crash, restart or shutdown: the timeout plus a margin of
-    /// the timeout again, at least an hour, so a live run's setup, human waits
-    /// and a follow-up agent run fit inside it.
-    pub fn stale_run_after(&self) -> Duration {
-        let timeout = Duration::from_secs(self.timeout_secs);
-        timeout.saturating_add(timeout.max(AGENT_STALE_RUN_MINIMUM_MARGIN))
-    }
 
     /// Get the default provider's config.
     pub fn default_provider_config(&self) -> Option<&ProviderConfig> {
@@ -9141,21 +9126,6 @@ timeout_secs = 3600
             let config = Config::from_toml(toml_str).unwrap();
             assert_eq!(config.agent.timeout_secs, 3600);
         });
-    }
-
-    #[test]
-    fn test_agent_stale_run_after_outlasts_every_agent_timeout() {
-        for timeout_secs in [0, 1, 60, 3_600, 21_600, 86_400, u64::MAX] {
-            let agent = AgentConfig {
-                timeout_secs,
-                ..AgentConfig::default()
-            };
-            assert!(
-                agent.stale_run_after() > Duration::from_secs(timeout_secs),
-                "an attempt must not be swept as orphaned while its {timeout_secs}s agent run \
-                 may still be live"
-            );
-        }
     }
 
     #[test]
