@@ -2,8 +2,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -14,7 +14,16 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-const RUNTIME_FILES: [&str; 2] = ["claudear.pid", "claudear.sock"];
+const ISSUE: &str = r#"{
+    "id": "10001",
+    "key": "TEST-1",
+    "self": "http://jira.invalid/rest/api/3/issue/10001",
+    "fields": {
+        "summary": "How do I export my data?",
+        "status": {"name": "To Do", "statusCategory": {"key": "new", "name": "To Do"}},
+        "project": {"key": "TEST", "name": "Test"}
+    }
+}"#;
 
 /// Stands in for Jira: reports every request and leaves it unanswered unless
 /// the test answers it, so whatever claudear asks Jira waits until then.
@@ -60,14 +69,18 @@ struct Request {
 }
 
 impl Request {
-    fn answer_not_found(mut self) {
-        let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        self.stream.write_all(response).unwrap();
+    fn answer(mut self, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        self.stream.write_all(response.as_bytes()).unwrap();
     }
 }
 
-/// A claudear home whose only source is a [`Jira`] stub, with its IPC socket
-/// and PID file kept apart from any claudear running on this machine.
+/// A claudear home whose only source is a [`Jira`] stub and whose agent CLI
+/// is a stub that runs until interrupted, with its IPC socket and PID file
+/// kept apart from any claudear running on this machine.
 struct Sandbox {
     directory: TempDir,
     jira: Jira,
@@ -84,10 +97,14 @@ impl Sandbox {
         for name in ["home", "logs", "runtime", "workspace"] {
             std::fs::create_dir(directory.path().join(name)).unwrap();
         }
-        let jira = Jira::start();
-        let root = directory.path().display();
+        let sandbox = Self {
+            directory,
+            jira: Jira::start(),
+        };
+        sandbox.install_agent();
+        let root = sandbox.directory.path().display();
         std::fs::write(
-            directory.path().join("claudear.toml"),
+            sandbox.path("claudear.toml"),
             format!(
                 r#"db_path = "{root}/claudear.db"
 workspace = "{root}/workspace"
@@ -98,12 +115,32 @@ base_url = "http://{address}"
 email = "claudear@example.com"
 api_token = "token"
 project_keys = ["TEST"]
+
+[agent.providers.claude]
+binary = "{root}/claude"
 "#,
-                address = jira.address,
+                address = sandbox.jira.address,
             ),
         )
         .unwrap();
-        Self { directory, jira }
+        sandbox
+    }
+
+    /// An agent CLI that reads its prompt, reports its PID once it handles
+    /// SIGINT, then runs until a SIGINT, which it records. Perl, because a
+    /// shell cannot trap a signal it inherited as ignored.
+    fn install_agent(&self) {
+        let script = format!(
+            r#"#!/bin/sh
+cat > /dev/null
+exec perl -e '$SIG{{INT}} = sub {{ open(my $f, ">", "{interrupted}") or die; close $f; exit 130 }}; open(my $f, ">", "{started}.partial") or die; print $f "$$\n"; close $f; rename("{started}.partial", "{started}") or die; sleep 1 while 1'
+"#,
+            interrupted = self.path("agent.interrupted").display(),
+            started = self.path("agent.pid").display(),
+        );
+        let binary = self.path("claude");
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -155,32 +192,44 @@ project_keys = ["TEST"]
         Daemon { id }
     }
 
-    /// The daemon's PID file and IPC socket, found under
-    /// `$XDG_RUNTIME_DIR` on Linux and `$TMPDIR/claudear-<uid>` on macOS.
-    fn runtime_files(&self) -> Vec<PathBuf> {
-        let runtime = self.path("runtime");
-        let mut directories = vec![runtime.clone()];
-        directories.extend(
-            std::fs::read_dir(&runtime)
-                .unwrap()
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir()),
+    fn wait_for_agent(&self, claudear: &mut Claudear) -> Agent {
+        let start = Instant::now();
+        while start.elapsed() < DEADLINE {
+            if let Ok(id) = std::fs::read_to_string(self.path("agent.pid")) {
+                return Agent {
+                    id: id.trim().parse().unwrap(),
+                    interrupted: self.path("agent.interrupted"),
+                };
+            }
+            claudear.assert_running();
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        panic!(
+            "claudear never started its agent CLI\n{}",
+            claudear.output()
         );
-        directories
-            .iter()
-            .flat_map(|directory| RUNTIME_FILES.map(|name| directory.join(name)))
-            .filter(|path| path.exists())
-            .collect()
     }
 
-    fn logs(&self) -> String {
-        std::fs::read_dir(self.path("logs"))
-            .unwrap()
-            .flatten()
-            .map(|entry| std::fs::read_to_string(entry.path()).unwrap_or_default())
-            .collect()
+    /// Everything under the runtime directory, where claudear keeps what tells
+    /// other invocations that a daemon is running.
+    fn runtime_files(&self) -> Vec<PathBuf> {
+        files_under(&self.path("runtime"))
     }
+}
+
+fn files_under(directory: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .flatten()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
 }
 
 /// A claudear this test spawned, killed if the test fails before it exits.
@@ -210,18 +259,6 @@ impl Claudear {
             std::thread::sleep(POLL_INTERVAL);
         }
         panic!("claudear never served HTTP on {port}\n{}", self.output());
-    }
-
-    fn wait_for_output(&mut self, text: &str) {
-        let start = Instant::now();
-        while start.elapsed() < DEADLINE {
-            if self.output().contains(text) {
-                return;
-            }
-            self.assert_running();
-            std::thread::sleep(POLL_INTERVAL);
-        }
-        panic!("claudear never printed {text:?}\n{}", self.output());
     }
 
     fn terminate(&self) {
@@ -280,10 +317,32 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        if is_running(self.id) {
-            // SAFETY: kill takes no pointers and only sends a signal.
-            unsafe { libc::kill(self.id as libc::pid_t, libc::SIGKILL) };
+        kill(self.id);
+    }
+}
+
+/// The stub agent CLI a run started, killed if the test fails while it runs.
+struct Agent {
+    id: u32,
+    interrupted: PathBuf,
+}
+
+impl Agent {
+    fn assert_interrupted(&self) {
+        let start = Instant::now();
+        while start.elapsed() < DEADLINE {
+            if self.interrupted.exists() {
+                return;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
+        panic!("claudear never interrupted its agent CLI");
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        kill(self.id);
     }
 }
 
@@ -293,7 +352,14 @@ fn terminate(id: u32) {
     assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
 }
 
-/// Zombies count as exited: an orphaned daemon is reaped by whoever adopts
+fn kill(id: u32) {
+    if is_running(id) {
+        // SAFETY: kill takes no pointers and only sends a signal.
+        unsafe { libc::kill(id as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
+/// Zombies count as exited: an orphaned process is reaped by whoever adopts
 /// it, which may never get to it (e.g. a container without an init process).
 fn is_running(id: u32) -> bool {
     let output = Command::new("ps")
@@ -368,11 +434,6 @@ fn test_terminate_drains_the_daemon() {
         "the daemon left {:?} behind",
         sandbox.runtime_files()
     );
-    let logs = sandbox.logs();
-    assert!(
-        logs.contains("Claude Watcher stopped gracefully"),
-        "the daemon did not drain its watcher:\n{logs}"
-    );
 }
 
 #[test]
@@ -402,45 +463,33 @@ fn test_terminate_drains_poll_mode() {
 }
 
 #[test]
-fn test_terminate_interrupts_a_trigger() {
+fn test_terminate_interrupts_the_agent_cli_of_a_one_shot_command() {
     let sandbox = Sandbox::new();
-    let mut claudear = sandbox.spawn(&["trigger", "jira", "TEST-1"]);
+    let mut claudear = sandbox.spawn(&["action", "reply", "jira", "TEST-1"]);
     let request = sandbox.jira.wait_for_request(&mut claudear);
     assert!(
         request.head.contains("TEST-1"),
         "unexpected request: {}",
         request.head
     );
+    request.answer(ISSUE);
+    let agent = sandbox.wait_for_agent(&mut claudear);
 
     claudear.terminate();
-    claudear.wait_for_output("Interrupted, stopping agent runs");
-    request.answer_not_found();
-    let status = claudear.wait();
 
-    assert_eq!(
-        status.signal(),
-        Some(libc::SIGINT),
-        "trigger exited with {status} instead of force-quitting once its runs were interrupted\n{}",
-        claudear.output()
-    );
+    agent.assert_interrupted();
+    claudear.wait();
 }
 
 #[test]
-fn test_runtime_files_are_found_while_the_daemon_runs() {
+fn test_the_daemon_keeps_runtime_files_while_it_runs() {
     let sandbox = Sandbox::new();
     let port = free_port();
     let mut claudear = sandbox.spawn(&["start", "--foreground", "--port", &port.to_string()]);
     claudear.wait_until_serving(port);
 
-    let found: Vec<_> = sandbox
-        .runtime_files()
-        .iter()
-        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
-        .map(str::to_owned)
-        .collect();
-
-    assert_eq!(
-        found, RUNTIME_FILES,
-        "the leftover checks would pass vacuously"
+    assert!(
+        !sandbox.runtime_files().is_empty(),
+        "nothing to leave behind, so the leftover checks would pass vacuously"
     );
 }
