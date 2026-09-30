@@ -284,7 +284,7 @@ impl Notifier for InstrumentedNotifier {
         }
     }
 
-    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<()> {
+    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<bool> {
         match self.inner.notify_support_digest(digest).await {
             Ok(v) => {
                 tracing::info!(component = self.inner.name(), "Notified support digest");

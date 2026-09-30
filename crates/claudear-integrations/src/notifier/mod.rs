@@ -57,7 +57,7 @@ mod whatsapp;
 
 pub use ask_orchestrator::send_to_all_and_wait_first_reply;
 pub use console::ConsoleNotifier;
-pub use discord::DiscordNotifier;
+pub use discord::{DiscordNotifier, SUPPORT_DIGEST_MAX_ENTRIES};
 pub use email::EmailNotifier;
 pub use push::PushNotifier;
 pub use slack::SlackNotifier;
@@ -147,12 +147,13 @@ pub trait Notifier: Send + Sync {
         self.notify_status(&digest.format_text()).await
     }
 
-    /// Send the digest of Discord support threads that need a reply.
+    /// Send the digest of Discord support threads that need a reply, returning
+    /// whether it was posted.
     ///
     /// Does nothing by default: the digest can post hourly, which is only
     /// reasonable for chat channels that override this.
-    async fn notify_support_digest(&self, _digest: &SupportDigest) -> Result<()> {
-        Ok(())
+    async fn notify_support_digest(&self, _digest: &SupportDigest) -> Result<bool> {
+        Ok(false)
     }
 
     /// Send a blocking question through this channel.
@@ -391,14 +392,22 @@ impl Notifier for CompositeNotifier {
         Ok(())
     }
 
-    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<()> {
-        let digest = digest.clone();
-        self.broadcast(|n| {
-            let digest = digest.clone();
-            async move { n.notify_support_digest(&digest).await }
-        })
+    /// Posted when any channel posted it; failures are logged like `broadcast`.
+    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<bool> {
+        let results = futures::future::join_all(
+            self.notifiers
+                .iter()
+                .map(|n| n.notify_support_digest(digest)),
+        )
         .await;
-        Ok(())
+        let mut posted = false;
+        for result in results {
+            match result {
+                Ok(sent) => posted |= sent,
+                Err(e) => tracing::error!("Notification error: {}", e),
+            }
+        }
+        Ok(posted)
     }
 
     async fn ask_question(

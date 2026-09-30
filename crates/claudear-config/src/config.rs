@@ -742,7 +742,7 @@ pub struct SupportDigestConfig {
     pub days: i64,
     /// How often to scan, in hours (default: 1.0, 0 = disable).
     pub interval_hours: f64,
-    /// How many needs-reply threads to post (default: 10).
+    /// How many needs-reply threads to post (default: 10, at most 10).
     pub max_entries: usize,
     /// Discord user ids whose replies count as the team's.
     pub team_user_ids: Vec<String>,

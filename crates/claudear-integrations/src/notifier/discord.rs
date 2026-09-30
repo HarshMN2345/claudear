@@ -1205,6 +1205,10 @@ pub(crate) fn build_repetitive_digest_message(
     })
 }
 
+/// Most needs-reply threads a support digest message lists. Discord allows 25
+/// embed fields, but ten keeps the post readable.
+pub const SUPPORT_DIGEST_MAX_ENTRIES: usize = 10;
+
 /// Build the Discord message for the support threads digest.
 ///
 /// Returns `None` when no thread needs a reply. Threads missing from the
@@ -1220,7 +1224,7 @@ pub(crate) fn build_support_digest_message(
     let mut fields: Vec<DiscordField> = digest
         .needs_reply
         .iter()
-        .take(10)
+        .take(SUPPORT_DIGEST_MAX_ENTRIES)
         .map(|entry| {
             let new = if entry.is_new { "\u{1F195} " } else { "" };
             DiscordField {
@@ -1486,12 +1490,13 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         Ok(())
     }
 
-    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<()> {
+    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<bool> {
         let mention = self.get_user_mention();
-        if let Some(message) = build_support_digest_message(digest, mention) {
-            let _ = self.send(message).await?;
-        }
-        Ok(())
+        let Some(message) = build_support_digest_message(digest, mention) else {
+            return Ok(false);
+        };
+        let _ = self.send(message).await?;
+        Ok(true)
     }
 
     async fn ask_question(

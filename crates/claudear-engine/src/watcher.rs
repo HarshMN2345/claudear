@@ -2544,8 +2544,16 @@ Create a PR with your changes.{custom_instructions}"#,
             needs_reply = digest.needs_reply_total,
             "Sending support digest"
         );
-        self.notifier.notify_support_digest(&digest).await?;
-        orchestrator.mark_sent(&digest);
+        // Only remember threads a channel really posted, so a failed post is
+        // retried on the next scan.
+        if self.notifier.notify_support_digest(&digest).await? {
+            orchestrator.mark_sent(&digest);
+        } else {
+            tracing::warn!(
+                component = "digest",
+                "Support digest was not posted; will retry next scan"
+            );
+        }
         Ok(())
     }
 

@@ -180,7 +180,13 @@ impl SupportDigestOrchestrator {
         needs_reply.sort_by(|a, b| b.score.cmp(&a.score));
         likely_resolved.sort_by(|a, b| b.waiting_hours.cmp(&a.waiting_hours));
         let needs_reply_total = needs_reply.len();
-        needs_reply.truncate(self.config.max_entries);
+        // The Discord message lists at most this many; anything cut here is never
+        // marked sent, so it still counts as new later.
+        needs_reply.truncate(
+            self.config
+                .max_entries
+                .min(claudear_integrations::notifier::SUPPORT_DIGEST_MAX_ENTRIES),
+        );
         likely_resolved.truncate(RESOLVED_LIMIT);
 
         let sent = self.sent.lock().unwrap();
