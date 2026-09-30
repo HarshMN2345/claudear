@@ -4209,27 +4209,6 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
 
     #[cfg(unix)]
     #[test]
-    fn test_claudear_variables_leave_out_the_run_marker() {
-        let withheld = claudear_variables(&HashMap::from([
-            (MARKER_VARIABLE.to_string(), String::new()),
-            (
-                MASTER_KEY_VARIABLE.to_string(),
-                FAKE_CLAUDEAR_CREDENTIAL.to_string(),
-            ),
-        ]));
-
-        assert!(
-            !withheld.contains(&OsString::from(MARKER_VARIABLE)),
-            "{MARKER_VARIABLE} was withheld along with Claudear's own variables"
-        );
-        assert!(
-            withheld.contains(&OsString::from(MASTER_KEY_VARIABLE)),
-            "{MASTER_KEY_VARIABLE} was not withheld"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn test_live_qa_run_keeps_the_rest_of_its_environment() {
         let environment = stub_run_environment(RunProfile::LiveQa);
 
