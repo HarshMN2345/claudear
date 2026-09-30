@@ -543,15 +543,16 @@ The `--setup` flag:
 
 ### Graceful Shutdown
 
-`claudear start`, `claudear poll`, `claudear webhook`, and `claudear dry-run` shut down the same way on SIGTERM, SIGINT, or SIGHUP, so Ctrl+C in a terminal drains in-flight runs just as `claudear stop` or SIGTERM does: the agent CLIs Claudear starts lead process groups of their own, which the terminal's Ctrl+C does not reach. Any of these signals that was already ignored when Claudear started stays ignored: a Claudear started under `nohup` keeps running when its terminal closes, and one that a script starts in the background keeps running on Ctrl+C, because the script's shell ignores SIGINT for it. `claudear stop` works only for a daemon started with `claudear start`; stop the other commands with a signal. Claudear then:
+`claudear start`, `claudear poll`, `claudear webhook`, and `claudear dry-run` shut down on SIGTERM, SIGINT, or SIGHUP, as `kill`, `systemctl stop`, `docker stop`, Ctrl+C, or a closing terminal send them. A daemon started with `claudear start` also shuts down on `claudear stop`; stop the other commands with a signal. Any of these signals that was already ignored when Claudear started stays ignored: a Claudear started under `nohup` keeps running when its terminal closes, and one that a script starts in the background keeps running on Ctrl+C, because the script's shell ignores SIGINT for it. Claudear then:
 
 1. Stops taking new work:
    - polling and background housekeeping start no new runs
    - issue webhooks are answered with `503 Service Unavailable` and `Retry-After: 60`, and not recorded, so a redelivery is processed once Claudear is back (GitHub review and pull request webhooks are still accepted)
    - IPC `Trigger` and `ProcessRetries` commands are refused
-2. Waits up to 30 seconds for in-flight runs to finish.
-3. Interrupts the agent CLIs still running after that, logging `Interrupting the agent CLIs of the runs still in flight after 30s`, and gives their runs up to 5 more seconds to record how they ended. A run that records a failure is retried later, like any failed run. Any agent process still running then is killed. Runs that background housekeeping started (retries, review runs, merge follow-ups, and release cascades) stop when the 30 seconds run out instead, and their agent CLIs are killed straight away.
-4. Exits, logging `Exiting with runs still in flight` if any are left. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends. A run that could not record how it ended leaves its fix attempt `pending` until Claudear next starts polling (`claudear start --poll` or `claudear poll`). Then an attempt started in the last 3 days goes back up for retry without spending a retry, and an older one is closed as `cannot_fix`, which `claudear reset <source> <issue_id>` undoes. Cascade attempts stay `pending`.
+2. On a signal, interrupts the agent CLIs at once, logging `Interrupting the agent CLIs of the runs in flight`. Each agent CLI leads a process group of its own, out of reach of the terminal's Ctrl+C, so Claudear passes on the SIGINT that Ctrl+C would send. It does not wait for the runs first: service managers and Docker follow SIGTERM with SIGKILL after a deadline, and agent runs take minutes. `claudear stop`, or a service that stops on its own, leaves the agent CLIs running instead.
+3. Waits up to 30 seconds for in-flight runs to finish, as interrupted runs do once they have recorded how they ended. A run that records a failure is retried later, like any failed run.
+4. Interrupts the agent CLIs still running after that, logging `Interrupting the agent CLIs of the runs still in flight after 30s`, and gives their runs up to 5 more seconds to record how they ended. Any agent process still running then is killed. Runs that background housekeeping started (retries, review runs, merge follow-ups, and release cascades) stop when the 30 seconds run out instead, and their agent CLIs are killed straight away.
+5. Exits, logging `Exiting with runs still in flight` if any are left. Blocking work, such as a local model call, gets up to 5 more seconds to stop before the process ends. A run that could not record how it ended leaves its fix attempt `pending` until Claudear next starts polling (`claudear start --poll` or `claudear poll`). Then an attempt started in the last 3 days goes back up for retry without spending a retry, and an older one is closed as `cannot_fix`, which `claudear reset <source> <issue_id>` undoes. Cascade attempts stay `pending`.
 
 While it drains, `claudear status` reports `Running: false`. `claudear stop` waits up to 45 seconds for the daemon to exit and reports progress every 5 seconds. It prints `Daemon stopped.` and exits with code 0 once the daemon has exited, or exits with code 1 if the daemon is still running after 45 seconds. If it cannot read the daemon's PID file, it can only watch the control socket, so once the socket closes it prints `The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed.` instead. A signal that reaches Claudear while it shuts down, including after `claudear stop`, forces the exit: Claudear kills every agent CLI and dies of SIGINT at once.
 
@@ -561,7 +562,7 @@ Exit codes:
 - `130` (death by SIGINT): a signal during the shutdown forced the exit
 - `1`: a service failed or stopped on its own (`The <name> service stopped unexpectedly`), which started the shutdown
 
-One-shot commands that run agents (`claudear trigger`, `claudear action`, and `claudear retries process`) work differently: Ctrl+C interrupts their agent CLIs, kills any still running 5 seconds later, and gives the command up to 30 seconds to record how its runs ended before it exits as interrupted. A second Ctrl+C exits at once.
+One-shot commands that run agents (`claudear trigger`, `claudear action`, and `claudear retries process`) also stop on SIGTERM, SIGINT, or SIGHUP: they interrupt their agent CLIs at once, kill any still running 5 seconds later, and give the command up to 30 seconds to record how its runs ended before it exits as interrupted, dying of SIGINT. A second signal exits at once.
 
 ### Manual Triggers
 
@@ -1024,7 +1025,7 @@ use_agent = false
 
 ## Running as a Service
 
-Service managers need `claudear start --foreground`: without it, `start` forks into the background and the manager loses track of the daemon. Give Claudear 50 seconds to stop before the manager sends SIGKILL: that covers the 30-second drain (see [Graceful Shutdown](#graceful-shutdown)), up to 5 seconds for interrupted agent CLIs, up to 5 seconds for blocking work to stop, and a margin.
+Service managers need `claudear start --foreground`: without it, `start` forks into the background and the manager loses track of the daemon. Give Claudear 50 seconds to stop before the manager sends SIGKILL: that covers the 30-second drain (see [Graceful Shutdown](#graceful-shutdown)), up to 5 seconds for interrupted agent CLIs, up to 5 seconds for blocking work to stop, and a margin. The defaults fall short of that in Docker (10 seconds) and launchd (20 seconds); systemd's 90 seconds would do, and the unit below sets 50 like the other examples.
 
 ### macOS (launchd)
 
@@ -1091,7 +1092,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now claudear
 ```
 
-`KillMode=mixed` sends SIGTERM to Claudear only, so the agent CLIs it started keep running while it drains; systemd kills any that are left once Claudear exits. `TimeoutStopSec=50` is how long systemd waits for Claudear to exit before it sends SIGKILL.
+`KillMode=mixed` sends SIGTERM to Claudear only, so the agent CLIs it started get the SIGINT Claudear passes on rather than systemd's SIGTERM, and their runs can record how they ended; systemd kills any that are left once Claudear exits. `TimeoutStopSec=50` is how long systemd waits for Claudear to exit before it sends SIGKILL.
 
 ---
 
@@ -1139,7 +1140,7 @@ docker run -d \
 
 ### Stopping
 
-`docker stop` sends SIGTERM, which tini forwards to Claudear, so it shuts down gracefully (see [Graceful Shutdown](#graceful-shutdown)). Docker kills the container if it is still running when the stop timeout runs out, and the default timeout is shorter than the drain: `docker-compose.yml` sets `stop_grace_period: 50s`, and the standalone examples pass `--stop-timeout 50`. For a container started without either, use `docker stop -t 50`.
+`docker stop` sends SIGTERM, which tini forwards to Claudear, so it interrupts its agent CLIs and shuts down gracefully (see [Graceful Shutdown](#graceful-shutdown)). Docker kills the container if it is still running when the stop timeout runs out, and the default of 10 seconds is shorter than a shutdown can take: `docker-compose.yml` sets `stop_grace_period: 50s`, and the standalone examples pass `--stop-timeout 50`. For a container started without either, use `docker stop -t 50`.
 
 Stop the container with `docker stop` (or `docker compose stop`) rather than running `claudear stop` inside it: the container ends as soon as Claudear exits, and a restart policy such as the compose file's `unless-stopped` starts it again unless Docker itself stopped it.
 
