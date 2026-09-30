@@ -59,6 +59,9 @@ const REVIEW_RERUN_DEFERRED_DECISION: &str = "review_rerun_deferred";
 /// review feedback on it and leaves the PR to humans.
 const MAX_REVIEW_CYCLES: i32 = 3;
 
+/// Why an attempt is closed as declined when a human refuses approval.
+const APPROVAL_DECLINED_REASON: &str = "Approval declined";
+
 const MAX_RATE_LIMIT_RESET_DAYS_AHEAD: i64 = 8;
 
 /// Whether a retry that failed to start should get its retry back.
@@ -87,6 +90,9 @@ enum ApprovalDecision {
     Redirect { repo_name: String },
     /// Reply could not be parsed.
     Unrecognized,
+    /// No reply came before the request timed out, or the request could not
+    /// be sent or read.
+    Unanswered,
 }
 
 /// Parse a human reply to an approval request.
@@ -345,6 +351,21 @@ enum ReviewOutcome {
     /// The rerun waits for the PR's repository to be indexed, so the
     /// feedback stays outstanding without spending any of its retries.
     Deferred,
+}
+
+/// What became of an issue handed to [`Watcher::process_issue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// The issue went through the processing pipeline, whatever it
+    /// concluded.
+    Processed,
+    /// A human refused approval, so the run did no work and closed the
+    /// issue's attempt as declined.
+    Declined,
+    /// The run stopped before processing the issue, for example because it
+    /// was already being processed, the provider was paused or no usable
+    /// answer came to its approval request.
+    Skipped,
 }
 
 impl Watcher {
@@ -1385,8 +1406,9 @@ impl Watcher {
                         status = %attempt.status,
                         "Skipping review feedback for terminal attempt status"
                     );
-                    // The PR is merged/closed/cannot-fix: close out the ledger so
-                    // its comments stop being re-surfaced, then stop watching.
+                    // The PR is merged/closed/cannot-fix/declined: close out the
+                    // ledger so its comments stop being re-surfaced, then stop
+                    // watching.
                     if let Err(e) = self.tracker.mark_pr_review_comments_handled(&pr_url) {
                         tracing::warn!(pr_url = %pr_url, error = %e, "Failed to close review-comment ledger for terminal PR");
                     }
@@ -1454,7 +1476,10 @@ impl Watcher {
     fn is_terminal_attempt_status(status: FixAttemptStatus) -> bool {
         matches!(
             status,
-            FixAttemptStatus::Merged | FixAttemptStatus::Closed | FixAttemptStatus::CannotFix
+            FixAttemptStatus::Merged
+                | FixAttemptStatus::Closed
+                | FixAttemptStatus::CannotFix
+                | FixAttemptStatus::Declined
         )
     }
 
@@ -3942,7 +3967,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Request human approval before processing an issue.
     ///
-    /// Returns the parsed `ApprovalDecision`.
+    /// Returns the parsed `ApprovalDecision`. A request that times out or
+    /// cannot be sent or read is [unanswered](ApprovalDecision::Unanswered)
+    /// rather than denied, since only a human's refusal closes the attempt.
     async fn request_approval(
         &self,
         source_name: &str,
@@ -4014,7 +4041,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     short_id = %issue.short_id,
                     "Approval timed out, skipping issue"
                 );
-                ApprovalDecision::Denied
+                ApprovalDecision::Unanswered
             }
             Err(ref e) => {
                 tracing::warn!(
@@ -4022,27 +4049,21 @@ Create a PR with your changes.{custom_instructions}"#,
                     error = %e,
                     "Error requesting approval, skipping issue"
                 );
-                ApprovalDecision::Denied
+                ApprovalDecision::Unanswered
             }
         };
 
-        let decision_label = match &decision {
-            ApprovalDecision::Approved => "approval_granted",
-            ApprovalDecision::Redirect { .. } => "approval_redirect",
-            _ => "approval_denied",
+        let (decision_label, outcome) = match &decision {
+            ApprovalDecision::Approved => ("approval_granted", "granted"),
+            ApprovalDecision::Redirect { .. } => ("approval_redirect", "redirected"),
+            ApprovalDecision::Denied => ("approval_denied", "denied"),
+            ApprovalDecision::Unrecognized => ("approval_unrecognized", "reply not understood"),
+            ApprovalDecision::Unanswered => ("approval_unanswered", "left unanswered"),
         };
         self.record_issue_decision(
             issue,
             decision_label,
-            format!(
-                "Approval {} for {}",
-                match &decision {
-                    ApprovalDecision::Approved => "granted",
-                    ApprovalDecision::Redirect { .. } => "redirected",
-                    _ => "denied",
-                },
-                issue.short_id
-            ),
+            format!("Approval {} for {}", outcome, issue.short_id),
             json!({
                 "correlation_id": ask_request.correlation_id,
                 "reply": reply.as_ref().ok().and_then(|r| r.as_ref().map(|r| &r.answer)),
@@ -4341,6 +4362,12 @@ Create a PR with your changes.{custom_instructions}"#,
     /// so the feedback is retried later instead of being addressed in a
     /// repository inferred from the issue.
     ///
+    /// A human refusing approval ends the run with its attempt
+    /// [declined](FixAttemptStatus::Declined), so neither an orphan sweep nor
+    /// the retry manager runs the issue again and asks once more. An approval
+    /// request left unanswered, or answered in a way that is not understood,
+    /// skips the issue and leaves its attempt for a later run to ask again.
+    ///
     /// From the moment the attempt is recorded until the run ends, a
     /// [`Heartbeat`] shows orphan sweeps in every process that the run is
     /// alive.
@@ -4352,7 +4379,7 @@ Create a PR with your changes.{custom_instructions}"#,
         review_feedback: Option<String>,
         existing_pr_branch: Option<String>,
         intent: Option<Intent>,
-    ) -> bool {
+    ) -> RunOutcome {
         use crate::processing::{IssueProcessor, ProcessingInput, ProcessingOutcome};
 
         // Retries, IPC and review-feedback triggers pass no intent, and a
@@ -4373,9 +4400,9 @@ Create a PR with your changes.{custom_instructions}"#,
                         status = %tip.status,
                         "Skipping deploy_qa tip that is running or has a verdict"
                     );
-                    return false;
+                    return RunOutcome::Skipped;
                 }
-                None => return false,
+                None => return RunOutcome::Skipped,
             }
         } else {
             None
@@ -4386,7 +4413,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Skipping issue processing while watcher is paused for Claude rate limit"
             );
-            return false;
+            return RunOutcome::Skipped;
         }
 
         let processing_key = format!("{}:{}", source.name(), issue.id);
@@ -4399,12 +4426,12 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 "Issue already being processed, skipping"
             );
-            return false;
+            return RunOutcome::Skipped;
         };
 
         if let Some(ref tip) = deploy_qa_tip {
             if !self.claim_deploy_qa_tip(tip, &issue.short_id) {
-                return false;
+                return RunOutcome::Skipped;
             }
         }
 
@@ -4524,7 +4551,7 @@ Create a PR with your changes.{custom_instructions}"#,
                         ),
                         json!({ "pr_repo": repo, "reason": reason }),
                     );
-                    return false;
+                    return RunOutcome::Skipped;
                 }
             },
             None => resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker)),
@@ -4582,10 +4609,26 @@ Create a PR with your changes.{custom_instructions}"#,
                             repo = %repo_name,
                             "Redirect repo not found, skipping issue"
                         );
-                        return false;
+                        return RunOutcome::Skipped;
                     }
                 }
-                ApprovalDecision::Denied | ApprovalDecision::Unrecognized => return false,
+                ApprovalDecision::Denied => {
+                    if let Err(e) = self.tracker.mark_declined(
+                        source.name(),
+                        &issue.id,
+                        APPROVAL_DECLINED_REASON,
+                    ) {
+                        tracing::error!(
+                            short_id = %issue.short_id,
+                            error = %e,
+                            "Failed to mark attempt declined"
+                        );
+                    }
+                    return RunOutcome::Declined;
+                }
+                ApprovalDecision::Unrecognized | ApprovalDecision::Unanswered => {
+                    return RunOutcome::Skipped;
+                }
             }
         }
 
@@ -4643,10 +4686,12 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Return false for semantic duplicate skips (don't count as processed),
-        // true for everything else
-        !matches!(&outcome, ProcessingOutcome::Failed { error }
-            if error.contains("Semantic duplicate of"))
+        match &outcome {
+            ProcessingOutcome::Failed { error } if error.contains("Semantic duplicate of") => {
+                RunOutcome::Skipped
+            }
+            _ => RunOutcome::Processed,
+        }
     }
 
     async fn clear_rate_limit_pause(&self) {
@@ -5261,6 +5306,10 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// `pr_repo` pins a review rerun to the repo of the PR under review. It must
     /// come from the reviewed attempt: a cascade row shares its parent's issue id.
+    ///
+    /// Fails when the run stops before processing the issue. A run whose
+    /// approval a human refused counts as carried out, so a retry or review
+    /// rerun that was declined is neither refunded nor tried again.
     async fn trigger_issue_inner(
         &self,
         source_name: &str,
@@ -5293,7 +5342,7 @@ Create a PR with your changes.{custom_instructions}"#,
             issue.set_metadata(REVIEW_PR_REPO_KEY, repo);
         }
 
-        let started = self
+        match self
             .process_issue(
                 Arc::clone(source),
                 issue,
@@ -5302,18 +5351,17 @@ Create a PR with your changes.{custom_instructions}"#,
                 existing_pr_branch,
                 None,
             )
-            .await;
-        if !started {
-            return Err(claudear_core::error::Error::source(
+            .await
+        {
+            RunOutcome::Processed | RunOutcome::Declined => Ok(()),
+            RunOutcome::Skipped => Err(claudear_core::error::Error::source(
                 source_name,
                 format!(
                     "Issue {} is already being processed; trigger deferred",
                     issue_id
                 ),
-            ));
+            )),
         }
-
-        Ok(())
     }
 
     /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
@@ -8779,6 +8827,7 @@ mod tests {
             FixAttemptStatus::Merged,
             FixAttemptStatus::Closed,
             FixAttemptStatus::CannotFix,
+            FixAttemptStatus::Declined,
         ];
 
         for status in non_terminal {
@@ -9765,7 +9814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_issue_returns_false_when_already_processing() {
+    async fn test_process_issue_skips_issue_already_processing() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
@@ -9778,19 +9827,18 @@ mod tests {
         )];
         let source = Arc::new(MockSource::with_issues("mock", issues)) as Arc<dyn IssueSource>;
         let watcher = create_test_watcher(notifier, tracker, vec![source.clone()], false);
-
-        // Mark as already processing
         watcher.lock_processing().insert("mock:1".to_string());
 
         let issue = Issue::new("1", "T-1", "Test Issue", "http://example.com/1", "mock");
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
 
-        let result = watcher
+        let outcome = watcher
             .process_issue(source, issue, match_result, None, None, None)
             .await;
-        assert!(
-            !result,
-            "process_issue should return false when issue already in-flight"
+        assert_eq!(
+            outcome,
+            RunOutcome::Skipped,
+            "process_issue should skip an issue already in flight"
         );
     }
 
@@ -10078,6 +10126,7 @@ mod tests {
             watcher
                 .process_issue(self.source.clone(), issue, match_result, None, None, None)
                 .await
+                == RunOutcome::Processed
         }
 
         fn assert_processing_released(&self, watcher: &Watcher) {
@@ -10955,8 +11004,9 @@ mod tests {
             .await
             .expect("the retried run should not panic");
 
-        assert!(
+        assert_eq!(
             retried,
+            RunOutcome::Processed,
             "the issue must not be refused as already being processed"
         );
         assert_eq!(
@@ -12234,15 +12284,15 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker.clone(), vec![source.clone()], false);
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
-        let started = watcher
+        let outcome = watcher
             .process_issue(source, issue, match_result, None, None, None)
             .await;
-        assert!(started); // true because it processed (even though it failed)
-
-        // Verify processing set was cleaned up
+        assert_eq!(
+            outcome,
+            RunOutcome::Processed,
+            "a run that fails after starting still counts as processed"
+        );
         assert!(!watcher.lock_processing().contains("mock:cleanup-1"));
-
-        // Verify active count is back to 0
         assert_eq!(watcher.active_count(), 0);
     }
 
@@ -15248,10 +15298,8 @@ mod tests {
         assert!(fetched.is_empty());
     }
 
-    // --- process_issue when rate limited ---
-
     #[tokio::test]
-    async fn test_process_issue_returns_false_when_rate_limited() {
+    async fn test_process_issue_skips_while_rate_limited() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
@@ -15269,12 +15317,13 @@ mod tests {
         }
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
-        let result = watcher
+        let outcome = watcher
             .process_issue(source, issue, match_result, None, None, None)
             .await;
-        assert!(
-            !result,
-            "process_issue should return false when rate limited"
+        assert_eq!(
+            outcome,
+            RunOutcome::Skipped,
+            "process_issue should skip an issue while the provider is rate limited"
         );
     }
 
@@ -15341,11 +15390,8 @@ mod tests {
         );
     }
 
-    // --- Resolved status in fix attempt ---
-
     #[test]
     fn test_is_terminal_attempt_status_exhaustive() {
-        // Verify we haven't missed any variants
         let all_statuses = [
             FixAttemptStatus::Pending,
             FixAttemptStatus::Success,
@@ -15353,21 +15399,23 @@ mod tests {
             FixAttemptStatus::Merged,
             FixAttemptStatus::Closed,
             FixAttemptStatus::CannotFix,
+            FixAttemptStatus::Answered,
+            FixAttemptStatus::Declined,
         ];
 
         let terminal_count = all_statuses
             .iter()
             .filter(|s| Watcher::is_terminal_attempt_status(**s))
             .count();
-        assert_eq!(terminal_count, 3, "Expected exactly 3 terminal statuses");
+        assert_eq!(terminal_count, 4, "Expected exactly 4 terminal statuses");
 
         let non_terminal_count = all_statuses
             .iter()
             .filter(|s| !Watcher::is_terminal_attempt_status(**s))
             .count();
         assert_eq!(
-            non_terminal_count, 3,
-            "Expected exactly 3 non-terminal statuses"
+            non_terminal_count, 4,
+            "Expected exactly 4 non-terminal statuses"
         );
     }
 
@@ -16005,10 +16053,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_approval_timeout_denies() {
+    async fn test_request_approval_timeout_is_unanswered() {
         let notifier = Arc::new(ApprovalMockNotifier::with_no_reply());
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        // Use very short timeout so test doesn't hang
         let watcher = create_approval_watcher(notifier.clone(), tracker.clone(), true, Some(1));
 
         let issue = test_issue();
@@ -16017,8 +16064,8 @@ mod tests {
 
         assert_eq!(
             decision,
-            ApprovalDecision::Denied,
-            "Timeout should be treated as denied"
+            ApprovalDecision::Unanswered,
+            "a timeout means no one answered, which is not a refusal"
         );
     }
 
@@ -16165,7 +16212,7 @@ mod tests {
         watcher: &Arc<Watcher>,
         notifier: &ApprovalMockNotifier,
         issue: Issue,
-    ) -> tokio::task::JoinHandle<bool> {
+    ) -> tokio::task::JoinHandle<RunOutcome> {
         let source = Arc::new(MockSource::with_issues(&issue.source, vec![issue.clone()]))
             as Arc<dyn IssueSource>;
         let run = {
@@ -16350,6 +16397,106 @@ mod tests {
                 .should_retry(&declined),
             "a retry the approver declined must close the attempt in a status the retry manager \
              never retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approval_request_without_a_refusal_leaves_the_attempt_open() {
+        for reply in [None, Some("maybe later"), Some("use org/unknown")] {
+            let notifier = Arc::new(match reply {
+                Some(answer) => ApprovalMockNotifier::with_reply(answer),
+                None => ApprovalMockNotifier::with_no_reply(),
+            });
+            let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+            let watcher = create_approval_watcher(notifier, tracker.clone(), true, Some(1));
+            let issue = test_issue();
+            let source = Arc::new(MockSource::with_issues(&issue.source, vec![issue.clone()]))
+                as Arc<dyn IssueSource>;
+
+            let outcome = watcher
+                .process_issue(
+                    source,
+                    issue.clone(),
+                    MatchResult::matched("Mock match", MatchPriority::Normal),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+
+            assert_eq!(
+                outcome,
+                RunOutcome::Skipped,
+                "an approval request answered with {reply:?} was not refused, so the issue must \
+                 only be skipped"
+            );
+            assert_eq!(
+                tracker
+                    .get_attempt(&issue.source, &issue.id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                FixAttemptStatus::Pending,
+                "an approval request answered with {reply:?} must leave the attempt open for a \
+                 later run to ask again"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_review_rerun_declined_at_approval_keeps_its_pr_watched() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("no"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let issue = Issue::new(
+            "1",
+            "MOCK-1",
+            "Mock issue",
+            "http://example.com/mock/1",
+            "mock",
+        );
+        tracker
+            .record_attempt(&issue.source, &issue.id, &issue.short_id)
+            .unwrap();
+        tracker
+            .mark_success(
+                &issue.source,
+                &issue.id,
+                "https://github.com/org/repo/pull/1",
+            )
+            .unwrap();
+        let source = Arc::new(MockSource::with_issues(&issue.source, vec![issue.clone()]))
+            as Arc<dyn IssueSource>;
+        let checkout = tempfile::tempdir().unwrap();
+        let mut watcher =
+            create_approval_watcher(notifier.clone(), tracker.clone(), true, Some(60));
+        watcher.sources = vec![source];
+        watcher.inferrer = Some(inferrer_indexing(IndexedRepo::new(
+            "org/repo",
+            checkout.path(),
+        )));
+        let attempt = tracker
+            .get_attempt(&issue.source, &issue.id)
+            .unwrap()
+            .unwrap();
+
+        let outcome = watcher
+            .process_review_action(&attempt, "Please add a test")
+            .await;
+
+        assert!(
+            matches!(outcome, Ok(ReviewOutcome::Handled)),
+            "a review rerun the approver declined is dealt with, so its feedback is not raised \
+             and asked about again, but got {outcome:?}"
+        );
+        assert_eq!(notifier.ask_count(), 1, "the approver should be asked once");
+        assert_eq!(
+            tracker
+                .get_attempt(&issue.source, &issue.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            FixAttemptStatus::Success,
+            "declining a review rerun must leave the attempt's open PR watched"
         );
     }
 }

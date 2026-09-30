@@ -1400,6 +1400,33 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn mark_declined(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking fix attempt as declined"
+        );
+        let conn = self.acquire_lock()?;
+        // An outcome a run already reached outlives a declined rerun, so a
+        // review rerun refused at approval leaves its open PR watched
+        let rows_affected = conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'declined', error_message = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
+              AND status IN ('pending', 'failed', 'closed')
+            "#,
+            params![reason, source, issue_id],
+        )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as declined"
+        );
+        Ok(())
+    }
+
     /// Read the routing intent classified for an attempt, if one was stored.
     fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
         let conn = self.acquire_lock()?;
@@ -10960,6 +10987,95 @@ mod tests {
         assert_eq!(
             attempt.error_message,
             Some("Max retries exceeded".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mark_declined_takes_attempts_out_of_the_sweep_and_the_retry_queue() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "new", "CLOUD-1").unwrap();
+        tracker
+            .record_attempt("sentry", "retrying", "CLOUD-2")
+            .unwrap();
+        tracker
+            .mark_failed("sentry", "retrying", "agent crashed")
+            .unwrap();
+        age_attempt(&tracker, "new", 2 * 60 * 60);
+
+        for issue_id in ["new", "retrying"] {
+            tracker
+                .mark_declined("sentry", issue_id, "Approval declined")
+                .unwrap();
+        }
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a declined attempt is no longer pending, so no sweep may release it"
+        );
+        assert!(
+            tracker.get_retryable_issues(2).unwrap().is_empty(),
+            "a declined attempt must never be queued for a retry"
+        );
+        for issue_id in ["new", "retrying"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Declined, "{issue_id}");
+            assert_eq!(
+                attempt.error_message.as_deref(),
+                Some("Approval declined"),
+                "{issue_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mark_declined_keeps_outcomes_a_run_already_reached() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("github", "open_pr", "GH-1").unwrap();
+        tracker
+            .mark_success("github", "open_pr", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.record_attempt("github", "merged", "GH-2").unwrap();
+        tracker
+            .mark_success("github", "merged", "https://github.com/org/repo/pull/2")
+            .unwrap();
+        tracker.mark_merged("github", "merged").unwrap();
+        tracker
+            .record_attempt("github", "answered", "GH-3")
+            .unwrap();
+        tracker
+            .mark_answered("github", "answered", "Use the v2 endpoint", None)
+            .unwrap();
+        tracker.record_attempt("github", "gave_up", "GH-4").unwrap();
+        tracker
+            .mark_cannot_fix("github", "gave_up", "Max retries (2) reached")
+            .unwrap();
+
+        for (issue_id, reached) in [
+            ("open_pr", FixAttemptStatus::Success),
+            ("merged", FixAttemptStatus::Merged),
+            ("answered", FixAttemptStatus::Answered),
+            ("gave_up", FixAttemptStatus::CannotFix),
+        ] {
+            tracker
+                .mark_declined("github", issue_id, "Approval declined")
+                .unwrap();
+            assert_eq!(
+                tracker
+                    .get_attempt("github", issue_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                reached,
+                "declining a rerun of {issue_id} must keep the outcome its attempt already reached"
+            );
+        }
+        assert_eq!(
+            tracker.get_pending_prs().unwrap().len(),
+            1,
+            "a review rerun declined at approval must leave its open PR watched"
         );
     }
 

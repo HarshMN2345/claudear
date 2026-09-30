@@ -212,6 +212,18 @@ pub trait AttemptTracker: Send + Sync {
         Ok(())
     }
 
+    /// Mark an issue's attempt as declined because a human refused approval
+    /// to work on it, unless the attempt already has an outcome of its own,
+    /// such as an open or merged PR, an answer or `cannot_fix`.
+    ///
+    /// Default no-op; persistent trackers should set the attempt status to
+    /// `declined` so neither the orphan sweep nor the retry manager runs the
+    /// issue again and asks for approval once more.
+    fn mark_declined(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        let _ = (source, issue_id, reason);
+        Ok(())
+    }
+
     /// Read the routing intent classified for an attempt, if one was stored.
     fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
         let _ = (source, issue_id);
