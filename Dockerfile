@@ -121,6 +121,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     openssh-client \
     sqlite3 \
+    tini \
     && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/locale/* \
     && ARCH=$(dpkg --print-architecture) \
     && curl -fsSL "https://cli.github.com/packages/githubcli-archive-keyring.gpg" \
@@ -163,5 +164,5 @@ EXPOSE 3100 443 80
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3100/api/health || exit 1
 
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["claudear"]
+ENTRYPOINT ["tini", "--", "docker-entrypoint.sh"]
+CMD ["claudear", "start", "--foreground"]
