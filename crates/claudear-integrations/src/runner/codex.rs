@@ -259,7 +259,7 @@ impl AgentRunner for CodexAgentRunner {
             result = group.wait(&mut child) => WaitOutcome::Exited(result),
             _ = tokio::time::sleep(timeout_duration) => WaitOutcome::TimedOut,
         };
-        group.kill();
+        group.finish().await;
 
         let (status, timed_out) = match outcome {
             WaitOutcome::Exited(Ok(status)) => (status, false),
@@ -367,10 +367,13 @@ impl AgentRunner for CodexAgentRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::runner::process_group::tests::assert_perl_environment_readable;
     #[cfg(unix)]
     use crate::runner::process_group::tests::{
-        exits_within, install_stub, is_running, kill, recorded_escaped_pid, recorded_pids,
-        wait_for_recorded_pids, BACKGROUND_PROCESS, ESCAPED_PROCESS, RUN_DEADLINE,
+        exits_within, install_stub, is_running, recorded_escaped_pid, recorded_pids,
+        stop_if_running, wait_for_recorded_pids, BACKGROUND_PROCESS, ESCAPED_PROCESS,
+        MARKER_VARIABLE, RUN_DEADLINE,
     };
 
     #[cfg(unix)]
@@ -638,10 +641,13 @@ mod tests {
         );
     }
 
+    /// Run a stub CLI that runs `setup` and then prints [`PR_URL`]. Returns the
+    /// result, or `None` if the run outlived [`RUN_DEADLINE`], the pid `setup`
+    /// recorded in `escaped`, and whether that process was still running
+    /// afterwards, killing it if so.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_execute_stops_reading_output_held_open_outside_the_process_group() {
-        let (directory, runner) = stub_runner(&pull_request_script(ESCAPED_PROCESS));
+    async fn execute_leaving(setup: &str) -> (Option<Result<AgentResult>>, u32, bool) {
+        let (directory, runner) = stub_runner(&pull_request_script(setup));
 
         let result = tokio::time::timeout(
             RUN_DEADLINE,
@@ -650,8 +656,14 @@ mod tests {
         .await;
         let escaped =
             recorded_escaped_pid(directory.path()).expect("the stub records the escaped pid");
-        let escaped_running = is_running(escaped);
-        kill(escaped);
+        (result.ok(), escaped, stop_if_running(escaped))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_stops_reading_output_held_open_outside_the_process_group() {
+        let (result, _, escaped_running) =
+            execute_leaving(&format!("env -u {MARKER_VARIABLE} {ESCAPED_PROCESS}")).await;
 
         let result = result
             .expect("the run must not wait on output held open outside its group")
@@ -660,7 +672,24 @@ mod tests {
         assert_eq!(result.pr_url.as_deref(), Some(PR_URL));
         assert!(
             escaped_running,
-            "the process must survive the group kill for this test to reach the drain deadline"
+            "the process must survive the group kill and the sweep for this test to reach the drain"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn test_execute_kills_processes_left_in_sessions_of_their_own() {
+        assert_perl_environment_readable();
+        let (result, escaped, escaped_running) = execute_leaving(ESCAPED_PROCESS).await;
+
+        let result = result
+            .expect("the run must end within its deadline")
+            .unwrap();
+        assert!(result.success, "the run failed: {:?}", result.error);
+        assert_eq!(result.pr_url.as_deref(), Some(PR_URL));
+        assert!(
+            !escaped_running,
+            "process {escaped} that left the CLI's process group outlived the run"
         );
     }
 

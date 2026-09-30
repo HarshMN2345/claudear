@@ -8,8 +8,9 @@ type Deadline = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// How long readers keep reading an agent CLI's output once its process group
 /// is killed. The CLI's own output is buffered by then, so a reader takes all of
 /// it and stops once the pipe is empty after the grace: a process that moved to
-/// a session of its own escaped the kill and can hold the pipe open forever. At
-/// the cutoff it stops even while such a process keeps writing.
+/// a session of its own escaped the kill and, with the run's marker hidden or
+/// scrubbed, the run's sweep too, so it can hold the pipe open forever. At the
+/// cutoff it stops even while such a process keeps writing.
 pub struct Drain {
     grace: Deadline,
     cutoff: Deadline,
