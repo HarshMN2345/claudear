@@ -273,7 +273,9 @@ max_reuse_candidates = 3
 # On timeout, continue with uncertainty note instead of hard-fail (default: true)
 best_effort_on_timeout = true
 
-# Require human approval before processing each issue (default: false)
+# Require human approval before processing each issue (default: false).
+# A "no" closes the issue's attempt as declined, so it is not retried or
+# asked about again unless reset; a request that times out is asked again.
 require_approval = false
 
 # Timeout for approval requests in seconds (falls back to wait_timeout_secs when unset)

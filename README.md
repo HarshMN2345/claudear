@@ -884,6 +884,7 @@ When an issue is assigned to a user, Claudear routes notifications to their conf
 | **Closed** | PR closed without merging (triggers retry) |
 | **Failed** | Fix attempt failed (triggers retry) |
 | **Cannot Fix** | Max retries exhausted |
+| **Declined** | A human refused approval; not retried or asked about again unless reset |
 
 ---
 
