@@ -51,6 +51,10 @@ const MAX_REVIEW_COMMENT_ATTEMPTS: i64 = 5;
 /// Issue metadata carrying the reviewed PR's repo into a review rerun.
 const REVIEW_PR_REPO_KEY: &str = "review_pr_repo";
 
+/// Decision recorded when a review rerun waits for its PR's repository to be
+/// indexed.
+const REVIEW_RERUN_DEFERRED_DECISION: &str = "review_rerun_deferred";
+
 /// How many review-driven reruns a PR gets before claudear stops answering
 /// review feedback on it and leaves the PR to humans.
 const MAX_REVIEW_CYCLES: i32 = 3;
@@ -319,6 +323,9 @@ pub struct Watcher {
     /// How often this watcher's runs send heartbeats, and how long its orphan
     /// sweeps let a run stay silent before releasing its attempt.
     liveness: Liveness,
+    /// URLs of the PRs whose review reruns wait for their repository to be
+    /// indexed, so each wait is recorded once rather than every cycle.
+    deferred_review_reruns: Mutex<HashSet<String>>,
 }
 
 /// A ledger comment carried by a review batch: `(scm_comment_id, comment_kind)`.
@@ -327,6 +334,18 @@ type CommentRef = (i64, &'static str);
 /// Actionable review feedback grouped for one PR:
 /// `(pr_url, feedback_summary, feedback_count, comment_refs)`.
 type PrReviewFeedback = (String, String, usize, Vec<CommentRef>);
+
+/// What became of review feedback handed to
+/// [`Watcher::process_review_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewOutcome {
+    /// The feedback is dealt with: a rerun addressing it started, or the PR
+    /// was left to humans.
+    Handled,
+    /// The rerun waits for the PR's repository to be indexed, so the
+    /// feedback stays outstanding without spending any of its retries.
+    Deferred,
+}
 
 impl Watcher {
     /// Create a new watcher.
@@ -412,6 +431,7 @@ impl Watcher {
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
             dispatched_deploy_qa_tips: Mutex::new(HashSet::new()),
             liveness: Liveness::default(),
+            deferred_review_reruns: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1377,7 +1397,7 @@ impl Watcher {
                     .process_review_action(&attempt, &feedback_summary)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(ReviewOutcome::Handled) => {
                         // Durably handled: acknowledge exactly the comments in this
                         // batch so they aren't re-surfaced, without touching any
                         // comment recorded concurrently while we were processing.
@@ -1387,6 +1407,12 @@ impl Watcher {
                         {
                             tracing::warn!(pr_url = %pr_url, error = %e, "Failed to mark review comments handled");
                         }
+                    }
+                    Ok(ReviewOutcome::Deferred) => {
+                        tracing::debug!(
+                            pr_url = %pr_url,
+                            "Leaving review feedback outstanding until the PR's repository is indexed"
+                        );
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1482,12 +1508,14 @@ impl Watcher {
     /// the review feedback appended to help Claude understand what to fix. A
     /// rerun that never starts fails without counting toward
     /// [`MAX_REVIEW_CYCLES`], so its feedback is retried instead of being lost
-    /// to the cap.
+    /// to the cap. A rerun whose PR repository cannot be resolved from the
+    /// index is [deferred](ReviewOutcome::Deferred) before anything can
+    /// charge the feedback for it, and runs once the repository is indexed.
     async fn process_review_action(
         &self,
         attempt: &claudear_core::types::FixAttempt,
         feedback: &str,
-    ) -> Result<()> {
+    ) -> Result<ReviewOutcome> {
         tracing::info!(
             source = %attempt.source,
             issue_id = %attempt.issue_id,
@@ -1522,9 +1550,20 @@ impl Watcher {
                     if let Some(rw) = &self.review_watcher {
                         rw.unwatch_pr(pr_url);
                     }
-                    return Ok(());
+                    return Ok(ReviewOutcome::Handled);
                 }
             }
+        }
+
+        if let (Some(pr_url), Some(repo)) = (attempt.pr_url.as_deref(), attempt.scm_repo.as_deref())
+        {
+            if let RepoResolution::Skip { reason } =
+                resolve_repo_for_cascade(self.inferrer.as_ref(), repo)
+            {
+                self.defer_review_rerun(attempt, pr_url, repo, &reason);
+                return Ok(ReviewOutcome::Deferred);
+            }
+            self.lock_deferred_review_reruns().remove(pr_url);
         }
 
         if self.config.learning.review_classification {
@@ -1593,7 +1632,7 @@ impl Watcher {
                     source = %attempt.source,
                     "Source not found for review action"
                 );
-                return Ok(());
+                return Ok(ReviewOutcome::Handled);
             }
         };
 
@@ -1652,7 +1691,48 @@ impl Watcher {
         if rerun.is_err() && charged {
             self.refund_review_cycle(attempt, pr_url);
         }
-        rerun
+        rerun.map(|()| ReviewOutcome::Handled)
+    }
+
+    /// Leave `attempt`'s review feedback outstanding because the repository of
+    /// the PR under review, `repo`, cannot be resolved from the index,
+    /// recording the wait once rather than every cycle it lasts.
+    fn defer_review_rerun(&self, attempt: &FixAttempt, pr_url: &str, repo: &str, reason: &str) {
+        let newly_deferred = self
+            .lock_deferred_review_reruns()
+            .insert(pr_url.to_string());
+        if !newly_deferred {
+            tracing::debug!(
+                pr_url = %pr_url,
+                repo = %repo,
+                "Review rerun still waiting for its PR repository"
+            );
+            return;
+        }
+        tracing::warn!(
+            short_id = %attempt.short_id,
+            repo = %repo,
+            reason = %reason,
+            "PR repo not resolvable, deferring review rerun"
+        );
+        self.record_attempt_decision(
+            attempt,
+            REVIEW_RERUN_DEFERRED_DECISION,
+            format!(
+                "Deferred review rerun for {}: PR repository {} is not resolvable",
+                attempt.short_id, repo
+            ),
+            json!({ "pr_repo": repo, "reason": reason }),
+        );
+    }
+
+    /// Lock the PRs whose review reruns are deferred, recovering them from a
+    /// poisoned lock: the set only gains or loses whole URLs, so a holder that
+    /// panicked cannot leave it inconsistent.
+    fn lock_deferred_review_reruns(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.deferred_review_reruns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Rerun `attempt`'s issue with review `feedback` on its PR branch, in
@@ -4005,6 +4085,25 @@ Create a PR with your changes.{custom_instructions}"#,
         self.tracker.record_activity(&activity).ok();
     }
 
+    /// Record a decision about `attempt`'s issue on the issue's timeline, for
+    /// when only the attempt is at hand.
+    fn record_attempt_decision(
+        &self,
+        attempt: &FixAttempt,
+        decision: &str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) {
+        let activity = ActivityLogEntry::new("decision", message.into())
+            .with_source(attempt.source.clone())
+            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+            .with_metadata(json!({
+                "decision": decision,
+                "details": details,
+            }));
+        self.tracker.record_activity(&activity).ok();
+    }
+
     /// Start QA for pending `deploy_qa` release tips without waiting for it to
     /// finish, returning a handle per started run.
     ///
@@ -4418,7 +4517,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     );
                     self.record_issue_decision(
                         &issue,
-                        "review_rerun_deferred",
+                        REVIEW_RERUN_DEFERRED_DECISION,
                         format!(
                             "Deferred review rerun for {}: PR repository {} is not resolvable",
                             issue.short_id, repo
