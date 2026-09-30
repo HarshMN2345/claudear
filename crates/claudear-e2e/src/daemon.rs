@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+/// Long enough for claudear to drain its runs and interrupt its agent CLIs
+/// before `docker stop` kills it.
+const STOP_TIMEOUT: Duration = Duration::from_secs(40);
+
 /// Handle to a running daemon instance.
 pub enum DaemonHandle {
     Process {
@@ -174,6 +178,8 @@ pub fn start_docker(
     let mut args = vec![
         "run".to_string(),
         "-d".to_string(),
+        "--stop-timeout".to_string(),
+        STOP_TIMEOUT.as_secs().to_string(),
         "--name".to_string(),
         format!("claudear-e2e-{}", label),
         "-p".to_string(),
