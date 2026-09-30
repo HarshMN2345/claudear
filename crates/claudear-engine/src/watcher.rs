@@ -16111,6 +16111,13 @@ mod tests {
     /// within [`ORPHAN_SWEEP_WINDOW`].
     const TEST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 
+    /// How the orphan-sweep tests' runs send heartbeats and how long their
+    /// sweeps let a run stay silent.
+    const TEST_LIVENESS: Liveness = Liveness {
+        interval: TEST_HEARTBEAT_INTERVAL,
+        stale_after: ORPHAN_SWEEP_WINDOW,
+    };
+
     /// A watcher that asks for approval before every run, waits up to a
     /// minute for the answer, and sends heartbeats and sweeps orphans on
     /// test-sized timing.
@@ -16119,11 +16126,37 @@ mod tests {
         tracker: Arc<SqliteTracker>,
     ) -> Arc<Watcher> {
         let mut watcher = create_approval_watcher(notifier, tracker, true, Some(60));
-        watcher.liveness = Liveness {
-            interval: TEST_HEARTBEAT_INTERVAL,
-            stale_after: ORPHAN_SWEEP_WINDOW,
-        };
+        watcher.liveness = TEST_LIVENESS;
         Arc::new(watcher)
+    }
+
+    /// An [`approval_gated_watcher`] that runs over `source` and retries a
+    /// failed attempt as soon as its retry manager next runs.
+    fn retrying_approval_gated_watcher(
+        notifier: Arc<ApprovalMockNotifier>,
+        tracker: Arc<SqliteTracker>,
+        source: Arc<dyn IssueSource>,
+    ) -> Arc<Watcher> {
+        let mut watcher = create_approval_watcher(notifier, tracker, true, Some(60));
+        watcher.liveness = TEST_LIVENESS;
+        watcher.sources = vec![source];
+        watcher.config.retry.base_delay_ms = 0;
+        watcher.config.retry.max_delay_ms = 0;
+        watcher.config.processing_delay_ms = 0;
+        watcher.set_running(true);
+        Arc::new(watcher)
+    }
+
+    /// How many times `decision` was recorded on `issue`'s timeline.
+    fn decisions_recorded(tracker: &SqliteTracker, issue: &Issue, decision: &str) -> usize {
+        tracker
+            .get_activities_for_issue(&issue.source, &issue.id)
+            .unwrap()
+            .into_iter()
+            .filter(|activity| activity.activity_type == "decision")
+            .filter_map(|activity| activity.metadata)
+            .filter(|metadata| metadata["decision"] == decision)
+            .count()
     }
 
     /// Process `issue` in the background until its run stops to wait for
@@ -16218,6 +16251,105 @@ mod tests {
             "a run that died stops showing it is alive, so the watcher's next sweep past the \
              window must hand its attempt back to the retry queue rather than leave the issue \
              blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_denied_approval_is_not_asked_again_after_orphan_sweeps_and_retries() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("no"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let issue = test_issue();
+        let source = Arc::new(MockSource::with_issues(&issue.source, vec![issue.clone()]))
+            as Arc<dyn IssueSource>;
+        let watcher =
+            retrying_approval_gated_watcher(notifier.clone(), tracker.clone(), source.clone());
+
+        watcher
+            .process_issue(
+                source,
+                issue.clone(),
+                MatchResult::matched("Mock match", MatchPriority::Normal),
+                None,
+                None,
+                None,
+            )
+            .await;
+        let declined = tracker
+            .get_attempt(&issue.source, &issue.id)
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(ORPHAN_SWEEP_WINDOW + Duration::from_secs(2)).await;
+        watcher.release_orphaned_attempts();
+        watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(
+            notifier.ask_count(),
+            1,
+            "a denied approval is final, so neither an orphan sweep nor the retry manager may \
+             run the issue again and ask the approver a second time"
+        );
+        assert_ne!(
+            declined.status,
+            FixAttemptStatus::Pending,
+            "a denied approval must close the attempt rather than leave it pending for an \
+             orphan sweep to release"
+        );
+        assert!(
+            !RetryManager::new(watcher.config.retry.clone(), tracker.clone())
+                .should_retry(&declined),
+            "a denied approval must close the attempt in a status the retry manager never \
+             retries"
+        );
+        assert_eq!(
+            decisions_recorded(&tracker, &issue, "approval_denied"),
+            1,
+            "the decline should be recorded once for operators to see"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_declined_at_approval_is_neither_refunded_nor_asked_again() {
+        let notifier = Arc::new(ApprovalMockNotifier::with_reply("no"));
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let issue = test_issue();
+        tracker
+            .record_attempt(&issue.source, &issue.id, &issue.short_id)
+            .unwrap();
+        tracker
+            .mark_failed(&issue.source, &issue.id, "agent crashed")
+            .unwrap();
+        let failed = tracker
+            .get_attempt(&issue.source, &issue.id)
+            .unwrap()
+            .unwrap();
+        let source = Arc::new(MockSource::with_issues(&issue.source, vec![issue.clone()]))
+            as Arc<dyn IssueSource>;
+        let watcher = retrying_approval_gated_watcher(notifier.clone(), tracker.clone(), source);
+
+        watcher.process_ready_retries().await.unwrap();
+        let declined = tracker
+            .get_attempt(&issue.source, &issue.id)
+            .unwrap()
+            .unwrap();
+        watcher.process_ready_retries().await.unwrap();
+
+        assert_eq!(
+            notifier.ask_count(),
+            1,
+            "a retry the approver declined is not in flight anywhere, so the retry manager must \
+             not run it again and ask a second time"
+        );
+        assert_eq!(
+            declined.retry_count,
+            failed.retry_count + 1,
+            "a retry the approver declined did run, so the retry it spent must not be refunded \
+             as if it never started"
+        );
+        assert!(
+            !RetryManager::new(watcher.config.retry.clone(), tracker.clone())
+                .should_retry(&declined),
+            "a retry the approver declined must close the attempt in a status the retry manager \
+             never retries"
         );
     }
 }
