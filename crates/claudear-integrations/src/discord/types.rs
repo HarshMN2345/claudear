@@ -34,6 +34,18 @@ pub struct DiscordChannel {
     pub name: Option<String>,
     /// Parent channel ID (for threads).
     pub parent_id: Option<String>,
+    /// Tags a forum channel offers its posts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_tags: Vec<ForumTag>,
+}
+
+/// A tag defined on a forum channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForumTag {
+    /// Tag ID.
+    pub id: String,
+    /// Tag name.
+    pub name: String,
 }
 
 impl DiscordChannel {
@@ -80,6 +92,9 @@ pub struct DiscordThread {
     /// carries the `archive_timestamp` cursor used to page archived threads.
     #[serde(default)]
     pub thread_metadata: Option<ThreadMetadata>,
+    /// Forum tag IDs applied to the post (see [`DiscordChannel::available_tags`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_tags: Vec<String>,
 }
 
 /// Subset of Discord's `thread_metadata` object.
@@ -551,6 +566,7 @@ mod tests {
             message_count: None,
             member_count: None,
             thread_metadata: None,
+            applied_tags: Vec::new(),
         };
         assert!(active_thread.is_active());
 
@@ -656,6 +672,7 @@ mod tests {
             guild_id: Some("guild123".to_string()),
             name: Some("general".to_string()),
             parent_id: None,
+            available_tags: Vec::new(),
         };
         let json = serde_json::to_string(&channel).unwrap();
         assert!(json.contains("general"));
@@ -961,6 +978,7 @@ mod tests {
             message_count: None,
             member_count: None,
             thread_metadata: None,
+            applied_tags: Vec::new(),
         };
         assert!(!thread.is_active());
     }
@@ -1222,6 +1240,7 @@ mod tests {
             guild_id: Some("g-1".to_string()),
             name: Some("voice".to_string()),
             parent_id: Some("cat-1".to_string()),
+            available_tags: Vec::new(),
         };
         let json = serde_json::to_string(&channel).unwrap();
         let deserialized: DiscordChannel = serde_json::from_str(&json).unwrap();
@@ -1246,6 +1265,7 @@ mod tests {
             message_count: Some(100),
             member_count: Some(10),
             thread_metadata: None,
+            applied_tags: Vec::new(),
         };
         let json = serde_json::to_string(&thread).unwrap();
         let deserialized: DiscordThread = serde_json::from_str(&json).unwrap();

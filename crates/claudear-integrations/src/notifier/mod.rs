@@ -65,7 +65,7 @@ pub use sms::SmsNotifier;
 pub use telegram::TelegramNotifier;
 pub use whatsapp::WhatsAppNotifier;
 
-use crate::reports::{RepetitiveDigest, Report};
+use crate::reports::{RepetitiveDigest, Report, SupportDigest};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -145,6 +145,14 @@ pub trait Notifier: Send + Sync {
     /// configured on-call user.
     async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
         self.notify_status(&digest.format_text()).await
+    }
+
+    /// Send the digest of Discord support threads that need a reply.
+    ///
+    /// Does nothing by default: the digest can post hourly, which is only
+    /// reasonable for chat channels that override this.
+    async fn notify_support_digest(&self, _digest: &SupportDigest) -> Result<()> {
+        Ok(())
     }
 
     /// Send a blocking question through this channel.
@@ -378,6 +386,16 @@ impl Notifier for CompositeNotifier {
         self.broadcast(|n| {
             let digest = digest.clone();
             async move { n.notify_repetitive_digest(&digest).await }
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<()> {
+        let digest = digest.clone();
+        self.broadcast(|n| {
+            let digest = digest.clone();
+            async move { n.notify_support_digest(&digest).await }
         })
         .await;
         Ok(())

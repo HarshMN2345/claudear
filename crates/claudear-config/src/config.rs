@@ -718,6 +718,54 @@ impl Default for Config {
 pub struct ReportsConfig {
     /// Weekly digest of repetitive, non-actionable Sentry issues.
     pub repetitive_digest: RepetitiveDigestConfig,
+    /// Digest of Discord support forum threads that need a reply.
+    pub support_digest: SupportDigestConfig,
+}
+
+/// Digest of Discord support forum threads that need a reply.
+///
+/// Scans the forum every `interval_hours`, ranks open threads by how urgently
+/// they need a reply, and posts the ranking to the configured notifier(s) when
+/// a thread enters the top `max_entries`. Report-only — threads are never fed
+/// into the fix pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SupportDigestConfig {
+    /// Whether the digest is enabled (default: false).
+    pub enabled: bool,
+    /// Bot token with read access to the forum. Falls back to the notifier/issue
+    /// Discord bot_token when unset.
+    pub bot_token: Option<SecretValue>,
+    /// Forum channel id to scan. The guild is read from the channel.
+    pub channel_id: String,
+    /// Only threads active in the last N days (default: 14).
+    pub days: i64,
+    /// How often to scan, in hours (default: 1.0, 0 = disable).
+    pub interval_hours: f64,
+    /// How many needs-reply threads to post (default: 10).
+    pub max_entries: usize,
+    /// Discord user ids whose replies count as the team's.
+    pub team_user_ids: Vec<String>,
+    /// Discord role ids whose holders count as team.
+    pub team_role_ids: Vec<String>,
+    /// Forum tag names that mark a thread solved (case-insensitive).
+    pub solved_tags: Vec<String>,
+}
+
+impl Default for SupportDigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: None,
+            channel_id: String::new(),
+            days: 14,
+            interval_hours: 1.0,
+            max_entries: 10,
+            team_user_ids: Vec::new(),
+            team_role_ids: Vec::new(),
+            solved_tags: vec!["solved".to_string(), "resolved".to_string()],
+        }
+    }
 }
 
 /// Weekly digest of repetitive, non-actionable Sentry issues.

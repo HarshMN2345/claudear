@@ -281,6 +281,8 @@ pub struct Watcher {
     code_search_service: Option<Arc<claudear_analysis::repo::code_index::CodeSearchService>>,
     discord_search_service: Option<Arc<claudear_analysis::knowledgebase::DiscordSearchService>>,
     discord_index_orchestrator: Option<Arc<crate::discord_index::DiscordIndexOrchestrator>>,
+    /// Reader for the Discord support forum digest, when enabled.
+    support_digest: Option<crate::support_digest::SupportDigestOrchestrator>,
     relationships: Option<RepoRelationships>,
     github_client: Option<Arc<GitHubClient>>,
     scm_provider: Option<Arc<dyn ScmProvider>>,
@@ -328,6 +330,8 @@ impl Watcher {
     /// Create a new watcher.
     pub fn new(options: WatcherOptions) -> Self {
         let feedback_analyzer = FeedbackAnalyzer::new().with_tracker(options.tracker.clone());
+        let support_digest =
+            crate::support_digest::SupportDigestOrchestrator::from_config(&options.config);
 
         // Wire classifier into inferrer: prefer agent-based when use_agent is set
         let mut inferrer = options.inferrer;
@@ -391,6 +395,7 @@ impl Watcher {
             code_search_service: options.code_search_service,
             discord_search_service: options.discord_search_service,
             discord_index_orchestrator: options.discord_index_orchestrator,
+            support_digest,
             relationships: options.relationships,
             github_client: options.github_client,
             scm_provider: options.scm_provider,
@@ -2505,6 +2510,43 @@ Create a PR with your changes.{custom_instructions}"#,
             _ => chrono::Weekday::Mon,
         };
         Some(ReportSchedule::weekly("repetitive-digest", day, cfg.hour))
+    }
+
+    /// Scan interval for the support digest, or `None` when it is off.
+    pub fn support_digest_interval(&self) -> Option<std::time::Duration> {
+        self.support_digest.as_ref()?;
+        let hours = self.config.reports.support_digest.interval_hours;
+        if hours <= 0.0 {
+            return None;
+        }
+        Some(std::time::Duration::from_secs_f64(hours * 3600.0))
+    }
+
+    /// Rank the Discord support forum and send the digest when a thread that
+    /// needs a reply was not in the last one sent. Report-only.
+    pub async fn send_support_digest(&self) -> Result<()> {
+        let Some(orchestrator) = self.support_digest.as_ref() else {
+            return Ok(());
+        };
+        let digest = orchestrator.collect().await?;
+
+        if !digest.has_new() {
+            tracing::info!(
+                component = "digest",
+                needs_reply = digest.needs_reply_total,
+                "No new support threads need a reply; nothing to send"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            component = "digest",
+            needs_reply = digest.needs_reply_total,
+            "Sending support digest"
+        );
+        self.notifier.notify_support_digest(&digest).await?;
+        orchestrator.mark_sent(&digest);
+        Ok(())
     }
 
     /// Build and send the weekly digest of repetitive, non-actionable Sentry

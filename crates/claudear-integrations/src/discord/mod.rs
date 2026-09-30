@@ -11,5 +11,5 @@ pub use client::{DiscordClient, DiscordHttpClient, ReqwestDiscordClient};
 pub use thread_manager::ThreadManager;
 pub use types::{
     CreateMessageParams, CreateThreadParams, DiscordChannel, DiscordMessage,
-    DiscordMessageReference, DiscordThread, DiscordUser, MessageEmbed, ThreadState,
+    DiscordMessageReference, DiscordThread, DiscordUser, ForumTag, MessageEmbed, ThreadState,
 };
