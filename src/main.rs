@@ -1818,7 +1818,8 @@ struct Daemon<'a> {
 
 impl Daemon<'_> {
     /// Run `services` until a signal, `request` or a service ending starts the shutdown, then
-    /// stop taking new work, drain the runs in flight and [wrap up](Self::wrap_up).
+    /// stop taking new work, drain the runs in flight and [wrap up](Self::wrap_up). A signal also
+    /// interrupts the agent CLIs as the shutdown begins.
     ///
     /// Fails with [`ForcedShutdown`] when another signal forces the shutdown.
     async fn serve<'s>(
@@ -1845,8 +1846,14 @@ impl Daemon<'_> {
         services: impl IntoIterator<Item = Service<'s>>,
         request: impl Future<Output = ()>,
     ) -> anyhow::Result<Summary> {
-        let summary =
-            shutdown::run(services, request, signals, |_| self.stop(), self.drain()).await;
+        let summary = shutdown::run(
+            services,
+            request,
+            signals,
+            |reason| self.stop(reason, registry),
+            self.drain(),
+        )
+        .await;
         match summary.outcome {
             Outcome::Forced => {
                 tracing::warn!("Shutdown forced, exiting immediately");
@@ -1892,7 +1899,9 @@ impl Daemon<'_> {
         );
     }
 
-    fn stop(&self) {
+    /// Stop taking new work. A signal also interrupts the agent CLIs in `registry` at once, while
+    /// `claudear stop` or a service ending lets their runs finish first.
+    fn stop(&self, reason: Reason, registry: &process_group::Registry) {
         if let Some(ipc) = self.ipc {
             ipc.set_stopping();
         }
@@ -1902,6 +1911,10 @@ impl Daemon<'_> {
         self.watcher.stop();
         for monitor in &self.monitors {
             monitor.abort();
+        }
+        if matches!(reason, Reason::Interrupted | Reason::Terminated) {
+            tracing::warn!("Interrupting the agent CLIs of the runs in flight");
+            registry.interrupt_all();
         }
         tracing::warn!(
             watcher_runs = self.watcher_runs(),
@@ -5045,6 +5058,115 @@ mod tests {
         assert!(
             started.elapsed() < shutdown::INTERRUPT_GRACE,
             "the second signal must cut the wrap-up short instead of waiting out the grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn signals_interrupt_the_agent_clis_as_the_shutdown_begins() {
+        for reason in [Reason::Terminated, Reason::Interrupted] {
+            let watcher = idle_watcher();
+            let runs = TaskTracker::new();
+            let _run = runs.token();
+            let daemon = Daemon {
+                watcher: &watcher,
+                ipc: None,
+                runs: Some(&runs),
+                monitors: Vec::new(),
+            };
+            let registry = process_group::Registry::new();
+            let (_cli, _guard, mut output) = spawn_cli(STUBBORN_CLI, &registry).await;
+            let (sender, mut signals) = unbounded();
+            sender.unbounded_send(reason).unwrap();
+
+            let serve = daemon.serve_with(
+                &mut signals,
+                &registry,
+                [Service::new("idle", pending())],
+                pending(),
+            );
+            tokio::pin!(serve);
+            assert!(
+                futures::poll!(&mut serve).is_pending(),
+                "the drain must wait for the run in flight"
+            );
+
+            assert!(
+                registry.is_interrupted(),
+                "{reason} must interrupt the agent CLIs as the shutdown begins"
+            );
+            let line = tokio::time::timeout(WRAP_UP_DEADLINE, output.next_line())
+                .await
+                .expect("the agent CLI must be interrupted while the drain still waits")
+                .expect("read the CLI's output");
+            assert_eq!(line.as_deref(), Some(CLI_INTERRUPTED));
+        }
+    }
+
+    #[tokio::test]
+    async fn claudear_stop_lets_the_agent_clis_run_through_the_drain() {
+        let watcher = idle_watcher();
+        let runs = TaskTracker::new();
+        let _run = runs.token();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: Some(&runs),
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (_cli, _guard, _output) = spawn_cli(STUBBORN_CLI, &registry).await;
+        let (_sender, mut signals) = unbounded::<Reason>();
+
+        let serve = daemon.serve_with(
+            &mut signals,
+            &registry,
+            [Service::new("idle", pending())],
+            std::future::ready(()),
+        );
+        tokio::pin!(serve);
+        assert!(
+            futures::poll!(&mut serve).is_pending(),
+            "the drain must wait for the run in flight"
+        );
+
+        assert!(runs.is_closed(), "claudear stop must begin the shutdown");
+        assert!(
+            !registry.is_interrupted(),
+            "claudear stop must let the agent CLIs run while the drain waits for their runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_ending_lets_the_agent_clis_run_through_the_drain() {
+        let watcher = idle_watcher();
+        let runs = TaskTracker::new();
+        let _run = runs.token();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: Some(&runs),
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (_cli, _guard, _output) = spawn_cli(STUBBORN_CLI, &registry).await;
+        let (_sender, mut signals) = unbounded::<Reason>();
+
+        let serve = daemon.serve_with(
+            &mut signals,
+            &registry,
+            [Service::new("ended", async { Ok::<(), anyhow::Error>(()) })],
+            pending(),
+        );
+        tokio::pin!(serve);
+        assert!(
+            futures::poll!(&mut serve).is_pending(),
+            "the drain must wait for the run in flight"
+        );
+
+        assert!(runs.is_closed(), "a service ending must begin the shutdown");
+        assert!(
+            !registry.is_interrupted(),
+            "a service ending must let the agent CLIs run while the drain waits for their runs"
         );
     }
 
