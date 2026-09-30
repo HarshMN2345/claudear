@@ -1317,6 +1317,6 @@ max_entries = 10
 team_user_ids = []
 team_role_ids = []
 
-# Forum tag names that mark a thread solved. Titles starting with [SOLVED],
+# Forum tag names that mark a thread solved. Titles starting with [SOLVED], [SOLVE],
 # [CLOSED], [FIXED] or [RESOLVED] also count.
 solved_tags = ["solved", "resolved"]
