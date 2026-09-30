@@ -111,12 +111,17 @@ impl RunProfile {
 }
 
 /// Claudear's own `CLAUDEAR_*` variables among `env` and the daemon's
-/// environment, which a spawned CLI inherits unless they are removed.
+/// environment, which a spawned CLI inherits unless they are removed. The run
+/// marker is never one of them: without it, the processes a run leaves outside
+/// its process group could not be found and killed.
 fn claudear_variables(env: &HashMap<String, String>) -> BTreeSet<OsString> {
     env.keys()
         .map(OsString::from)
         .chain(std::env::vars_os().map(|(name, _)| name))
-        .filter(|name| name.to_string_lossy().starts_with(CLAUDEAR_VARIABLE_PREFIX))
+        .filter(|name| {
+            name.to_string_lossy().starts_with(CLAUDEAR_VARIABLE_PREFIX)
+                && name != process_group::MARKER_VARIABLE
+        })
         .collect()
 }
 
@@ -1018,7 +1023,7 @@ The PR title should include the issue ID: {}
     /// Render matched MCP servers into a private temp file (claudear-mcp-*.json,
     /// 0600 on Unix) passed to the CLI via --mcp-config and deleted when the handle
     /// drops. `${VAR}` in env is expanded by the CLI from the run's environment,
-    /// so a live-QA run cannot expand `${CLAUDEAR_*}`.
+    /// so a live-QA run cannot expand Claudear's own `${CLAUDEAR_*}` variables.
     fn render_mcp_config(
         servers: &[(&String, &McpServerConfig)],
     ) -> std::io::Result<tempfile::NamedTempFile> {
@@ -4167,7 +4172,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
 
         let inherited: Vec<&String> = environment
             .keys()
-            .filter(|name| name.starts_with(DOCUMENTED_CLAUDEAR_PREFIX))
+            .filter(|name| {
+                name.starts_with(DOCUMENTED_CLAUDEAR_PREFIX) && name.as_str() != MARKER_VARIABLE
+            })
             .collect();
         assert!(
             inherited.is_empty(),
@@ -4178,6 +4185,46 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"%s"}\n' 
                 .values()
                 .any(|value| value.contains(FAKE_CLAUDEAR_CREDENTIAL)),
             "a Claudear credential reached the live-QA agent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_live_qa_run_keeps_its_run_marker() {
+        let environment = stub_run_environment(RunProfile::LiveQa);
+
+        assert!(
+            environment
+                .get(MARKER_VARIABLE)
+                .is_some_and(|marker| !marker.is_empty()),
+            "the live-QA agent lost {MARKER_VARIABLE}, so its leftover processes cannot be found"
+        );
+        for name in [MASTER_KEY_VARIABLE, DISCORD_BOT_TOKEN_VARIABLE] {
+            assert!(
+                !environment.contains_key(name),
+                "the live-QA agent inherited {name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_claudear_variables_leave_out_the_run_marker() {
+        let withheld = claudear_variables(&HashMap::from([
+            (MARKER_VARIABLE.to_string(), String::new()),
+            (
+                MASTER_KEY_VARIABLE.to_string(),
+                FAKE_CLAUDEAR_CREDENTIAL.to_string(),
+            ),
+        ]));
+
+        assert!(
+            !withheld.contains(&OsString::from(MARKER_VARIABLE)),
+            "{MARKER_VARIABLE} was withheld along with Claudear's own variables"
+        );
+        assert!(
+            withheld.contains(&OsString::from(MASTER_KEY_VARIABLE)),
+            "{MASTER_KEY_VARIABLE} was not withheld"
         );
     }
 
