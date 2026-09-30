@@ -1306,7 +1306,7 @@ channel_id = ""
 # Only threads active in the last N days (default: 14)
 days = 14
 
-# How often to scan, in hours (default: 1.0, 0 = disable)
+# How often to scan, in hours (default: 1.0, 0 = disable, at most 8760)
 interval_hours = 1.0
 
 # How many needs-reply threads to post (default: 10, at most 10)

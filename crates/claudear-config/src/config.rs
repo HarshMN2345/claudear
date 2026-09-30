@@ -740,7 +740,7 @@ pub struct SupportDigestConfig {
     pub channel_id: String,
     /// Only threads active in the last N days (default: 14).
     pub days: i64,
-    /// How often to scan, in hours (default: 1.0, 0 = disable).
+    /// How often to scan, in hours (default: 1.0, 0 = disable, at most 8760).
     pub interval_hours: f64,
     /// How many needs-reply threads to post (default: 10, at most 10).
     pub max_entries: usize,
@@ -750,6 +750,31 @@ pub struct SupportDigestConfig {
     pub team_role_ids: Vec<String>,
     /// Forum tag names that mark a thread solved (case-insensitive).
     pub solved_tags: Vec<String>,
+}
+
+impl SupportDigestConfig {
+    /// Longest allowed scan interval: one year.
+    pub const MAX_INTERVAL_HOURS: f64 = 24.0 * 365.0;
+
+    /// Validate the scan interval and activity window.
+    pub fn validate(&self) -> Result<()> {
+        if !self.interval_hours.is_finite()
+            || !(0.0..=Self::MAX_INTERVAL_HOURS).contains(&self.interval_hours)
+        {
+            return Err(Error::config(format!(
+                "reports.support_digest.interval_hours must be between 0 and {}, got {}",
+                Self::MAX_INTERVAL_HOURS,
+                self.interval_hours
+            )));
+        }
+        if self.days < 1 {
+            return Err(Error::config(format!(
+                "reports.support_digest.days must be at least 1, got {}",
+                self.days
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for SupportDigestConfig {
@@ -3429,6 +3454,10 @@ impl Config {
 
         if self.deploy_qa.enabled {
             self.deploy_qa.validate()?;
+        }
+
+        if self.reports.support_digest.enabled {
+            self.reports.support_digest.validate()?;
         }
 
         let has_github_token = self

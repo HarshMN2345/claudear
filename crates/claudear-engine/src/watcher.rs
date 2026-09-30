@@ -2519,7 +2519,8 @@ Create a PR with your changes.{custom_instructions}"#,
         if hours <= 0.0 {
             return None;
         }
-        Some(std::time::Duration::from_secs_f64(hours * 3600.0))
+        // Config validation bounds the interval; never panic on a bad one.
+        std::time::Duration::try_from_secs_f64(hours * 3600.0).ok()
     }
 
     /// Rank the Discord support forum and send the digest when a thread that

@@ -134,8 +134,22 @@ static ALSO_AFFECTED: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid pattern")
 });
 
-static THANKS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(thanks?|thank you|thx|ty|solved|fixed|works now|it works|working now|resolved|figured it out)\b")
+static FIXED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(solved|fixed|works now|it works|working now|resolved|figured it out|sorted)\b",
+    )
+    .expect("valid pattern")
+});
+
+// Bare thanks only reads as resolved in a short message ("thanks!", "ty that
+// was it"); longer ones are usually thanks for looking.
+static THANKS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(thanks?|thank you|thx|ty)\b").expect("valid pattern"));
+const SHORT_THANKS_WORDS: usize = 6;
+
+// The poster promises a next step, so the thread is still open.
+static FOLLOW_UP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(tomorrow|later|(will|i['’]?ll|going to) (send|share|try|test|check|update|get back|post)|get back to you)\b")
         .expect("valid pattern")
 });
 
@@ -161,6 +175,15 @@ pub fn is_solved(title: &str, tags: &[String], solved_tags: &[String]) -> bool {
         || tags
             .iter()
             .any(|tag| solved_tags.iter().any(|s| s.eq_ignore_ascii_case(tag)))
+}
+
+/// Whether a poster's message reads like the problem is gone.
+fn reads_fixed(text: &str) -> bool {
+    if STILL_BROKEN.is_match(text) || FOLLOW_UP.is_match(text) {
+        return false;
+    }
+    FIXED.is_match(text)
+        || (THANKS.is_match(text) && text.split_whitespace().count() <= SHORT_THANKS_WORDS)
 }
 
 fn excerpt(text: &str, length: usize) -> String {
@@ -214,11 +237,7 @@ impl SupportThread {
         {
             reasons.push(format!("team replied last, {}d ago", waiting_hours / 24));
             SupportStatus::WaitingOnUser
-        } else if last_speaker == Speaker::Op
-            && replies > 0
-            && THANKS.is_match(&last.content)
-            && !STILL_BROKEN.is_match(&last.content)
-        {
+        } else if last_speaker == Speaker::Op && replies > 0 && reads_fixed(&last.content) {
             reasons.push("poster's last message reads like it is fixed".to_string());
             SupportStatus::LikelyResolved
         } else {

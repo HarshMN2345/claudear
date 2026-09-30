@@ -1,13 +1,15 @@
 //! Collects Discord support forum threads and ranks them for the support digest.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use chrono::{DateTime, Duration, Utc};
 
 use claudear_config::{Config, SupportDigestConfig};
 use claudear_core::error::{Error, Result};
-use claudear_integrations::discord::{DiscordClient, DiscordThread};
+use claudear_integrations::discord::{DiscordClient, DiscordMessage, DiscordThread};
 use claudear_integrations::reports::{
     is_solved, SupportDigest, SupportMessage, SupportStatus, SupportThread,
 };
@@ -21,14 +23,26 @@ const RESOLVED_LIMIT: usize = 5;
 /// Pause between thread reads; the Discord client does not retry 429s.
 const READ_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Most message pages read per thread (1000 messages). Longer threads are
+/// ranked on their newest messages.
+const MAX_PAGES: usize = 10;
+
+/// How long a team role lookup is trusted before it is read again.
+const ROLE_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// File, next to the database, that keeps the last sent digest across restarts.
+const SENT_FILE: &str = "support_digest_sent.json";
+
 /// Reads the support forum and builds [`SupportDigest`]s.
 pub struct SupportDigestOrchestrator {
     client: DiscordClient,
     config: SupportDigestConfig,
-    /// Whether an author holds a team role, looked up once per process.
-    team_roles: Mutex<HashMap<String, bool>>,
+    /// Whether an author holds a team role, and when that was looked up.
+    team_roles: Mutex<HashMap<String, (bool, Instant)>>,
     /// Needs-reply threads listed in the last digest that was sent.
     sent: Mutex<HashSet<String>>,
+    /// Where `sent` is saved; `None` for an in-memory database.
+    sent_path: Option<PathBuf>,
 }
 
 impl SupportDigestOrchestrator {
@@ -58,12 +72,16 @@ impl SupportDigestOrchestrator {
             tracing::warn!("Support digest enabled but missing bot_token or channel_id; skipping");
             return None;
         };
+        let sent_path = (config.db_path.as_os_str() != ":memory:")
+            .then(|| config.db_path.with_file_name(SENT_FILE));
+        let sent = sent_path.as_deref().map(load_sent).unwrap_or_default();
         match DiscordClient::new(token) {
             Ok(client) => Some(Self {
                 client,
                 config: cfg.clone(),
                 team_roles: Mutex::default(),
-                sent: Mutex::default(),
+                sent: Mutex::new(sent),
+                sent_path,
             }),
             Err(e) => {
                 tracing::warn!(error = %e, "Support digest Discord client failed; skipping");
@@ -118,22 +136,15 @@ impl SupportDigestOrchestrator {
             let Some(owner_id) = thread.owner_id.clone() else {
                 continue;
             };
-            tokio::time::sleep(READ_DELAY).await;
-            let messages = match self
-                .client
-                .list_channel_messages(&thread.id, PAGE_LIMIT)
-                .await
-            {
+            let messages = match self.thread_messages(&thread.id).await {
                 Ok(messages) => messages,
                 Err(e) => {
                     tracing::warn!(thread = %thread.id, error = %e, "Failed to read support thread; skipping");
                     continue;
                 }
             };
-            // Discord returns newest first.
             let messages: Vec<SupportMessage> = messages
                 .into_iter()
-                .rev()
                 .filter_map(|message| {
                     let author = message.author.filter(|author| !author.bot)?;
                     let timestamp = DateTime::parse_from_rfc3339(&message.timestamp)
@@ -204,13 +215,51 @@ impl SupportDigestOrchestrator {
         })
     }
 
-    /// Remember which threads a sent digest listed.
+    /// Remember which threads a sent digest listed, on disk too so a restart
+    /// does not announce them again.
     pub fn mark_sent(&self, digest: &SupportDigest) {
-        *self.sent.lock().unwrap() = digest
+        let sent: HashSet<String> = digest
             .needs_reply
             .iter()
             .map(|entry| entry.thread_id.clone())
             .collect();
+        if let Some(path) = &self.sent_path {
+            let json = serde_json::to_string(&sent).unwrap_or_default();
+            if let Err(e) = std::fs::write(path, json) {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to save support digest state");
+            }
+        }
+        *self.sent.lock().unwrap() = sent;
+    }
+
+    /// A thread's messages, oldest first, paging back up to [`MAX_PAGES`].
+    async fn thread_messages(&self, thread_id: &str) -> Result<Vec<DiscordMessage>> {
+        tokio::time::sleep(READ_DELAY).await;
+        // The first page comes newest first; older pages oldest first.
+        let mut messages: Vec<DiscordMessage> = self
+            .client
+            .list_channel_messages(thread_id, PAGE_LIMIT)
+            .await?
+            .into_iter()
+            .rev()
+            .collect();
+        let mut page_len = messages.len();
+        for _ in 1..MAX_PAGES {
+            if page_len < PAGE_LIMIT {
+                break;
+            }
+            let Some(oldest) = messages.first().map(|message| message.id.clone()) else {
+                break;
+            };
+            tokio::time::sleep(READ_DELAY).await;
+            let older = self
+                .client
+                .list_channel_messages_before(thread_id, &oldest, PAGE_LIMIT)
+                .await?;
+            page_len = older.len();
+            messages.splice(0..0, older);
+        }
+        Ok(messages)
     }
 
     /// Configured team user ids plus repliers holding a team role. A failed role
@@ -233,7 +282,13 @@ impl SupportDigestOrchestrator {
             .collect();
 
         for user_id in repliers {
-            let cached = self.team_roles.lock().unwrap().get(user_id).copied();
+            let cached = self
+                .team_roles
+                .lock()
+                .unwrap()
+                .get(user_id)
+                .filter(|(_, at)| at.elapsed() < ROLE_TTL)
+                .map(|(is_team, _)| *is_team);
             let is_team = match cached {
                 Some(is_team) => is_team,
                 None => match self.client.get_member_roles(guild_id, user_id).await {
@@ -246,7 +301,7 @@ impl SupportDigestOrchestrator {
                         self.team_roles
                             .lock()
                             .unwrap()
-                            .insert(user_id.to_string(), is_team);
+                            .insert(user_id.to_string(), (is_team, Instant::now()));
                         is_team
                     }
                     Err(e) => {
@@ -262,4 +317,13 @@ impl SupportDigestOrchestrator {
 
         team
     }
+}
+
+/// Threads listed in the last sent digest, or none when the file is missing or
+/// unreadable.
+fn load_sent(path: &std::path::Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
