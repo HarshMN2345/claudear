@@ -4,7 +4,6 @@ use super::types::{
     CreateMessageParams, CreateThreadParams, DiscordChannel, DiscordMessage, DiscordThread,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use claudear_core::error::{Error, Result};
 use claudear_core::http::HttpResponse;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -479,30 +478,6 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         before: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<DiscordThread>> {
-        self.page_public_archived_threads(channel_id, before, limit, None)
-            .await
-    }
-
-    /// List public archived threads under a channel that were archived at or
-    /// after `since`, newest first.
-    pub async fn list_public_archived_threads_since(
-        &self,
-        channel_id: &str,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<DiscordThread>> {
-        self.page_public_archived_threads(channel_id, None, Some(100), Some(since))
-            .await
-    }
-
-    /// Page archived threads newest first, stopping once a page reaches threads
-    /// archived before `since`.
-    async fn page_public_archived_threads(
-        &self,
-        channel_id: &str,
-        before: Option<&str>,
-        limit: Option<usize>,
-        since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<DiscordThread>> {
         #[derive(serde::Deserialize)]
         struct ThreadsResponse {
             threads: Vec<DiscordThread>,
@@ -557,64 +532,12 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             // Stop when the API says there's no more, the page was empty, or we
             // have no cursor to advance with (avoids an infinite loop).
             match next_before {
-                Some(ts) if page.has_more && !empty && !ts.is_empty() => {
-                    let reached = since.is_some_and(|since| {
-                        DateTime::parse_from_rfc3339(&ts).is_ok_and(|at| at < since)
-                    });
-                    if reached {
-                        break;
-                    }
-                    before = Some(ts)
-                }
+                Some(ts) if page.has_more && !empty && !ts.is_empty() => before = Some(ts),
                 _ => break,
             }
         }
 
-        if let Some(since) = since {
-            all.retain(|thread| {
-                thread
-                    .archive_timestamp()
-                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                    .is_none_or(|at| at >= since)
-            });
-        }
-
         Ok(all)
-    }
-
-    /// Role IDs a user holds in a guild, or `None` when they are not a member.
-    pub async fn get_member_roles(
-        &self,
-        guild_id: &str,
-        user_id: &str,
-    ) -> Result<Option<Vec<String>>> {
-        let url = format!(
-            "{}/guilds/{}/members/{}",
-            DISCORD_API_BASE, guild_id, user_id
-        );
-        let response = self.http.get(&url).await?;
-
-        if response.status == 404 {
-            return Ok(None);
-        }
-        if !response.is_success() {
-            return Err(Error::notifier(
-                "discord",
-                format!(
-                    "Failed to get guild member ({}): {}",
-                    response.status, response.body
-                ),
-            ));
-        }
-
-        #[derive(serde::Deserialize)]
-        struct Member {
-            #[serde(default)]
-            roles: Vec<String>,
-        }
-
-        let member: Member = response.json()?;
-        Ok(Some(member.roles))
     }
 }
 

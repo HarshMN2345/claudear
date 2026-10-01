@@ -724,21 +724,28 @@ pub struct ReportsConfig {
 
 /// Digest of Discord support forum threads that need a reply.
 ///
-/// Scans the forum every `interval_hours`, ranks open threads by how urgently
-/// they need a reply, and posts the ranking to the configured notifier(s) when
-/// a thread enters the top `max_entries`. Report-only — threads are never fed
-/// into the fix pipeline.
+/// Reads the forum from the Appwrite project that the threads bot syncs Discord
+/// into, so Claudear needs no access to the forum itself. Every `interval_hours`
+/// it ranks open threads by how urgently they need a reply and posts the
+/// ranking to the configured notifier(s) when a thread enters the top
+/// `max_entries`. Report-only: nothing is posted to the forum and threads are
+/// never fed into the fix pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SupportDigestConfig {
     /// Whether the digest is enabled (default: false).
     pub enabled: bool,
-    /// Bot token with read access to the forum. Falls back to the notifier/issue
-    /// Discord bot_token when unset.
-    pub bot_token: Option<SecretValue>,
-    /// Forum channel id to scan. The guild is read from the channel.
-    pub channel_id: String,
-    /// Only threads active in the last N days (default: 14).
+    /// Appwrite endpoint of the threads project, e.g. "https://fra.cloud.appwrite.io/v1".
+    pub endpoint: String,
+    /// Appwrite project id of the threads project.
+    pub project_id: String,
+    /// Database holding the `threads`, `messages` and `authors` tables (default: "main").
+    pub database_id: String,
+    /// API key with `rows.read`; only needed when the tables are not public.
+    pub api_key: Option<SecretValue>,
+    /// Discord server id the forum belongs to, used to link threads.
+    pub guild_id: String,
+    /// Only threads active in the last N days (default: 14, at most 365).
     pub days: i64,
     /// How often to scan, in hours (default: 1.0, 0 = disable, at most 8760).
     pub interval_hours: f64,
@@ -746,18 +753,31 @@ pub struct SupportDigestConfig {
     pub max_entries: usize,
     /// Discord user ids whose replies count as the team's.
     pub team_user_ids: Vec<String>,
-    /// Discord role ids whose holders count as team.
-    pub team_role_ids: Vec<String>,
-    /// Forum tag names that mark a thread solved (case-insensitive).
-    pub solved_tags: Vec<String>,
+    /// Discord role names; thread authors holding one count as team (default: ["Core"]).
+    pub team_roles: Vec<String>,
 }
 
 impl SupportDigestConfig {
     /// Longest allowed scan interval: one year.
     pub const MAX_INTERVAL_HOURS: f64 = 24.0 * 365.0;
 
-    /// Validate the scan interval and activity window.
+    /// Longest allowed activity window, in days.
+    pub const MAX_DAYS: i64 = 365;
+
+    /// Validate the threads project and the scan bounds.
     pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("endpoint", &self.endpoint),
+            ("project_id", &self.project_id),
+            ("database_id", &self.database_id),
+            ("guild_id", &self.guild_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "reports.support_digest.{name} is required"
+                )));
+            }
+        }
         if !self.interval_hours.is_finite()
             || !(0.0..=Self::MAX_INTERVAL_HOURS).contains(&self.interval_hours)
         {
@@ -767,9 +787,10 @@ impl SupportDigestConfig {
                 self.interval_hours
             )));
         }
-        if self.days < 1 {
+        if !(1..=Self::MAX_DAYS).contains(&self.days) {
             return Err(Error::config(format!(
-                "reports.support_digest.days must be at least 1, got {}",
+                "reports.support_digest.days must be between 1 and {}, got {}",
+                Self::MAX_DAYS,
                 self.days
             )));
         }
@@ -781,14 +802,16 @@ impl Default for SupportDigestConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bot_token: None,
-            channel_id: String::new(),
+            endpoint: String::new(),
+            project_id: String::new(),
+            database_id: "main".to_string(),
+            api_key: None,
+            guild_id: String::new(),
             days: 14,
             interval_hours: 1.0,
             max_entries: 10,
             team_user_ids: Vec::new(),
-            team_role_ids: Vec::new(),
-            solved_tags: vec!["solved".to_string(), "resolved".to_string()],
+            team_roles: vec!["Core".to_string()],
         }
     }
 }

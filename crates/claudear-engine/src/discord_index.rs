@@ -477,7 +477,6 @@ mod tests {
             guild_id: Some("guild1".to_string()),
             name: Some(format!("name-{id}")),
             parent_id: parent.map(String::from),
-            available_tags: Vec::new(),
         }
     }
 

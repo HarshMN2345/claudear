@@ -1491,6 +1491,9 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     }
 
     async fn notify_support_digest(&self, digest: &SupportDigest) -> Result<bool> {
+        if !self.has_delivery_path() {
+            return Ok(false);
+        }
         let mention = self.get_user_mention();
         let Some(message) = build_support_digest_message(digest, mention) else {
             return Ok(false);

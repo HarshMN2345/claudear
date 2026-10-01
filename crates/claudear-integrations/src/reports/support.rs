@@ -30,7 +30,7 @@ pub enum SupportStatus {
     NeedsReply,
     /// The poster's last message reads like thanks or "fixed".
     LikelyResolved,
-    /// The team replied last.
+    /// The team replied last, or the poster said they'd follow up.
     WaitingOnUser,
 }
 
@@ -136,7 +136,7 @@ static ALSO_AFFECTED: LazyLock<Regex> = LazyLock::new(|| {
 
 static FIXED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\b(solved|fixed|works now|it works|working now|resolved|figured it out|sorted)\b",
+        r"(?i)\b(solved|fixed|works now|it works|working now|resolved|figured it out|sorted|that (worked|did it|fixed it)|you['’]?re (right|correct)|expected results?)\b",
     )
     .expect("valid pattern")
 });
@@ -169,21 +169,20 @@ static SOLVED_TITLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*\[(solved?|closed|fixed|resolved)\]").expect("valid pattern")
 });
 
-/// Whether the thread is marked solved by a forum tag or its title.
-pub fn is_solved(title: &str, tags: &[String], solved_tags: &[String]) -> bool {
+/// Whether the poster marked the thread solved in its title.
+pub fn is_solved(title: &str) -> bool {
     SOLVED_TITLE.is_match(title)
-        || tags
-            .iter()
-            .any(|tag| solved_tags.iter().any(|s| s.eq_ignore_ascii_case(tag)))
 }
 
 /// Whether a poster's message reads like the problem is gone.
 fn reads_fixed(text: &str) -> bool {
-    if STILL_BROKEN.is_match(text) || FOLLOW_UP.is_match(text) {
+    if STILL_BROKEN.is_match(text) {
         return false;
     }
     FIXED.is_match(text)
-        || (THANKS.is_match(text) && text.split_whitespace().count() <= SHORT_THANKS_WORDS)
+        || (THANKS.is_match(text)
+            && !FOLLOW_UP.is_match(text)
+            && text.split_whitespace().count() <= SHORT_THANKS_WORDS)
 }
 
 fn excerpt(text: &str, length: usize) -> String {
@@ -237,9 +236,22 @@ impl SupportThread {
         {
             reasons.push(format!("team replied last, {}d ago", waiting_hours / 24));
             SupportStatus::WaitingOnUser
-        } else if last_speaker == Speaker::Op && replies > 0 && reads_fixed(&last.content) {
+        } else if last_speaker == Speaker::Op
+            && self.messages.len() > 1
+            && reads_fixed(&last.content)
+        {
             reasons.push("poster's last message reads like it is fixed".to_string());
             SupportStatus::LikelyResolved
+        } else if last_speaker == Speaker::Op
+            && replies > 0
+            && FOLLOW_UP.is_match(&last.content)
+            && !STILL_BROKEN.is_match(&last.content)
+        {
+            reasons.push(format!(
+                "poster said they'd follow up, {}d ago",
+                waiting_hours / 24
+            ));
+            SupportStatus::WaitingOnUser
         } else {
             if last_speaker == Speaker::Team {
                 score += 20.0;
