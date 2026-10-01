@@ -755,6 +755,12 @@ pub struct SupportDigestConfig {
     pub team_user_ids: Vec<String>,
     /// Discord role names; thread authors holding one count as team (default: ["Core"]).
     pub team_roles: Vec<String>,
+    /// Write a suggested answer for listed threads to the project's `drafts`
+    /// table, for review in the dashboard (default: false). Needs `api_key`
+    /// with write access.
+    pub drafts: bool,
+    /// Most drafts written per scan (default: 3).
+    pub max_drafts: usize,
 }
 
 impl SupportDigestConfig {
@@ -787,6 +793,16 @@ impl SupportDigestConfig {
                 self.interval_hours
             )));
         }
+        if self.drafts
+            && self
+                .api_key
+                .as_ref()
+                .is_none_or(|key| key.expose().trim().is_empty())
+        {
+            return Err(Error::config(
+                "reports.support_digest.api_key is required when drafts are enabled",
+            ));
+        }
         if !(1..=Self::MAX_DAYS).contains(&self.days) {
             return Err(Error::config(format!(
                 "reports.support_digest.days must be between 1 and {}, got {}",
@@ -812,6 +828,8 @@ impl Default for SupportDigestConfig {
             max_entries: 10,
             team_user_ids: Vec::new(),
             team_roles: vec!["Core".to_string()],
+            drafts: false,
+            max_drafts: 3,
         }
     }
 }

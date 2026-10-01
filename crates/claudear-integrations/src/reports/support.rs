@@ -37,6 +37,7 @@ pub enum SupportStatus {
 /// One message in a support thread.
 #[derive(Debug, Clone)]
 pub struct SupportMessage {
+    pub id: String,
     pub author_id: String,
     pub author: String,
     pub content: String,
@@ -87,6 +88,8 @@ pub struct SupportDigest {
     pub likely_resolved: Vec<SupportEntry>,
     /// Threads where the team replied last.
     pub waiting_on_user: usize,
+    /// Suggested answers waiting for review.
+    pub drafts_to_review: usize,
 }
 
 impl SupportDigest {
@@ -195,6 +198,29 @@ fn excerpt(text: &str, length: usize) -> String {
 }
 
 impl SupportThread {
+    /// The conversation as plain text, oldest first, for the agent to answer.
+    pub fn transcript(&self) -> String {
+        let mut text = format!("Support thread: {}\n", self.title);
+        if !self.tags.is_empty() {
+            text.push_str(&format!("Tags: {}\n", self.tags.join(", ")));
+        }
+        for message in &self.messages {
+            let who = if message.author_id == self.owner_id {
+                " (poster)"
+            } else {
+                ""
+            };
+            text.push_str(&format!(
+                "\n{}{} at {}:\n{}\n",
+                message.author,
+                who,
+                message.timestamp.format("%Y-%m-%d %H:%M UTC"),
+                message.content
+            ));
+        }
+        text
+    }
+
     fn speaker(&self, message: &SupportMessage, team: &HashSet<String>) -> Speaker {
         if message.author_id == self.owner_id {
             Speaker::Op

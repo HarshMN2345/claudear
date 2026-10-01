@@ -1325,3 +1325,12 @@ max_entries = 10
 # who opened a thread, so list most staff here.
 team_user_ids = []
 team_roles = ["Core"]
+
+# Write a suggested answer for listed threads to the project's `drafts` table,
+# using the QA agent with code search (default: false). Admins review, edit and
+# approve them on the dashboard's Support page; the threads project then posts
+# approved answers to the forum. Needs api_key with rows read/write.
+drafts = false
+
+# Most drafts written per scan (default: 3)
+max_drafts = 3

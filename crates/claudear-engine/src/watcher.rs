@@ -4,6 +4,7 @@ use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
+use crate::support_digest::DraftStatus;
 use chrono::{DateTime, Utc};
 use claudear_analysis::deploy_qa::DEPLOY_QA_SOURCE;
 use claudear_analysis::feedback::{FeedbackAnalyzer, IssueEmbeddingService, Outcome};
@@ -22,7 +23,9 @@ use claudear_core::types::{
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
-use claudear_integrations::reports::{ReportFrequency, ReportGenerator, ReportSchedule};
+use claudear_integrations::reports::{
+    ReportFrequency, ReportGenerator, ReportSchedule, SupportDigest, SupportThread,
+};
 use claudear_integrations::runner::{self, AgentRunner};
 use claudear_integrations::scm::{
     PrReviewState, PrStatus, ReviewEvent, ReviewWatcher, ScmProvider,
@@ -2529,7 +2532,18 @@ Create a PR with your changes.{custom_instructions}"#,
         let Some(orchestrator) = self.support_digest.as_ref() else {
             return Ok(());
         };
-        let digest = orchestrator.collect().await?;
+        let (mut digest, threads) = orchestrator.collect().await?;
+
+        if self.config.reports.support_digest.drafts {
+            self.write_support_drafts(orchestrator.store(), &digest, &threads)
+                .await;
+            match orchestrator.store().count_pending_drafts().await {
+                Ok(count) => digest.drafts_to_review = count,
+                Err(e) => {
+                    tracing::warn!(component = "digest", error = %e, "Failed to count support drafts")
+                }
+            }
+        }
 
         if !digest.has_new() {
             tracing::info!(
@@ -2556,6 +2570,96 @@ Create a PR with your changes.{custom_instructions}"#,
             );
         }
         Ok(())
+    }
+
+    /// Write a suggested answer for the digest's threads whose draft is missing
+    /// or older than their latest message, trying at most `max_drafts` per scan.
+    /// Drafts a reviewer already approved are left alone.
+    async fn write_support_drafts(
+        &self,
+        store: &crate::support_digest::ThreadsStore,
+        digest: &SupportDigest,
+        threads: &[SupportThread],
+    ) {
+        let mut attempts = 0;
+        for entry in &digest.needs_reply {
+            if attempts >= self.config.reports.support_digest.max_drafts {
+                break;
+            }
+            let Some(thread) = threads.iter().find(|thread| thread.id == entry.thread_id) else {
+                continue;
+            };
+            let latest = thread.messages.last().map(|message| message.id.as_str());
+            match store.draft(&thread.id).await {
+                Ok(Some(draft))
+                    if draft.status == DraftStatus::Approved
+                        || draft.answered_message_id.as_deref() == latest =>
+                {
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(component = "digest", thread = %thread.id, error = %e, "Failed to read support draft");
+                    continue;
+                }
+            }
+
+            attempts += 1;
+            let saved = match self.answer_support_thread(thread).await {
+                Ok(answer) => store.save_draft(thread, &answer).await,
+                Err(e) => Err(e),
+            };
+            match saved {
+                Ok(()) => {
+                    tracing::info!(component = "digest", thread = %thread.id, "Wrote support draft")
+                }
+                Err(e) => {
+                    tracing::warn!(component = "digest", thread = %thread.id, error = %e, "Failed to write support draft")
+                }
+            }
+        }
+    }
+
+    /// Ask the QA agent to answer a support thread, grounded in code search
+    /// and indexed Discord discussions. Read-only: nothing is posted.
+    async fn answer_support_thread(&self, thread: &SupportThread) -> Result<String> {
+        let mut issue = Issue::new(
+            &thread.id,
+            &thread.id,
+            &thread.title,
+            &thread.url,
+            "discord",
+        );
+        issue.description = Some(thread.transcript());
+
+        let query = claudear_analysis::repo::code_index::build_code_search_query(&issue);
+        let limit = self.config.qa.max_context_chunks;
+        let mut context = String::new();
+        if let Some(code_search) = &self.code_search_service {
+            if let Ok(results) = code_search.search(&query, None, limit).await {
+                context = claudear_analysis::repo::code_index::format_code_search_context(&results);
+            }
+        }
+        if let Some(discord_search) = &self.discord_search_service {
+            if let Ok(results) = discord_search.search(&query, None, limit).await {
+                if !results.is_empty() {
+                    context.push('\n');
+                    context.push_str(
+                        &claudear_analysis::knowledgebase::format_discord_search_context(&results),
+                    );
+                }
+            }
+        }
+
+        let scratch = std::env::temp_dir().join("claudear-qa");
+        let _ = std::fs::create_dir_all(&scratch);
+        let agent = self.qa_agent.as_ref().unwrap_or(&self.agent);
+        let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
+        tokio::time::timeout(timeout, agent.answer_question(&issue, &context, &scratch))
+            .await
+            .map_err(|_| {
+                claudear_core::error::Error::Other("Support answer timed out".to_string())
+            })?
     }
 
     /// Build and send the weekly digest of repetitive, non-actionable Sentry

@@ -1277,10 +1277,19 @@ pub(crate) fn build_support_digest_message(
                 if digest.needs_reply_total == 1 { "s" } else { "" },
             )),
             description: Some(format!(
-                "Active in the last {} days \u{00B7} {} look resolved \u{00B7} {} waiting on the user",
+                "Active in the last {} days \u{00B7} {} look resolved \u{00B7} {} waiting on the user{}",
                 digest.days,
                 digest.likely_resolved.len(),
-                digest.waiting_on_user
+                digest.waiting_on_user,
+                if digest.drafts_to_review > 0 {
+                    format!(
+                        " \u{00B7} {} draft{} to review in the dashboard",
+                        digest.drafts_to_review,
+                        if digest.drafts_to_review == 1 { "" } else { "s" }
+                    )
+                } else {
+                    String::new()
+                }
             )),
             url: None,
             color: Some(0x3498db), // Blue
