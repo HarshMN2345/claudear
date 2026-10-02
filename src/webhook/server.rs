@@ -50,6 +50,9 @@ pub(crate) struct AppState {
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub(crate) code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
     pub(crate) discord_search_service: Option<Arc<crate::knowledgebase::DiscordSearchService>>,
+    /// Cloudflare Access verifier for `/mcp`, built when
+    /// `[mcp_server].require_cloudflare_access` is set.
+    pub(crate) mcp_cf_verifier: Option<Arc<super::cf_access::CfAccessVerifier>>,
     #[allow(dead_code)]
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     review_watcher: Option<Arc<ReviewWatcher>>,
@@ -237,6 +240,26 @@ impl WebhookServer {
             None
         };
 
+        // Build the Cloudflare Access verifier up front when MCP requires it, so
+        // the JWKS cache is shared across requests.
+        let mcp_cf_verifier = if self.config.mcp_server.enabled
+            && self.config.mcp_server.require_cloudflare_access
+        {
+            let verifier =
+                super::cf_access::CfAccessVerifier::new(&self.config.mcp_server.cf_access);
+            if verifier.is_configured() {
+                Some(Arc::new(verifier))
+            } else {
+                tracing::warn!(
+                    "mcp_server.require_cloudflare_access is set but cf_access.team_domain/audience \
+                     are empty; MCP requests will be rejected until configured"
+                );
+                Some(Arc::new(verifier))
+            }
+        } else {
+            None
+        };
+
         let state = Arc::new(AppState {
             agent: self.agent,
             config: self.config,
@@ -249,6 +272,7 @@ impl WebhookServer {
             issue_embedding_service: self.issue_embedding_service,
             code_search_service: self.code_search_service,
             discord_search_service: self.discord_search_service,
+            mcp_cf_verifier,
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             review_watcher: self.review_watcher,
             user_registry,
@@ -263,14 +287,12 @@ impl WebhookServer {
         // Combined with the processing set, this provides effective rate control
         let concurrency_layer = ConcurrencyLimitLayer::new(10);
 
-        let mut webhook_routes = Router::new()
-            .route("/health", get(health_handler))
-            .route(
-                "/webhook/{source}",
-                get(webhook_verify_handler)
-                    .post(webhook_handler)
-                    .layer(concurrency_layer),
-            );
+        let mut webhook_routes = Router::new().route("/health", get(health_handler)).route(
+            "/webhook/{source}",
+            get(webhook_verify_handler)
+                .post(webhook_handler)
+                .layer(concurrency_layer),
+        );
 
         // Mount the built-in MCP search server on the same port when enabled.
         // It exposes the existing code/Discord search services as MCP tools over
@@ -1530,6 +1552,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -1573,6 +1596,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -1614,6 +1638,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -1689,6 +1714,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -1739,6 +1765,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -1811,6 +1838,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -1893,6 +1921,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -1947,6 +1976,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2002,6 +2032,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2053,6 +2084,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2126,6 +2158,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2254,6 +2287,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2368,6 +2402,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2454,6 +2489,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2490,6 +2526,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2524,6 +2561,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2555,6 +2593,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2585,6 +2624,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -2856,6 +2896,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3614,6 +3655,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3655,6 +3697,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3697,6 +3740,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -3851,6 +3895,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4148,6 +4193,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4280,6 +4326,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4334,6 +4381,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4475,6 +4523,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4569,6 +4618,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -4606,6 +4656,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5055,6 +5106,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5236,6 +5288,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5278,6 +5331,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5319,6 +5373,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5360,6 +5415,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5401,6 +5457,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5442,6 +5499,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5483,6 +5541,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5528,6 +5587,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5572,6 +5632,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5623,6 +5684,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5713,6 +5775,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5745,6 +5808,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5882,6 +5946,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -5941,6 +6006,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6316,6 +6382,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6492,6 +6559,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6523,6 +6591,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6722,6 +6791,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
@@ -6994,6 +7064,7 @@ mod tests {
             issue_embedding_service: None,
             code_search_service: None,
             discord_search_service: None,
+            mcp_cf_verifier: None,
             feedback_analyzer: tokio::sync::Mutex::new(FeedbackAnalyzer::new()),
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),

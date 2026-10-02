@@ -15,6 +15,7 @@
 //! surfaced here. Adding a new tool is a matter of extending `tool_definitions`
 //! and `call_tool`.
 
+use super::cf_access::CfAccessVerifier;
 use super::server::AppState;
 use crate::config::McpSearchServerConfig;
 use crate::knowledgebase::DiscordSearchService;
@@ -26,7 +27,18 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
+
+/// Header Cloudflare Access sets with its signed identity JWT.
+const CF_ACCESS_HEADER: &str = "cf-access-jwt-assertion";
+
+/// Hex-encoded SHA-256 of a personal access token, matching what storage holds.
+pub(crate) fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 /// Protocol versions this handler implements. The newest (first) is advertised
 /// when a client requests a version we do not recognise.
@@ -94,6 +106,31 @@ pub(crate) async fn mcp_post_handler(
             .into_response();
     }
 
+    // Enforce that the request transited Cloudflare Access (e.g. WARP) when
+    // required, before any token/tool work.
+    if cfg.require_cloudflare_access {
+        if let Err(resp) =
+            enforce_cloudflare_access(&headers, state.mcp_cf_verifier.as_deref()).await
+        {
+            return resp;
+        }
+    }
+
+    // Require a per-user personal access token when configured, and identify the
+    // caller for attribution.
+    if cfg.require_auth {
+        match authenticate_bearer(&headers, state.tracker.as_ref()) {
+            Ok(user) => {
+                tracing::info!(
+                    component = "mcp",
+                    user = %user.email,
+                    "Authenticated MCP request"
+                );
+            }
+            Err(resp) => return resp,
+        }
+    }
+
     let ctx = McpContext {
         cfg,
         code_search: state.code_search_service.as_deref(),
@@ -113,11 +150,7 @@ async fn process_post(ctx: &McpContext<'_>, body: &[u8]) -> PostOutcome {
     let request: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(e) => {
-            return PostOutcome::Json(rpc_error(
-                Value::Null,
-                -32700,
-                format!("Parse error: {e}"),
-            ));
+            return PostOutcome::Json(rpc_error(Value::Null, -32700, format!("Parse error: {e}")));
         }
     };
 
@@ -164,12 +197,102 @@ fn origin_allowed(allowed: &[String], origin: Option<&str>) -> bool {
     }
 }
 
+/// Build a `401 Unauthorized` JSON-RPC response advertising Bearer auth.
+fn unauthorized(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(rpc_error(Value::Null, -32001, message.to_string())),
+    )
+        .into_response()
+}
+
+/// Build a `403 Forbidden` JSON-RPC response.
+fn forbidden(message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(rpc_error(Value::Null, -32001, message.to_string())),
+    )
+        .into_response()
+}
+
+/// Extract the `Authorization: Bearer <token>` value, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// Resolve the per-user token on the request to its owner, or return a ready
+/// `401` response.
+// The error is a full axum Response, which is large by nature; that is fine for
+// a per-request auth gate.
+#[allow(clippy::result_large_err)]
+fn authenticate_bearer(
+    headers: &HeaderMap,
+    tracker: &dyn FixAttemptTracker,
+) -> Result<claudear_storage::UserRow, Response> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(unauthorized(
+            "Missing bearer token. Create one in the portal and send it as Authorization: Bearer <token>.",
+        ));
+    };
+    match tracker.get_user_by_api_token_hash(&hash_token(token)) {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => Err(unauthorized("Invalid or expired token")),
+        Err(e) => {
+            tracing::error!(component = "mcp", error = %e, "Token lookup failed");
+            Err(unauthorized("Token verification failed"))
+        }
+    }
+}
+
+/// Verify the Cloudflare Access JWT on the request, or return a ready `403`.
+#[allow(clippy::result_large_err)]
+async fn enforce_cloudflare_access(
+    headers: &HeaderMap,
+    verifier: Option<&CfAccessVerifier>,
+) -> Result<(), Response> {
+    let Some(verifier) = verifier else {
+        return Err(forbidden(
+            "Cloudflare Access is required but not configured on the server",
+        ));
+    };
+    let Some(jwt) = headers.get(CF_ACCESS_HEADER).and_then(|v| v.to_str().ok()) else {
+        return Err(forbidden(
+            "Missing Cloudflare Access assertion; request must transit Cloudflare Access",
+        ));
+    };
+    match verifier.verify(jwt).await {
+        Ok(claims) => {
+            tracing::debug!(
+                component = "mcp",
+                principal = %claims.principal(),
+                "Cloudflare Access verified"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(component = "mcp", error = %e, "Cloudflare Access verification failed");
+            Err(forbidden("Invalid Cloudflare Access assertion"))
+        }
+    }
+}
+
 /// Resolve the protocol version to advertise: echo the client's request when we
 /// support it, otherwise fall back to our newest supported version so the client
 /// can decide whether to proceed.
 fn negotiate_version(requested: Option<&str>) -> &'static str {
     requested
-        .and_then(|v| SUPPORTED_PROTOCOL_VERSIONS.iter().copied().find(|s| *s == v))
+        .and_then(|v| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .copied()
+                .find(|s| *s == v)
+        })
         .unwrap_or(DEFAULT_PROTOCOL_VERSION)
 }
 
@@ -282,7 +405,9 @@ async fn call_tool(ctx: &McpContext<'_>, params: &Value) -> Result<Value, ToolEr
 
 async fn code_search(ctx: &McpContext<'_>, args: &Value) -> Value {
     let Some(service) = ctx.code_search else {
-        return tool_error("Code search is unavailable (code indexing or embeddings not configured).");
+        return tool_error(
+            "Code search is unavailable (code indexing or embeddings not configured).",
+        );
     };
     let Some(query) = str_arg(args, "query") else {
         return tool_error("Missing required argument: query");
@@ -346,7 +471,9 @@ async fn discord_search(ctx: &McpContext<'_>, args: &Value) -> Value {
         Ok(results) if results.is_empty() => {
             tool_text("No relevant Discord discussions found.".to_string())
         }
-        Ok(results) => tool_text(crate::knowledgebase::format_discord_search_context(&results)),
+        Ok(results) => tool_text(crate::knowledgebase::format_discord_search_context(
+            &results,
+        )),
         Err(e) => tool_error(&format!("Discord search failed: {e}")),
     }
 }
@@ -482,7 +609,7 @@ fn tool_error(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::SqliteTracker;
+    use crate::storage::{SqliteTracker, UserStore};
     use claudear_core::types::{CodeChunk, CodeSearchResult, CodeSymbol, Language, SymbolKind};
 
     fn cfg(expose_code: bool, expose_discord: bool) -> McpSearchServerConfig {
@@ -554,7 +681,10 @@ mod tests {
         assert_eq!(negotiate_version(Some("2025-06-18")), "2025-06-18");
         assert_eq!(negotiate_version(Some("2024-11-05")), "2024-11-05");
         // Unknown or missing versions fall back to the newest supported one.
-        assert_eq!(negotiate_version(Some("1999-01-01")), DEFAULT_PROTOCOL_VERSION);
+        assert_eq!(
+            negotiate_version(Some("1999-01-01")),
+            DEFAULT_PROTOCOL_VERSION
+        );
         assert_eq!(negotiate_version(None), DEFAULT_PROTOCOL_VERSION);
     }
 
@@ -814,6 +944,54 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unavailable"));
+    }
+
+    #[test]
+    fn hash_token_is_stable_and_distinct() {
+        assert_eq!(hash_token("cldr_abc"), hash_token("cldr_abc"));
+        assert_ne!(hash_token("cldr_abc"), hash_token("cldr_xyz"));
+        // 32-byte SHA-256 -> 64 hex chars.
+        assert_eq!(hash_token("x").len(), 64);
+    }
+
+    #[test]
+    fn bearer_token_parsing() {
+        let mut h = HeaderMap::new();
+        assert_eq!(bearer_token(&h), None);
+        h.insert(header::AUTHORIZATION, "Bearer   tok123  ".parse().unwrap());
+        assert_eq!(bearer_token(&h), Some("tok123"));
+        h.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert_eq!(bearer_token(&h), None);
+    }
+
+    #[test]
+    fn authenticate_bearer_resolves_created_token() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("dev@example.com", "hash", "Dev", "viewer")
+            .unwrap();
+        // Mint a token the way the API does: store its hash + prefix.
+        let secret = "cldr_secret_value";
+        tracker
+            .create_api_token(user_id, "laptop", &hash_token(secret), "cldr_secr", None)
+            .unwrap();
+
+        // No header -> 401.
+        assert!(authenticate_bearer(&HeaderMap::new(), &tracker).is_err());
+
+        // Wrong token -> 401.
+        let mut bad = HeaderMap::new();
+        bad.insert(header::AUTHORIZATION, "Bearer nope".parse().unwrap());
+        assert!(authenticate_bearer(&bad, &tracker).is_err());
+
+        // Correct token -> the owning user.
+        let mut good = HeaderMap::new();
+        good.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {secret}").parse().unwrap(),
+        );
+        let user = authenticate_bearer(&good, &tracker).expect("valid token");
+        assert_eq!(user.email, "dev@example.com");
     }
 
     #[tokio::test]
