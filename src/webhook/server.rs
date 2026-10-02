@@ -1253,6 +1253,7 @@ mod tests {
             qa: crate::config::QaConfig::default(),
             knowledgebase: crate::config::KnowledgebasesConfig::default(),
             reports: crate::config::ReportsConfig::default(),
+            mcp_server: crate::config::McpSearchServerConfig::default(),
         }
     }
 

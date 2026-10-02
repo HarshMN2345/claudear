@@ -85,7 +85,10 @@ pub(crate) async fn mcp_post_handler(
     let response = match method {
         "initialize" => rpc_result(id, initialize_result(&params)),
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, json!({ "tools": tool_definitions(&state) })),
+        "tools/list" => rpc_result(
+            id,
+            json!({ "tools": tool_definitions(&state.config.mcp_server) }),
+        ),
         "tools/call" => match call_tool(&state, &params).await {
             Ok(result) => rpc_result(id, result),
             Err(ToolError::Protocol { code, message }) => rpc_error(id, code, message),
@@ -116,8 +119,7 @@ fn initialize_result(params: &Value) -> Value {
 }
 
 /// Build the list of exposed tools based on configuration.
-fn tool_definitions(state: &AppState) -> Vec<Value> {
-    let cfg = &state.config.mcp_server;
+fn tool_definitions(cfg: &crate::config::McpSearchServerConfig) -> Vec<Value> {
     let mut tools = Vec::new();
 
     if cfg.expose_code {
@@ -404,4 +406,184 @@ fn tool_error(message: &str) -> Value {
         "content": [{ "type": "text", "text": message }],
         "isError": true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claudear_core::types::{
+        CodeChunk, CodeSearchResult, CodeSymbol, Language, SymbolKind,
+    };
+
+    fn cfg(expose_code: bool, expose_discord: bool) -> crate::config::McpSearchServerConfig {
+        crate::config::McpSearchServerConfig {
+            enabled: true,
+            expose_code,
+            expose_discord,
+            ..Default::default()
+        }
+    }
+
+    fn tool_names(tools: &[Value]) -> Vec<String> {
+        tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tool_definitions_respect_toggles() {
+        let all = tool_names(&tool_definitions(&cfg(true, true)));
+        assert_eq!(all, vec!["code_search", "find_symbol", "discord_search"]);
+
+        let code_only = tool_names(&tool_definitions(&cfg(true, false)));
+        assert_eq!(code_only, vec!["code_search", "find_symbol"]);
+
+        let discord_only = tool_names(&tool_definitions(&cfg(false, true)));
+        assert_eq!(discord_only, vec!["discord_search"]);
+
+        assert!(tool_definitions(&cfg(false, false)).is_empty());
+    }
+
+    #[test]
+    fn tool_definitions_have_valid_schemas() {
+        for tool in tool_definitions(&cfg(true, true)) {
+            assert!(tool["name"].is_string());
+            assert!(tool["description"].is_string());
+            assert_eq!(tool["inputSchema"]["type"], "object");
+            assert!(tool["inputSchema"]["required"].is_array());
+        }
+    }
+
+    #[test]
+    fn initialize_echoes_requested_protocol_version() {
+        let result = initialize_result(&json!({ "protocolVersion": "2024-11-05" }));
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["serverInfo"]["name"], "claudear-search");
+        assert!(result["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn initialize_falls_back_to_default_version() {
+        assert_eq!(
+            initialize_result(&json!({}))["protocolVersion"],
+            DEFAULT_PROTOCOL_VERSION
+        );
+        // An empty string should not be echoed back.
+        assert_eq!(
+            initialize_result(&json!({ "protocolVersion": "" }))["protocolVersion"],
+            DEFAULT_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn rpc_envelopes_are_well_formed() {
+        let ok = rpc_result(json!(1), json!({ "x": 2 }));
+        assert_eq!(ok["jsonrpc"], "2.0");
+        assert_eq!(ok["id"], 1);
+        assert_eq!(ok["result"]["x"], 2);
+        assert!(ok.get("error").is_none());
+
+        let err = rpc_error(json!("abc"), -32601, "nope".to_string());
+        assert_eq!(err["id"], "abc");
+        assert_eq!(err["error"]["code"], -32601);
+        assert_eq!(err["error"]["message"], "nope");
+        assert!(err.get("result").is_none());
+    }
+
+    #[test]
+    fn tool_result_helpers_set_error_flag() {
+        let ok = tool_text("hi".to_string());
+        assert_eq!(ok["content"][0]["type"], "text");
+        assert_eq!(ok["content"][0]["text"], "hi");
+        assert!(ok.get("isError").is_none());
+
+        let err = tool_error("boom");
+        assert_eq!(err["isError"], true);
+        assert_eq!(err["content"][0]["text"], "boom");
+    }
+
+    #[test]
+    fn str_arg_trims_and_rejects_blank() {
+        let args = json!({ "query": "  hello  ", "blank": "   ", "n": 3 });
+        assert_eq!(str_arg(&args, "query"), Some("hello"));
+        assert_eq!(str_arg(&args, "blank"), None);
+        assert_eq!(str_arg(&args, "missing"), None);
+        assert_eq!(str_arg(&args, "n"), None);
+    }
+
+    #[test]
+    fn usize_arg_parses_only_unsigned() {
+        let args = json!({ "limit": 5, "neg": -1, "s": "7" });
+        assert_eq!(usize_arg(&args, "limit"), Some(5));
+        assert_eq!(usize_arg(&args, "neg"), None);
+        assert_eq!(usize_arg(&args, "s"), None);
+        assert_eq!(usize_arg(&args, "missing"), None);
+    }
+
+    #[test]
+    fn truncate_respects_utf8_boundaries() {
+        assert_eq!(truncate_on_boundary("short", 10), "short");
+        // 'é' is two bytes; truncating at a byte that splits it must step back.
+        let s = "a".to_string() + &"é".repeat(10);
+        let out = truncate_on_boundary(&s, 5);
+        assert!(out.ends_with("(truncated)"));
+        // The kept prefix must be valid UTF-8 (no panic building `out`).
+        assert!(out.starts_with('a'));
+    }
+
+    fn chunk() -> CodeChunk {
+        CodeChunk {
+            id: Some(1),
+            repo_id: 1,
+            file_path: "src/lib.rs".to_string(),
+            chunk_type: "function".to_string(),
+            symbol_name: Some("do_thing".to_string()),
+            language: Language::Rust,
+            start_line: 10,
+            end_line: 20,
+            chunk_text: "fn do_thing() {}".to_string(),
+            context_text: String::new(),
+            file_hash: "h".to_string(),
+            content_hash: None,
+        }
+    }
+
+    #[test]
+    fn format_code_results_renders_matches() {
+        assert_eq!(format_code_results(&[]), "No matching code found.");
+
+        let results = vec![CodeSearchResult {
+            chunk: chunk(),
+            score: 0.9321,
+        }];
+        let out = format_code_results(&results);
+        assert!(out.contains("src/lib.rs:10-20"));
+        assert!(out.contains("93% match"));
+        assert!(out.contains("do_thing"));
+        assert!(out.contains("fn do_thing()"));
+    }
+
+    #[test]
+    fn format_symbols_renders_matches() {
+        assert_eq!(format_symbols(&[]), "No matching symbols found.");
+
+        let symbols = vec![CodeSymbol {
+            id: Some(1),
+            repo_id: 1,
+            file_path: "src/lib.rs".to_string(),
+            symbol_name: "do_thing".to_string(),
+            symbol_kind: SymbolKind::Function,
+            parent_symbol: Some("Thing".to_string()),
+            language: Language::Rust,
+            start_line: 10,
+            end_line: 20,
+            signature: Some("fn do_thing()".to_string()),
+        }];
+        let out = format_symbols(&symbols);
+        assert!(out.contains("**do_thing** (function)"));
+        assert!(out.contains("src/lib.rs:10-20"));
+        assert!(out.contains("in `Thing`"));
+        assert!(out.contains("fn do_thing()"));
+    }
 }
