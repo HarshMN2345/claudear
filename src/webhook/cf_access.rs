@@ -24,10 +24,18 @@ use crate::config::CloudflareAccessConfig;
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, DecodingKey, Validation};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// How long a fetched JWKS is trusted before a refresh is forced.
 const JWKS_TTL: Duration = Duration::from_secs(3600);
+
+/// Minimum spacing between outbound JWKS fetches. Bounds the work an
+/// unauthenticated caller can trigger by presenting tokens with unknown key ids
+/// (this runs before bearer auth).
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Timeout for the JWKS fetch so a slow Cloudflare response cannot pile up.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Claims we care about from a Cloudflare Access JWT.
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +80,9 @@ pub struct CfAccessVerifier {
     issuer: String,
     http: reqwest::Client,
     cache: RwLock<Option<CachedJwks>>,
+    /// Single-flight gate for refreshes; holds the last fetch-attempt time so
+    /// concurrent callers coalesce and a cooldown can be enforced.
+    refresh_gate: Mutex<Option<Instant>>,
 }
 
 impl CfAccessVerifier {
@@ -82,8 +93,12 @@ impl CfAccessVerifier {
             issuer: format!("https://{team_domain}"),
             audience: cfg.audience.trim().to_string(),
             team_domain,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(FETCH_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
             cache: RwLock::new(None),
+            refresh_gate: Mutex::new(None),
         }
     }
 
@@ -103,12 +118,14 @@ impl CfAccessVerifier {
             .kid
             .ok_or_else(|| "token missing key id (kid)".to_string())?;
 
-        // Try the cached key set, refetching once if the kid is unknown or stale.
-        let mut key = self.find_key(&kid, false).await?;
-        if key.is_none() {
-            key = self.find_key(&kid, true).await?;
+        // Fast path: a known key from a non-stale cache needs no fetch.
+        let mut jwk = self.cached_fresh_key(&kid).await;
+        if jwk.is_none() {
+            // Unknown or stale: attempt a bounded, coalesced refresh, then retry.
+            self.refresh_if_allowed().await;
+            jwk = self.cached_key(&kid).await;
         }
-        let jwk = key.ok_or_else(|| format!("no matching Cloudflare key for kid {kid}"))?;
+        let jwk = jwk.ok_or_else(|| format!("no matching Cloudflare key for kid {kid}"))?;
 
         let decoding_key =
             DecodingKey::from_jwk(&jwk).map_err(|e| format!("invalid Cloudflare key: {e}"))?;
@@ -122,29 +139,62 @@ impl CfAccessVerifier {
         Ok(data.claims)
     }
 
-    /// Look up a key by id from the cache, optionally forcing a refetch first.
-    async fn find_key(
-        &self,
-        kid: &str,
-        force_refresh: bool,
-    ) -> Result<Option<jsonwebtoken::jwk::Jwk>, String> {
-        if force_refresh || self.cache_is_stale().await {
-            self.refresh().await?;
-        }
+    /// A key from the cache only if the cache is within its TTL.
+    async fn cached_fresh_key(&self, kid: &str) -> Option<jsonwebtoken::jwk::Jwk> {
         let guard = self.cache.read().await;
-        Ok(guard.as_ref().and_then(|c| c.keys.find(kid)).cloned())
-    }
-
-    async fn cache_is_stale(&self) -> bool {
-        match &*self.cache.read().await {
-            Some(c) => c.fetched_at.elapsed() >= JWKS_TTL,
-            None => true,
+        match guard.as_ref() {
+            Some(c) if c.fetched_at.elapsed() < JWKS_TTL => c.keys.find(kid).cloned(),
+            _ => None,
         }
     }
 
-    async fn refresh(&self) -> Result<(), String> {
-        let keys: JwkSet = self
-            .http
+    /// A key from the cache regardless of age.
+    async fn cached_key(&self, kid: &str) -> Option<jsonwebtoken::jwk::Jwk> {
+        self.cache
+            .read()
+            .await
+            .as_ref()
+            .and_then(|c| c.keys.find(kid).cloned())
+    }
+
+    /// Refresh the JWKS, coalescing concurrent callers and enforcing a cooldown
+    /// so bogus assertions (valid-looking tokens with unknown key ids) cannot
+    /// drive unbounded outbound fetches, since this runs before bearer auth. A
+    /// failure is logged and swallowed so a Cloudflare hiccup is not amplified
+    /// into a per-request error storm; the subsequent key lookup simply misses.
+    async fn refresh_if_allowed(&self) {
+        // Serialize refreshers; whoever waited may find the work already done.
+        let mut last_attempt = self.refresh_gate.lock().await;
+
+        // Another task refreshed while we waited for the gate.
+        if let Some(c) = self.cache.read().await.as_ref() {
+            if c.fetched_at.elapsed() < JWKS_TTL {
+                return;
+            }
+        }
+        // Cooldown: cap how often we hit Cloudflare.
+        if let Some(t) = *last_attempt {
+            if t.elapsed() < MIN_REFRESH_INTERVAL {
+                return;
+            }
+        }
+
+        *last_attempt = Some(Instant::now());
+        match self.fetch_jwks().await {
+            Ok(keys) => {
+                *self.cache.write().await = Some(CachedJwks {
+                    keys,
+                    fetched_at: Instant::now(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(component = "cf_access", error = %e, "JWKS refresh failed");
+            }
+        }
+    }
+
+    async fn fetch_jwks(&self) -> Result<JwkSet, String> {
+        self.http
             .get(&self.certs_url)
             .send()
             .await
@@ -153,11 +203,6 @@ impl CfAccessVerifier {
             .map_err(|e| format!("Cloudflare certs request failed: {e}"))?
             .json()
             .await
-            .map_err(|e| format!("failed to parse Cloudflare certs: {e}"))?;
-        *self.cache.write().await = Some(CachedJwks {
-            keys,
-            fetched_at: Instant::now(),
-        });
-        Ok(())
+            .map_err(|e| format!("failed to parse Cloudflare certs: {e}"))
     }
 }

@@ -164,15 +164,56 @@ async fn process_post(ctx: &McpContext<'_>, body: &[u8]) -> PostOutcome {
         ));
     }
 
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request.get("params").cloned().unwrap_or(Value::Null);
-
-    // A request without an `id` is a notification: do the work (nothing, for the
-    // notifications we expect) and acknowledge without a JSON-RPC body.
-    let Some(id) = id else {
-        return PostOutcome::Accepted;
+    // The payload must be a JSON-RPC 2.0 request object. Anything else (null,
+    // numbers, bare objects without a valid envelope) is an Invalid Request.
+    let Some(obj) = request.as_object() else {
+        return PostOutcome::Json(rpc_error(
+            Value::Null,
+            -32600,
+            "Invalid Request: expected a JSON-RPC object".to_string(),
+        ));
     };
+
+    // An `id`, when present, must be a string, number, or null — never an
+    // object/array. Its absence marks a notification. Extract it up front so we
+    // can echo a valid id back even in envelope errors.
+    let id_present = obj.contains_key("id");
+    let id = obj.get("id").cloned().unwrap_or(Value::Null);
+    let id_valid = matches!(id, Value::String(_) | Value::Number(_) | Value::Null);
+    let reply_id = if id_valid { id.clone() } else { Value::Null };
+
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return PostOutcome::Json(rpc_error(
+            reply_id,
+            -32600,
+            "Invalid Request: jsonrpc must be \"2.0\"".to_string(),
+        ));
+    }
+
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        return PostOutcome::Json(rpc_error(
+            reply_id,
+            -32600,
+            "Invalid Request: missing method".to_string(),
+        ));
+    };
+
+    if id_present && !id_valid {
+        return PostOutcome::Json(rpc_error(
+            Value::Null,
+            -32600,
+            "Invalid Request: id must be a string, number, or null".to_string(),
+        ));
+    }
+
+    let params = obj.get("params").cloned().unwrap_or(Value::Null);
+
+    // A valid request without an `id` member is a notification: acknowledge with
+    // no JSON-RPC body.
+    if !id_present {
+        return PostOutcome::Accepted;
+    }
+    let id = reply_id;
 
     let response = match method {
         "initialize" => rpc_result(id, initialize_result(&params)),
@@ -609,8 +650,22 @@ fn tool_error(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::code_index::CodeSearchService;
     use crate::storage::{SqliteTracker, UserStore};
     use claudear_core::types::{CodeChunk, CodeSearchResult, CodeSymbol, Language, SymbolKind};
+    use std::sync::Arc;
+
+    /// Try to build an embedding client; returns `None` when the ONNX model is
+    /// unavailable (common in CI), so tests that need a real search service can
+    /// early-return rather than fail. Mirrors the analysis crate's test helper.
+    fn try_embedding_client() -> Option<Arc<crate::feedback::EmbeddingClient>> {
+        crate::feedback::EmbeddingClient::new(crate::feedback::EmbeddingConfig {
+            pool_size: 1,
+            ..Default::default()
+        })
+        .ok()
+        .map(Arc::new)
+    }
 
     fn cfg(expose_code: bool, expose_discord: bool) -> McpSearchServerConfig {
         McpSearchServerConfig {
@@ -636,7 +691,12 @@ mod tests {
         }
     }
 
-    async fn post(ctx: &McpContext<'_>, request: Value) -> Option<Value> {
+    /// Post a request, defaulting the `jsonrpc` envelope field to "2.0" so each
+    /// test can focus on its own fields. Pass it explicitly to test negotiation.
+    async fn post(ctx: &McpContext<'_>, mut request: Value) -> Option<Value> {
+        if let Some(obj) = request.as_object_mut() {
+            obj.entry("jsonrpc").or_insert(json!("2.0"));
+        }
         match process_post(ctx, request.to_string().as_bytes()).await {
             PostOutcome::Accepted => None,
             PostOutcome::Json(value) => Some(value),
@@ -921,6 +981,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_envelopes_are_rejected() {
+        let cfg = cfg(true, true);
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = test_ctx(&cfg, &tracker);
+
+        // Non-object JSON values are Invalid Request, not notifications.
+        for raw in [b"null".as_slice(), b"42", b"\"hi\"", b"{}"] {
+            let PostOutcome::Json(v) = process_post(&ctx, raw).await else {
+                panic!("expected JSON body for {raw:?}");
+            };
+            assert_eq!(v["error"]["code"], -32600, "payload {raw:?}");
+        }
+
+        // Wrong jsonrpc version is rejected (note: post() would inject "2.0", so
+        // build the body explicitly here).
+        let bad_version = json!({ "jsonrpc": "1.0", "id": 1, "method": "ping" });
+        let PostOutcome::Json(v) = process_post(&ctx, bad_version.to_string().as_bytes()).await
+        else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(v["error"]["code"], -32600);
+
+        // An object/array id is invalid.
+        let bad_id = json!({ "jsonrpc": "2.0", "id": {"x": 1}, "method": "ping" });
+        let PostOutcome::Json(v) = process_post(&ctx, bad_id.to_string().as_bytes()).await else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(v["error"]["code"], -32600);
+    }
+
+    #[tokio::test]
+    async fn missing_jsonrpc_notification_is_still_rejected() {
+        let cfg = cfg(true, true);
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = test_ctx(&cfg, &tracker);
+
+        // A notification missing the jsonrpc field is an invalid envelope, not a
+        // silent 202. (post() injects jsonrpc, so call process_post directly.)
+        let raw = json!({ "method": "notifications/initialized" });
+        let PostOutcome::Json(v) = process_post(&ctx, raw.to_string().as_bytes()).await else {
+            panic!("expected JSON body");
+        };
+        assert_eq!(v["error"]["code"], -32600);
+
+        // A well-formed notification (jsonrpc present, no id) is acked with 202.
+        let ok = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        assert!(matches!(
+            process_post(&ctx, ok.to_string().as_bytes()).await,
+            PostOutcome::Accepted
+        ));
+    }
+
+    #[tokio::test]
     async fn tool_call_reports_unavailable_service_as_error_result() {
         let cfg = cfg(true, true);
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -992,6 +1105,92 @@ mod tests {
         );
         let user = authenticate_bearer(&good, &tracker).expect("valid token");
         assert_eq!(user.email, "dev@example.com");
+    }
+
+    #[tokio::test]
+    async fn find_symbol_tool_scopes_by_repo_and_applies_limit() {
+        // Needs a real CodeSearchService (construction requires an embedding
+        // client); skip where the model is unavailable, like the analysis tests.
+        let Some(emb) = try_embedding_client() else {
+            return;
+        };
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let repo_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+        let other_id = tracker.get_or_create_repo_id("org/other").unwrap();
+
+        let sym = |name: &str, rid: i64| CodeSymbol {
+            id: None,
+            repo_id: rid,
+            file_path: format!("src/{name}.rs"),
+            symbol_name: name.to_string(),
+            symbol_kind: SymbolKind::Function,
+            parent_symbol: None,
+            language: Language::Rust,
+            start_line: 1,
+            end_line: 2,
+            signature: Some(format!("fn {name}()")),
+        };
+        tracker
+            .save_code_symbols(&[
+                sym("handle_a", repo_id),
+                sym("handle_b", repo_id),
+                sym("handle_c", repo_id),
+                sym("handle_z", other_id),
+            ])
+            .unwrap();
+
+        let service = CodeSearchService::new(tracker.clone(), emb);
+        // max_limit caps results below the number of matches.
+        let cfg = McpSearchServerConfig {
+            enabled: true,
+            expose_code: true,
+            expose_discord: false,
+            default_limit: 10,
+            max_limit: 2,
+            ..Default::default()
+        };
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: Some(&service),
+            discord_search: None,
+            tracker: tracker.as_ref(),
+        };
+
+        let resp = post(
+            &ctx,
+            json!({
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "find_symbol",
+                    "arguments": { "name": "handle_", "repo_id": repo_id, "limit": 5 }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // Repo scoping excludes the symbol in org/other, and max_limit=2 caps the
+        // three in-repo matches down to two.
+        assert!(text.contains("Found 2 symbol(s)"), "got: {text}");
+        assert!(!text.contains("handle_z"), "other repo leaked: {text}");
+
+        // An unknown repo name is a tool error, not a protocol error.
+        let bad = post(
+            &ctx,
+            json!({
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "find_symbol",
+                    "arguments": { "name": "handle_", "repo": "org/missing" }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bad["result"]["isError"], true);
     }
 
     #[tokio::test]

@@ -4416,7 +4416,7 @@ impl UserStore for SqliteTracker {
                  FROM api_tokens t
                  JOIN users u ON t.user_id = u.id
                  WHERE t.token_hash = ?1
-                   AND (t.expires_at IS NULL OR t.expires_at > datetime('now'))",
+                   AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime('now'))",
                 params![token_hash],
                 UserRow::from_row,
             )

@@ -50,6 +50,24 @@ fn hash_secret(secret: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Normalize a caller-supplied expiry into a UTC `YYYY-MM-DD HH:MM:SS` string
+/// that SQLite's `datetime()` compares correctly. Accepts RFC3339 input. `None`
+/// stays `None` (no expiry); an unparseable value is an error.
+fn normalize_expiry(raw: Option<&str>) -> Result<Option<String>, StatusCode> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| {
+                Some(
+                    dt.with_timezone(&chrono::Utc)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                )
+            })
+            .map_err(|_| StatusCode::BAD_REQUEST),
+    }
+}
+
 /// `POST /api/tokens` — create a token for the current user.
 pub async fn create_token_handler(
     user: AuthUser,
@@ -65,13 +83,14 @@ pub async fn create_token_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let expires_at = normalize_expiry(body.expires_at.as_deref())?;
     let secret = generate_secret();
     let hash = hash_secret(&secret);
     let prefix = &secret[..TOKEN_PREFIX_LEN];
 
     let token = state
         .tracker
-        .create_api_token(user.id, name, &hash, prefix, body.expires_at.as_deref())
+        .create_api_token(user.id, name, &hash, prefix, expires_at.as_deref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok((
@@ -163,13 +182,14 @@ pub async fn create_user_token_handler(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    let expires_at = normalize_expiry(body.expires_at.as_deref())?;
     let secret = generate_secret();
     let hash = hash_secret(&secret);
     let prefix = &secret[..TOKEN_PREFIX_LEN];
 
     let token = state
         .tracker
-        .create_api_token(user_id, name, &hash, prefix, body.expires_at.as_deref())
+        .create_api_token(user_id, name, &hash, prefix, expires_at.as_deref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok((
@@ -190,6 +210,25 @@ mod tests {
         assert_eq!(&secret[..TOKEN_PREFIX_LEN], &secret[..13]);
         assert_eq!(hash_secret(&secret), hash_secret(&secret));
         assert_ne!(hash_secret(&secret), hash_secret(&generate_secret()));
+    }
+
+    #[test]
+    fn normalize_expiry_parses_and_normalizes_to_utc() {
+        assert_eq!(normalize_expiry(None).unwrap(), None);
+        assert_eq!(normalize_expiry(Some("   ")).unwrap(), None);
+        assert_eq!(
+            normalize_expiry(Some("2026-06-01T09:00:00Z")).unwrap(),
+            Some("2026-06-01 09:00:00".to_string())
+        );
+        // A +02:00 offset is converted back to UTC.
+        assert_eq!(
+            normalize_expiry(Some("2026-06-01T09:00:00+02:00")).unwrap(),
+            Some("2026-06-01 07:00:00".to_string())
+        );
+        assert_eq!(
+            normalize_expiry(Some("not-a-date")),
+            Err(StatusCode::BAD_REQUEST)
+        );
     }
 
     #[test]
