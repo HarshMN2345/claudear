@@ -166,13 +166,12 @@ impl CfAccessVerifier {
         // Serialize refreshers; whoever waited may find the work already done.
         let mut last_attempt = self.refresh_gate.lock().await;
 
-        // Another task refreshed while we waited for the gate.
-        if let Some(c) = self.cache.read().await.as_ref() {
-            if c.fetched_at.elapsed() < JWKS_TTL {
-                return;
-            }
-        }
-        // Cooldown: cap how often we hit Cloudflare.
+        // Cooldown is the only gate here: this is reached only when the wanted
+        // key is absent from a fresh cache (an unknown/rotated kid) or the cache
+        // is stale, and in both cases we want to refetch — just not more than
+        // once per MIN_REFRESH_INTERVAL. A coalesced second caller that skips on
+        // cooldown still reads the cache the first caller populated, because
+        // verify() does an any-age lookup afterwards.
         if let Some(t) = *last_attempt {
             if t.elapsed() < MIN_REFRESH_INTERVAL {
                 return;

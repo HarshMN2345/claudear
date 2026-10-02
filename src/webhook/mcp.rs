@@ -28,6 +28,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Header Cloudflare Access sets with its signed identity JWT.
@@ -461,7 +462,7 @@ async fn code_search(ctx: &McpContext<'_>, args: &Value) -> Value {
     let limit = ctx.cfg.resolve_limit(usize_arg(args, "limit"));
 
     match service.search(query, repo_id, limit).await {
-        Ok(results) => tool_text(format_code_results(&results)),
+        Ok(results) => tool_text(format_code_results(&results, &repo_name_map(ctx.tracker))),
         Err(e) => tool_error(&format!("Code search failed: {e}")),
     }
 }
@@ -491,7 +492,7 @@ fn find_symbol(ctx: &McpContext<'_>, args: &Value) -> Value {
             // The storage layer caps symbol lookups generously (up to 100); apply
             // the configured limit here so this tool is bounded like the others.
             symbols.truncate(ctx.cfg.resolve_limit(usize_arg(args, "limit")));
-            tool_text(format_symbols(&symbols))
+            tool_text(format_symbols(&symbols, &repo_name_map(ctx.tracker)))
         }
         Err(e) => tool_error(&format!("Symbol search failed: {e}")),
     }
@@ -553,7 +554,31 @@ fn resolve_repo(ctx: &McpContext<'_>, args: &Value) -> Result<Option<i64>, Strin
 
 // --- result formatting ------------------------------------------------------
 
-fn format_code_results(results: &[claudear_core::types::CodeSearchResult]) -> String {
+/// Map every indexed repo id to its name, for labelling results. Falls back to
+/// an empty map (results then show `repo#<id>`) if the lookup fails.
+fn repo_name_map(tracker: &dyn FixAttemptTracker) -> HashMap<i64, String> {
+    tracker
+        .list_indexed_repos()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.id, r.name))
+        .collect()
+}
+
+/// A display label for a repo id: its name, or `repo#<id>` when unknown. Results
+/// can span repositories (when `repo` is omitted), so a repo-relative path alone
+/// is ambiguous — every result carries this prefix.
+fn repo_label(repo_names: &HashMap<i64, String>, repo_id: i64) -> String {
+    repo_names
+        .get(&repo_id)
+        .cloned()
+        .unwrap_or_else(|| format!("repo#{repo_id}"))
+}
+
+fn format_code_results(
+    results: &[claudear_core::types::CodeSearchResult],
+    repo_names: &HashMap<i64, String>,
+) -> String {
     use std::fmt::Write;
 
     if results.is_empty() {
@@ -565,8 +590,9 @@ fn format_code_results(results: &[claudear_core::types::CodeSearchResult]) -> St
         let chunk = &result.chunk;
         let _ = write!(
             out,
-            "\n### {}. {}:{}-{} ({}, {:.0}% match)",
+            "\n### {}. {}:{}:{}-{} ({}, {:.0}% match)",
             i + 1,
+            repo_label(repo_names, chunk.repo_id),
             chunk.file_path,
             chunk.start_line,
             chunk.end_line,
@@ -583,7 +609,10 @@ fn format_code_results(results: &[claudear_core::types::CodeSearchResult]) -> St
     out
 }
 
-fn format_symbols(symbols: &[claudear_core::types::CodeSymbol]) -> String {
+fn format_symbols(
+    symbols: &[claudear_core::types::CodeSymbol],
+    repo_names: &HashMap<i64, String>,
+) -> String {
     use std::fmt::Write;
 
     if symbols.is_empty() {
@@ -594,9 +623,10 @@ fn format_symbols(symbols: &[claudear_core::types::CodeSymbol]) -> String {
     for symbol in symbols {
         let _ = write!(
             out,
-            "\n- **{}** ({}) - {}:{}-{}",
+            "\n- **{}** ({}) - {}:{}:{}-{}",
             symbol.symbol_name,
             symbol.symbol_kind,
+            repo_label(repo_names, symbol.repo_id),
             symbol.file_path,
             symbol.start_line,
             symbol.end_line,
@@ -836,24 +866,39 @@ mod tests {
         }
     }
 
+    fn repo_names() -> HashMap<i64, String> {
+        HashMap::from([(1, "org/repo".to_string())])
+    }
+
     #[test]
     fn format_code_results_renders_matches() {
-        assert_eq!(format_code_results(&[]), "No matching code found.");
+        let names = repo_names();
+        assert_eq!(format_code_results(&[], &names), "No matching code found.");
 
         let results = vec![CodeSearchResult {
             chunk: chunk(),
             score: 0.9321,
         }];
-        let out = format_code_results(&results);
-        assert!(out.contains("src/lib.rs:10-20"));
+        let out = format_code_results(&results, &names);
+        // Repo name prefixes the (repo-relative) path so cross-repo results are
+        // unambiguous.
+        assert!(out.contains("org/repo:src/lib.rs:10-20"), "got: {out}");
         assert!(out.contains("93% match"));
         assert!(out.contains("do_thing"));
         assert!(out.contains("fn do_thing()"));
+
+        // Unknown repo id falls back to repo#<id>.
+        let out_unknown = format_code_results(&results, &HashMap::new());
+        assert!(
+            out_unknown.contains("repo#1:src/lib.rs"),
+            "got: {out_unknown}"
+        );
     }
 
     #[test]
     fn format_symbols_renders_matches() {
-        assert_eq!(format_symbols(&[]), "No matching symbols found.");
+        let names = repo_names();
+        assert_eq!(format_symbols(&[], &names), "No matching symbols found.");
 
         let symbols = vec![CodeSymbol {
             id: Some(1),
@@ -867,9 +912,9 @@ mod tests {
             end_line: 20,
             signature: Some("fn do_thing()".to_string()),
         }];
-        let out = format_symbols(&symbols);
+        let out = format_symbols(&symbols, &names);
         assert!(out.contains("**do_thing** (function)"));
-        assert!(out.contains("src/lib.rs:10-20"));
+        assert!(out.contains("org/repo:src/lib.rs:10-20"), "got: {out}");
         assert!(out.contains("in `Thing`"));
         assert!(out.contains("fn do_thing()"));
     }
@@ -1130,12 +1175,15 @@ mod tests {
             end_line: 2,
             signature: Some(format!("fn {name}()")),
         };
+        // The out-of-repo symbol sorts FIRST ("handle_0" < "handle_a"), so if the
+        // repo filter were dropped it would appear in the (name-ordered) top-2 and
+        // fail the assertions below.
         tracker
             .save_code_symbols(&[
                 sym("handle_a", repo_id),
                 sym("handle_b", repo_id),
                 sym("handle_c", repo_id),
-                sym("handle_z", other_id),
+                sym("handle_0", other_id),
             ])
             .unwrap();
 
@@ -1171,10 +1219,15 @@ mod tests {
         .unwrap();
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        // Repo scoping excludes the symbol in org/other, and max_limit=2 caps the
-        // three in-repo matches down to two.
+        // max_limit=2 caps the three in-repo matches down to two, and repo scoping
+        // keeps the first-sorting out-of-repo "handle_0" out entirely (losing the
+        // filter would put handle_0 in the top-2 and fail here).
         assert!(text.contains("Found 2 symbol(s)"), "got: {text}");
-        assert!(!text.contains("handle_z"), "other repo leaked: {text}");
+        assert!(
+            text.contains("handle_a") && text.contains("handle_b"),
+            "got: {text}"
+        );
+        assert!(!text.contains("handle_0"), "other repo leaked: {text}");
 
         // An unknown repo name is a tool error, not a protocol error.
         let bad = post(
