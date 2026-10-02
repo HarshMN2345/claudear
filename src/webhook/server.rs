@@ -39,17 +39,17 @@ const PROCESSING_ENTRY_TTL_SECS: u64 = 3600;
 const MAX_PROCESSING_ENTRIES: usize = 1000;
 
 /// State shared across handlers.
-struct AppState {
-    config: Config,
+pub(crate) struct AppState {
+    pub(crate) config: Config,
     handlers: WebhookHandlerRegistry,
     notifier: Arc<dyn Notifier>,
-    tracker: Arc<dyn FixAttemptTracker>,
+    pub(crate) tracker: Arc<dyn FixAttemptTracker>,
     sqlite_tracker: Option<Arc<dyn FixAttemptTracker>>,
     inferrer: Option<RepoInferrer>,
     embedding_client: Option<Arc<crate::feedback::EmbeddingClient>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
-    code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
-    discord_search_service: Option<Arc<crate::knowledgebase::DiscordSearchService>>,
+    pub(crate) code_search_service: Option<Arc<crate::repo::code_index::CodeSearchService>>,
+    pub(crate) discord_search_service: Option<Arc<crate::knowledgebase::DiscordSearchService>>,
     #[allow(dead_code)]
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     review_watcher: Option<Arc<ReviewWatcher>>,
@@ -263,14 +263,27 @@ impl WebhookServer {
         // Combined with the processing set, this provides effective rate control
         let concurrency_layer = ConcurrencyLimitLayer::new(10);
 
-        let webhook_routes = Router::new()
+        let mut webhook_routes = Router::new()
             .route("/health", get(health_handler))
             .route(
                 "/webhook/{source}",
                 get(webhook_verify_handler)
                     .post(webhook_handler)
                     .layer(concurrency_layer),
-            )
+            );
+
+        // Mount the built-in MCP search server on the same port when enabled.
+        // It exposes the existing code/Discord search services as MCP tools over
+        // the Streamable HTTP transport (POST for requests, GET rejected).
+        if state.config.mcp_server.enabled {
+            webhook_routes = webhook_routes.route(
+                "/mcp",
+                get(super::mcp::mcp_get_handler).post(super::mcp::mcp_post_handler),
+            );
+            tracing::info!("MCP search server enabled at /mcp");
+        }
+
+        let webhook_routes = webhook_routes
             .layer(DefaultBodyLimit::max(512 * 1024)) // 512 KB body size limit
             .with_state(state.clone());
 
