@@ -204,6 +204,20 @@ pub fn create_api_router_full(
                 .put(update_user_handler)
                 .delete(delete_user_handler),
         )
+        // Personal access token routes (for the MCP server and other clients)
+        .route(
+            "/api/tokens",
+            axum::routing::get(super::tokens::list_tokens_handler)
+                .post(super::tokens::create_token_handler),
+        )
+        .route(
+            "/api/tokens/all",
+            axum::routing::get(super::tokens::list_all_tokens_handler),
+        )
+        .route(
+            "/api/tokens/{id}",
+            axum::routing::delete(super::tokens::revoke_token_handler),
+        )
         // Model browsing & download routes
         .route(
             "/api/chat/models/browse",
@@ -3061,6 +3075,7 @@ mod tests {
             qa: claudear_config::config::QaConfig::default(),
             knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
             reports: claudear_config::config::ReportsConfig::default(),
+            mcp_server: claudear_config::config::McpSearchServerConfig::default(),
         }
     }
 
