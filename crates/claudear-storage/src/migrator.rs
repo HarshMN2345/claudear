@@ -76,6 +76,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "deploy_qa_tips",
         sql: include_str!("../../../migrations/V12__deploy_qa_tips.sql"),
     },
+    Migration {
+        version: 13,
+        name: "api_tokens",
+        sql: include_str!("../../../migrations/V13__api_tokens.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.

@@ -16,9 +16,10 @@ pub use analytics::{
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteTracker;
 pub use types::{
-    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
-    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
-    StoredIndexedRepo, StoredRepository, UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
+    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
+    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredRepository,
+    UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
@@ -1752,6 +1753,45 @@ pub trait UserStore: Send + Sync {
     /// Delete all sessions for a user.
     fn delete_user_sessions(&self, _user_id: i64) -> Result<()> {
         Ok(())
+    }
+
+    /// Create a personal access token for a user. The caller supplies the hash
+    /// and display prefix; the plaintext is never passed in. Returns the stored
+    /// row (without the secret).
+    fn create_api_token(
+        &self,
+        _user_id: i64,
+        _name: &str,
+        _token_hash: &str,
+        _token_prefix: &str,
+        _expires_at: Option<&str>,
+    ) -> Result<ApiTokenRow> {
+        Err(claudear_core::error::Error::Other(
+            "create_api_token not supported".to_string(),
+        ))
+    }
+
+    /// Resolve the user behind a token hash, if the token exists and has not
+    /// expired. Also bumps the token's `last_used_at`.
+    fn get_user_by_api_token_hash(&self, _token_hash: &str) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// List a user's own tokens (secrets excluded).
+    fn list_api_tokens(&self, _user_id: i64) -> Result<Vec<ApiTokenRow>> {
+        Ok(Vec::new())
+    }
+
+    /// List every token with its owner, for the admin usage view.
+    fn list_all_api_tokens(&self) -> Result<Vec<ApiTokenWithOwner>> {
+        Ok(Vec::new())
+    }
+
+    /// Revoke a token by id. When `user_id` is `Some`, the delete is scoped to
+    /// that owner (self-service); `None` allows an admin to revoke any token.
+    /// Returns whether a row was removed.
+    fn delete_api_token(&self, _id: &str, _user_id: Option<i64>) -> Result<bool> {
+        Ok(false)
     }
 }
 
