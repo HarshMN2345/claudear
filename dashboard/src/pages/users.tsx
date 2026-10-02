@@ -1,10 +1,15 @@
 import { useState } from 'react'
 import useSWR from 'swr'
-import { fetchUsers, createUser, updateUser, deleteUser, type UserRecord } from '../lib/api'
+import {
+  fetchUsers, createUser, updateUser, deleteUser,
+  fetchUserTokens, createUserToken, revokeToken,
+  type UserRecord, type ApiToken, type CreatedToken,
+} from '../lib/api'
 import { parseUTCDate } from '../lib/formatters'
 import { useAuth } from '../lib/auth'
 import { UsersTableSkeleton } from '../components/shared/page-skeletons'
-import { Plus, Pencil, Trash2, X } from 'lucide-react'
+import { TimeAgo } from '../components/shared/time-ago'
+import { Plus, Pencil, Trash2, X, Copy, Check, KeyRound } from 'lucide-react'
 
 export default function UsersPage() {
   const { user: currentUser } = useAuth()
@@ -211,6 +216,160 @@ function UserForm({
           </button>
         </div>
       </form>
+
+      {user ? (
+        <UserTokens userId={user.id} />
+      ) : (
+        <p className="mt-6 pt-4 border-t text-xs text-muted-foreground">
+          Save the user first, then re-open to create API tokens for them.
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** Inline API-token management for a single user, shown in the edit form. */
+function UserTokens({ userId }: { userId: number }) {
+  const { data: tokens = [], isLoading, mutate } = useSWR<ApiToken[]>(
+    ['user-tokens', userId],
+    () => fetchUserTokens(userId),
+  )
+  const [name, setName] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [error, setError] = useState('')
+  const [created, setCreated] = useState<CreatedToken | null>(null)
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!name.trim()) return
+    setError('')
+    setCreating(true)
+    try {
+      const token = await createUserToken(userId, { name: name.trim() })
+      setCreated(token)
+      setName('')
+      await mutate()
+    } catch {
+      setError('Failed to create token')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const handleRevoke = async (id: string) => {
+    if (!confirm('Revoke this token? Clients using it will stop working.')) return
+    setError('')
+    try {
+      await revokeToken(id)
+      await mutate()
+    } catch {
+      setError('Failed to revoke token')
+    }
+  }
+
+  return (
+    <div className="mt-6 pt-4 border-t space-y-3">
+      <div className="flex items-center gap-2">
+        <KeyRound className="h-4 w-4 text-muted-foreground" />
+        <h4 className="font-medium text-sm">API Tokens</h4>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Tokens let this user's tools (e.g. the MCP search server) authenticate as them.
+        The secret is shown once, at creation.
+      </p>
+
+      {error && (
+        <div className="bg-destructive/10 text-destructive text-sm p-2 rounded-md">{error}</div>
+      )}
+
+      {created && (
+        <div className="bg-primary/5 border border-primary/20 rounded-md p-3 space-y-2">
+          <div className="text-xs font-medium text-primary">
+            Copy this token now — it won't be shown again.
+          </div>
+          <SecretReveal secret={created.secret} />
+        </div>
+      )}
+
+      <form onSubmit={handleCreate} className="flex items-center gap-2">
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Token name (e.g. laptop, ci)"
+          className="flex-1 px-3 py-2 border rounded-md bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+        />
+        <button
+          type="submit"
+          disabled={creating || !name.trim()}
+          className="flex items-center gap-1.5 px-3 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
+        >
+          <Plus className="h-4 w-4" /> Create
+        </button>
+      </form>
+
+      {isLoading ? (
+        <div className="text-xs text-muted-foreground">Loading tokens…</div>
+      ) : tokens.length === 0 ? (
+        <div className="text-xs text-muted-foreground">No tokens yet.</div>
+      ) : (
+        <div className="border rounded-md overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/50">
+              <tr>
+                <th className="text-left p-2 font-medium">Name</th>
+                <th className="text-left p-2 font-medium">Prefix</th>
+                <th className="text-left p-2 font-medium">Created</th>
+                <th className="text-left p-2 font-medium">Last used</th>
+                <th className="text-right p-2 font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tokens.map((t) => (
+                <tr key={t.id} className="border-t">
+                  <td className="p-2">{t.name}</td>
+                  <td className="p-2 font-mono text-xs text-muted-foreground">{t.token_prefix}…</td>
+                  <td className="p-2 text-muted-foreground">{parseUTCDate(t.created_at).toLocaleDateString()}</td>
+                  <td className="p-2 text-muted-foreground">
+                    {t.last_used_at ? <TimeAgo date={t.last_used_at} /> : 'never'}
+                  </td>
+                  <td className="p-2 text-right">
+                    <button
+                      onClick={() => handleRevoke(t.id)}
+                      className="p-1.5 rounded hover:bg-destructive/10 text-destructive"
+                      title="Revoke"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** A read-only secret field with a copy button and transient "copied" state. */
+function SecretReveal({ secret }: { secret: string }) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = () => {
+    navigator.clipboard.writeText(secret)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+  return (
+    <div className="flex items-center gap-2">
+      <code className="flex-1 px-2 py-1.5 bg-muted rounded font-mono text-xs break-all">{secret}</code>
+      <button
+        onClick={handleCopy}
+        className="flex items-center gap-1 px-2 py-1.5 border rounded-md text-xs hover:bg-muted shrink-0"
+        title="Copy"
+      >
+        {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+        {copied ? 'Copied' : 'Copy'}
+      </button>
     </div>
   )
 }

@@ -124,6 +124,60 @@ pub async fn list_all_tokens_handler(
     Ok(Json(tokens))
 }
 
+/// `GET /api/users/{id}/tokens` — admin: list a specific user's tokens.
+pub async fn list_user_tokens_handler(
+    _admin: AdminUser,
+    State(state): State<ApiState>,
+    Path(user_id): Path<i64>,
+) -> Result<Json<Vec<ApiTokenRow>>, StatusCode> {
+    let tokens = state
+        .tracker
+        .list_api_tokens(user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(tokens))
+}
+
+/// `POST /api/users/{id}/tokens` — admin: mint a token for a specific user.
+pub async fn create_user_token_handler(
+    admin: AdminUser,
+    State(state): State<ApiState>,
+    Path(user_id): Path<i64>,
+    Json(body): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<CreatedTokenResponse>), StatusCode> {
+    if !check_api_rate_limit(admin.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 100 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // The target user must exist.
+    if state
+        .tracker
+        .get_user_by_id(user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_none()
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let secret = generate_secret();
+    let hash = hash_secret(&secret);
+    let prefix = &secret[..TOKEN_PREFIX_LEN];
+
+    let token = state
+        .tracker
+        .create_api_token(user_id, name, &hash, prefix, body.expires_at.as_deref())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedTokenResponse { token, secret }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

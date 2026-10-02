@@ -218,6 +218,12 @@ pub fn create_api_router_full(
             "/api/tokens/{id}",
             axum::routing::delete(super::tokens::revoke_token_handler),
         )
+        // Admin: manage a specific user's tokens from the Users screen.
+        .route(
+            "/api/users/{id}/tokens",
+            axum::routing::get(super::tokens::list_user_tokens_handler)
+                .post(super::tokens::create_user_token_handler),
+        )
         // Model browsing & download routes
         .route(
             "/api/chat/models/browse",
