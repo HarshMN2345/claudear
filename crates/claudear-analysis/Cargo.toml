@@ -9,6 +9,7 @@ sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite"]
 cuda = ["ort/cuda"]
 
 [dependencies]
+abnegate-index = { workspace = true }
 claudear-core = { workspace = true }
 claudear-config = { workspace = true }
 claudear-storage = { workspace = true }
@@ -63,9 +64,6 @@ sha2 = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
-
-# Crypto (hex encoding)
-hex = { workspace = true }
 
 # URL encoding
 urlencoding = { workspace = true }
