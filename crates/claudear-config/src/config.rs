@@ -530,9 +530,10 @@ fn default_storage_dir() -> PathBuf {
 /// the webhooks/dashboard, exposing the existing semantic search services
 /// (code + Discord knowledge) as MCP tools over the Streamable HTTP transport.
 ///
-/// Disabled by default: the endpoint is unauthenticated and shares the webhook
-/// port, so it should only be turned on where that exposure is acceptable
-/// (e.g. behind a trusted proxy or on a private network).
+/// Enabled by default. The endpoint is unauthenticated and shares the webhook
+/// port, so browser `Origin` values are rejected unless allow-listed (see
+/// `allowed_origins`) to guard against DNS-rebinding; set `enabled = false` to
+/// turn it off entirely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpSearchServerConfig {
@@ -547,16 +548,23 @@ pub struct McpSearchServerConfig {
     pub default_limit: usize,
     /// Hard cap on the number of results a single search tool call may return.
     pub max_limit: usize,
+    /// Browser `Origin` values allowed to call the endpoint. Requests with no
+    /// `Origin` header (CLI/server-to-server MCP clients) are always allowed;
+    /// requests carrying an `Origin` not in this list are rejected with 403 to
+    /// defend against DNS-rebinding attacks, per the MCP Streamable HTTP spec.
+    /// Empty (the default) blocks all browser origins.
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for McpSearchServerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             expose_code: true,
             expose_discord: true,
             default_limit: 10,
             max_limit: 50,
+            allowed_origins: Vec::new(),
         }
     }
 }
