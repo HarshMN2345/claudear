@@ -618,10 +618,15 @@ mod tests {
     #[test]
     fn truncate_respects_utf8_boundaries() {
         assert_eq!(truncate_on_boundary("short", 10), "short");
+        // "a" + "é"×10: 'a' at byte 0, then each 'é' spans 2 bytes. Byte offset 4
+        // lands inside the second 'é', so truncation must step back to offset 3 -
+        // a naive `&text[..4]` would panic. (Offset 5 is already a boundary and
+        // would not exercise this path.)
         let s = "a".to_string() + &"é".repeat(10);
-        let out = truncate_on_boundary(&s, 5);
+        let out = truncate_on_boundary(&s, 4);
         assert!(out.ends_with("(truncated)"));
-        assert!(out.starts_with('a'));
+        // Stepped back to the boundary at byte 3: "a" + one "é".
+        assert!(out.starts_with("aé…"));
     }
 
     fn chunk() -> CodeChunk {
