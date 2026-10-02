@@ -513,10 +513,61 @@ pub struct Config {
     /// Scheduled reports / digests configuration group.
     #[serde(default)]
     pub reports: ReportsConfig,
+    /// Built-in MCP search server (exposes code/Discord knowledge search over
+    /// the existing HTTP port). Distinct from the `mcp` field above, which is
+    /// client-side config for MCP servers attached to Claude runs.
+    #[serde(default)]
+    pub mcp_server: McpSearchServerConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
     PathBuf::from("./storage")
+}
+
+/// Built-in MCP search server configuration.
+///
+/// When enabled, a `POST /mcp` endpoint is mounted on the same HTTP server as
+/// the webhooks/dashboard, exposing the existing semantic search services
+/// (code + Discord knowledge) as MCP tools over the Streamable HTTP transport.
+///
+/// Disabled by default: the endpoint is unauthenticated and shares the webhook
+/// port, so it should only be turned on where that exposure is acceptable
+/// (e.g. behind a trusted proxy or on a private network).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSearchServerConfig {
+    /// Enable the built-in MCP search server.
+    pub enabled: bool,
+    /// Expose the `code_search` / `find_symbol` tools (requires code indexing).
+    pub expose_code: bool,
+    /// Expose the `discord_search` tool (requires the Discord knowledgebase).
+    pub expose_discord: bool,
+    /// Default number of results returned by search tools when the caller
+    /// omits `limit`.
+    pub default_limit: usize,
+    /// Hard cap on the number of results a single search tool call may return.
+    pub max_limit: usize,
+}
+
+impl Default for McpSearchServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            expose_code: true,
+            expose_discord: true,
+            default_limit: 10,
+            max_limit: 50,
+        }
+    }
+}
+
+impl McpSearchServerConfig {
+    /// Clamp a caller-supplied limit into `[1, max_limit]`, falling back to
+    /// `default_limit` when none was supplied.
+    pub fn resolve_limit(&self, requested: Option<usize>) -> usize {
+        let max = self.max_limit.max(1);
+        requested.unwrap_or(self.default_limit).clamp(1, max)
+    }
 }
 
 /// Dashboard display & estimation configuration.
@@ -708,6 +759,7 @@ impl Default for Config {
             qa: QaConfig::default(),
             knowledgebase: KnowledgebasesConfig::default(),
             reports: ReportsConfig::default(),
+            mcp_server: McpSearchServerConfig::default(),
         }
     }
 }
