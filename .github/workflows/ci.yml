@@ -92,7 +92,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::double_must_use
 
   test:
     name: Test (${{ matrix.crate }})

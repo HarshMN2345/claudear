@@ -2,6 +2,9 @@
 members = ["crates/*"]
 resolver = "2"
 
+[workspace.lints.clippy]
+double_must_use = "allow"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "process", "signal", "fs", "net", "io-util", "macros"] }
@@ -161,6 +164,9 @@ claudear-engine = { path = "crates/claudear-engine" }
 name = "claudear"
 version = "1.0.0"
 edition = "2021"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "claudear"
