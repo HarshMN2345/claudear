@@ -1445,21 +1445,48 @@ mod tests {
             return;
         };
 
-        // Index a tiny repo so the vector search has something to return.
-        let dir = tempfile::tempdir().unwrap();
+        // Index the target repo with three matching files, and a second repo with
+        // its own match, so we can prove both repo scoping and limit forwarding.
+        let indexer = CodeIndexer::new(tracker.clone(), emb.clone());
+        let repo_dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(
+                repo_dir.path().join(name),
+                format!(
+                    "/// Parse the application configuration from disk ({name}).\n\
+                     pub fn parse_config_{n}(path: &str) -> Config {{ load(path) }}\n",
+                    n = name.trim_end_matches(".rs")
+                ),
+            )
+            .unwrap();
+        }
+        indexer
+            .index_repo("org/repo", repo_dir.path())
+            .await
+            .unwrap();
+
+        let other_dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.path().join("config.rs"),
-            "/// Parse the application configuration from disk.\n\
-             pub fn parse_config(path: &str) -> Config { load(path) }\n",
+            other_dir.path().join("elsewhere.rs"),
+            "/// Parse the application configuration from disk (other).\n\
+             pub fn parse_config_other(path: &str) -> Config { load(path) }\n",
         )
         .unwrap();
-        CodeIndexer::new(tracker.clone(), emb.clone())
-            .index_repo("org/repo", dir.path())
+        indexer
+            .index_repo("org/other", other_dir.path())
             .await
             .unwrap();
 
         let service = CodeSearchService::new(tracker.clone(), emb);
-        let c = cfg(true, false);
+        // max_limit below the number of in-repo matches, so the cap is observable.
+        let c = McpSearchServerConfig {
+            enabled: true,
+            expose_code: true,
+            expose_discord: false,
+            default_limit: 10,
+            max_limit: 2,
+            ..Default::default()
+        };
         let ctx = McpContext {
             cfg: &c,
             code_search: Some(&service),
@@ -1473,7 +1500,10 @@ mod tests {
             json!({
                 "id": 1,
                 "method": "tools/call",
-                "params": { "name": "code_search", "arguments": { "query": "parse configuration" } }
+                "params": {
+                    "name": "code_search",
+                    "arguments": { "query": "parse configuration", "repo": "org/repo", "limit": 10 }
+                }
             }),
         )
         .await
@@ -1482,11 +1512,14 @@ mod tests {
         assert!(resp.get("error").is_none());
         assert_eq!(resp["result"].get("isError"), None);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        // Populated, labelled result (repo name + file) proves query is forwarded
-        // and results are rendered.
-        assert!(text.contains("code match"), "expected results: {text}");
+        // Limit forwarding: three files match but max_limit caps the result at two.
+        assert!(
+            text.contains("Found 2 code match(es)"),
+            "limit not applied: {text}"
+        );
+        // Repo scoping: only the target repo appears, never org/other.
         assert!(text.contains("org/repo"), "missing repo label: {text}");
-        assert!(text.contains("config.rs"), "missing file: {text}");
+        assert!(!text.contains("org/other"), "repo scope leaked: {text}");
 
         // Forwarding is also observable on the error paths: a missing query and a
         // malformed scope must surface as tool errors.
@@ -1528,13 +1561,16 @@ mod tests {
             timestamp: ts.to_string(),
             reply_to: None,
         };
+        // Timestamps >10 min apart force separate chunks, so chan1 has two
+        // matches and the limit cap is observable.
         indexer
             .index(
                 "chan1",
                 false,
                 vec![
                     msg("1", "2024-01-01T10:00:00Z"),
-                    msg("2", "2024-01-01T10:01:00Z"),
+                    msg("2", "2024-01-01T12:00:00Z"),
+                    msg("3", "2024-01-01T14:00:00Z"),
                 ],
             )
             .await
@@ -1550,15 +1586,23 @@ mod tests {
                 "chan2",
                 false,
                 vec![
-                    msg2("3", "2024-01-02T10:00:00Z"),
-                    msg2("4", "2024-01-02T10:01:00Z"),
+                    msg2("4", "2024-01-02T10:00:00Z"),
+                    msg2("5", "2024-01-02T12:00:00Z"),
                 ],
             )
             .await
             .unwrap();
 
         let service = crate::knowledgebase::DiscordSearchService::new(tracker.clone(), emb);
-        let c = cfg(false, true);
+        // max_limit below the number of chan1 matches, so the cap is observable.
+        let c = McpSearchServerConfig {
+            enabled: true,
+            expose_code: false,
+            expose_discord: true,
+            default_limit: 10,
+            max_limit: 1,
+            ..Default::default()
+        };
         let ctx = McpContext {
             cfg: &c,
             code_search: None,
@@ -1574,7 +1618,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "discord_search",
-                    "arguments": { "query": "deploy rollback", "channel_id": "chan1" }
+                    "arguments": { "query": "deploy rollback", "channel_id": "chan1", "limit": 10 }
                 }
             }),
         )
@@ -1593,6 +1637,10 @@ mod tests {
         );
         assert!(text.contains("chan1"), "got: {text}");
         assert!(!text.contains("chan2"), "channel scope leaked: {text}");
+        // Limit forwarding: chan1 has multiple matching chunks but max_limit caps
+        // the output at one (results are numbered "### 1.", "### 2." ...).
+        assert!(text.contains("### 1."), "expected a result entry: {text}");
+        assert!(!text.contains("### 2."), "limit not applied: {text}");
 
         // Forwarding is observable without vector results: a missing query and a
         // malformed channel_id scope must surface as tool errors.
