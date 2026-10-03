@@ -656,6 +656,14 @@ async fn helpscout_list_conversations(ctx: &McpContext<'_>, args: &Value) -> Val
 
     match source.fetch_issues().await {
         Ok(mut issues) => {
+            // fetch_issues concatenates per-mailbox results in config order; sort
+            // globally newest-first (by update, then creation) before limiting so
+            // a later mailbox's newer conversations aren't dropped.
+            issues.sort_by(|a, b| {
+                let ka = a.updated_at.or(a.created_at);
+                let kb = b.updated_at.or(b.created_at);
+                kb.cmp(&ka)
+            });
             issues.truncate(limit);
             tool_text(format_helpscout_conversations(&issues))
         }
@@ -2003,7 +2011,7 @@ mod tests {
         }
     }
 
-    fn hs_issue(short: &str, title: &str, status: &str, email: &str) -> Issue {
+    fn hs_issue(short: &str, title: &str, status: &str, email: &str, minutes_ago: i64) -> Issue {
         let mut issue = Issue::new(
             short,
             short,
@@ -2013,6 +2021,7 @@ mod tests {
         );
         issue.set_metadata("status", status.to_string());
         issue.set_metadata("customer_email", email.to_string());
+        issue.updated_at = Some(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago));
         issue
     }
 
@@ -2026,11 +2035,14 @@ mod tests {
             max_limit: 2,
             ..Default::default()
         };
+        // Deliberately out of order: HS-2 is newest, HS-1 oldest. Newest-first
+        // ordering + limit=2 must keep HS-2 and HS-3 and drop the oldest (HS-1),
+        // not just the last in input order.
         let source = FakeHelpScout {
             issues: vec![
-                hs_issue("HS-1", "Login broken", "active", "a@x.com"),
-                hs_issue("HS-2", "Billing question", "pending", "b@x.com"),
-                hs_issue("HS-3", "Feature request", "active", "c@x.com"),
+                hs_issue("HS-1", "Login broken", "active", "a@x.com", 60),
+                hs_issue("HS-2", "Billing question", "pending", "b@x.com", 1),
+                hs_issue("HS-3", "Feature request", "active", "c@x.com", 10),
             ],
         };
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -2058,9 +2070,12 @@ mod tests {
             text.contains("Found 2 HelpScout conversation(s)"),
             "got: {text}"
         );
-        assert!(text.contains("HS-1") && text.contains("Login broken"));
-        assert!(text.contains("[active]") && text.contains("a@x.com"));
-        assert!(!text.contains("HS-3"), "limit not applied: {text}");
+        assert!(text.contains("[pending]") && text.contains("b@x.com"));
+        // Global newest-first: HS-1 (oldest) is dropped, and HS-2 precedes HS-3.
+        assert!(!text.contains("HS-1"), "oldest not dropped: {text}");
+        let pos2 = text.find("HS-2").expect("HS-2 present");
+        let pos3 = text.find("HS-3").expect("HS-3 present");
+        assert!(pos2 < pos3, "not newest-first: {text}");
     }
 
     #[tokio::test]
@@ -2091,9 +2106,12 @@ mod tests {
         assert_eq!(resp["result"]["isError"], true);
     }
 
-    /// A fake Discord lister returning canned messages/channels.
+    /// A fake Discord lister that returns channel-specific messages, keyed by
+    /// channel id, and only answers channel lookups for its configured guild.
+    /// This lets tests verify that a channel *name* resolves to the right *id*.
     struct FakeDiscord {
-        messages: Vec<DiscordMessage>,
+        guild_id: String,
+        by_channel: std::collections::HashMap<String, Vec<DiscordMessage>>,
         channels: Vec<DiscordChannel>,
     }
 
@@ -2101,23 +2119,30 @@ mod tests {
     impl DiscordMessageLister for FakeDiscord {
         async fn list_channel_messages(
             &self,
-            _channel_id: &str,
+            channel_id: &str,
             limit: usize,
         ) -> crate::error::Result<Vec<DiscordMessage>> {
-            Ok(self.messages.iter().take(limit).cloned().collect())
+            Ok(self
+                .by_channel
+                .get(channel_id)
+                .map(|msgs| msgs.iter().take(limit).cloned().collect())
+                .unwrap_or_default())
         }
         async fn list_guild_channels(
             &self,
-            _guild_id: &str,
+            guild_id: &str,
         ) -> crate::error::Result<Vec<DiscordChannel>> {
+            if guild_id != self.guild_id {
+                return Ok(Vec::new());
+            }
             Ok(self.channels.clone())
         }
     }
 
-    fn dmsg(id: &str, author: &str, content: &str) -> DiscordMessage {
+    fn dmsg(id: &str, channel_id: &str, author: &str, content: &str) -> DiscordMessage {
         DiscordMessage {
             id: id.to_string(),
-            channel_id: "100".to_string(),
+            channel_id: channel_id.to_string(),
             author: Some(DiscordUser {
                 id: "u1".to_string(),
                 username: author.to_string(),
@@ -2149,10 +2174,17 @@ mod tests {
     async fn discord_list_messages_tool_lists_and_resolves_names() {
         let cfg = cfg(false, true);
         let lister = FakeDiscord {
-            messages: vec![
-                dmsg("1", "alice", "first message"),
-                dmsg("2", "bob", "second message"),
-            ],
+            guild_id: "guild1".to_string(),
+            by_channel: std::collections::HashMap::from([
+                (
+                    "100".to_string(),
+                    vec![dmsg("1", "100", "alice", "deploy pipeline is green")],
+                ),
+                (
+                    "200".to_string(),
+                    vec![dmsg("2", "200", "bob", "lunch plans today")],
+                ),
+            ]),
             channels: vec![dchan("100", "engineering"), dchan("200", "random")],
         };
         let tracker = SqliteTracker::in_memory().unwrap();
@@ -2167,7 +2199,7 @@ mod tests {
             discord_guild_id: Some("guild1"),
         };
 
-        // By channel id.
+        // By channel id -> that channel's messages.
         let resp = post(
             &ctx,
             json!({ "id": 1, "method": "tools/call",
@@ -2176,12 +2208,10 @@ mod tests {
         .await
         .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("alice") && text.contains("first message"),
-            "got: {text}"
-        );
+        assert!(text.contains("deploy pipeline is green"), "got: {text}");
 
-        // By channel name (resolved via guild channels).
+        // By channel name -> resolves "engineering" to id 100, returning *its*
+        // messages and not the "random" channel's (so wrong resolution fails).
         let resp = post(
             &ctx,
             json!({ "id": 2, "method": "tools/call",
@@ -2190,10 +2220,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp["result"].get("isError"), None);
-        assert!(resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("message"));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("deploy pipeline is green"), "got: {text}");
+        assert!(
+            !text.contains("lunch plans"),
+            "resolved to wrong channel: {text}"
+        );
 
         // Unknown channel name -> tool error.
         let resp = post(
@@ -2237,11 +2269,12 @@ mod tests {
             format_helpscout_conversations(&[]),
             "No HelpScout conversations found."
         );
-        let hs = format_helpscout_conversations(&[hs_issue("HS-9", "Oops", "active", "z@x.com")]);
+        let hs =
+            format_helpscout_conversations(&[hs_issue("HS-9", "Oops", "active", "z@x.com", 0)]);
         assert!(hs.contains("HS-9") && hs.contains("Oops") && hs.contains("[active]"));
 
         assert!(format_discord_messages("100", &[]).contains("No messages"));
-        let dm = format_discord_messages("100", &[dmsg("1", "alice", "hello world")]);
+        let dm = format_discord_messages("100", &[dmsg("1", "100", "alice", "hello world")]);
         assert!(dm.contains("alice") && dm.contains("hello world"));
     }
 }
