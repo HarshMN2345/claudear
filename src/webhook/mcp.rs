@@ -20,12 +20,14 @@ use super::server::AppState;
 use crate::config::McpSearchServerConfig;
 use crate::knowledgebase::DiscordSearchService;
 use crate::repo::code_index::CodeSearchService;
+use crate::source::IssueSource;
 use crate::storage::FixAttemptTracker;
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
+use claudear_integrations::discord::{DiscordChannel, DiscordClient, DiscordMessage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -33,6 +35,38 @@ use std::sync::Arc;
 
 /// Header Cloudflare Access sets with its signed identity JWT.
 const CF_ACCESS_HEADER: &str = "cf-access-jwt-assertion";
+
+/// The slice of the Discord bot client the list tool needs. A trait so the
+/// request path can be tested with a fake, without a live bot token.
+#[async_trait::async_trait]
+pub(crate) trait DiscordMessageLister: Send + Sync {
+    async fn list_channel_messages(
+        &self,
+        channel_id: &str,
+        limit: usize,
+    ) -> crate::error::Result<Vec<DiscordMessage>>;
+    async fn list_guild_channels(
+        &self,
+        guild_id: &str,
+    ) -> crate::error::Result<Vec<DiscordChannel>>;
+}
+
+#[async_trait::async_trait]
+impl DiscordMessageLister for DiscordClient {
+    async fn list_channel_messages(
+        &self,
+        channel_id: &str,
+        limit: usize,
+    ) -> crate::error::Result<Vec<DiscordMessage>> {
+        DiscordClient::list_channel_messages(self, channel_id, limit).await
+    }
+    async fn list_guild_channels(
+        &self,
+        guild_id: &str,
+    ) -> crate::error::Result<Vec<DiscordChannel>> {
+        DiscordClient::list_guild_channels(self, guild_id).await
+    }
+}
 
 /// Hex-encoded SHA-256 of a personal access token, matching what storage holds.
 pub(crate) fn hash_token(token: &str) -> String {
@@ -56,6 +90,12 @@ struct McpContext<'a> {
     discord_search: Option<&'a DiscordSearchService>,
     tracker: &'a dyn FixAttemptTracker,
     cf_verifier: Option<&'a CfAccessVerifier>,
+    /// HelpScout source for live conversation listing (as an `IssueSource`).
+    helpscout: Option<&'a dyn IssueSource>,
+    /// Discord bot client for live message listing.
+    discord_lister: Option<&'a dyn DiscordMessageLister>,
+    /// Guild id used to resolve channel names to ids for Discord listing.
+    discord_guild_id: Option<&'a str>,
 }
 
 /// Outcome of handling a POST: either a bare 202 ack (for notifications) or a
@@ -94,6 +134,9 @@ pub(crate) async fn mcp_post_handler(
         discord_search: state.discord_search_service.as_deref(),
         tracker: state.tracker.as_ref(),
         cf_verifier: state.mcp_cf_verifier.as_deref(),
+        helpscout: state.helpscout_source.as_deref(),
+        discord_lister: state.discord_lister.as_deref(),
+        discord_guild_id: state.discord_guild_id.as_deref(),
     };
     handle_request(&ctx, &headers, &body).await
 }
@@ -409,6 +452,37 @@ fn tool_definitions(cfg: &McpSearchServerConfig) -> Vec<Value> {
                 "required": ["query"]
             }
         }));
+
+        tools.push(json!({
+            "name": "discord_list_messages",
+            "description": "List the most recent messages in a Discord channel (live, \
+                not semantic). Identify the channel by `channel_id`, or by `channel` \
+                name which is resolved within the configured guild.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "string", "description": "Discord channel id." },
+                    "channel": { "type": "string", "description": "Channel name (resolved to an id within the guild)." },
+                    "limit": { "type": "integer", "description": "Max messages to return (newest first).", "minimum": 1 }
+                },
+                "required": []
+            }
+        }));
+    }
+
+    if cfg.expose_helpscout {
+        tools.push(json!({
+            "name": "helpscout_list_conversations",
+            "description": "List current HelpScout conversations (live) from the \
+                configured mailboxes, newest first, with status, customer and link.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "Max conversations to return.", "minimum": 1 }
+                },
+                "required": []
+            }
+        }));
     }
 
     tools
@@ -434,6 +508,12 @@ async fn call_tool(ctx: &McpContext<'_>, params: &Value) -> Result<Value, ToolEr
         "code_search" if ctx.cfg.expose_code => Ok(code_search(ctx, &args).await),
         "find_symbol" if ctx.cfg.expose_code => Ok(find_symbol(ctx, &args)),
         "discord_search" if ctx.cfg.expose_discord => Ok(discord_search(ctx, &args).await),
+        "discord_list_messages" if ctx.cfg.expose_discord => {
+            Ok(discord_list_messages(ctx, &args).await)
+        }
+        "helpscout_list_conversations" if ctx.cfg.expose_helpscout => {
+            Ok(helpscout_list_conversations(ctx, &args).await)
+        }
         other => Err(ToolError::Protocol {
             code: -32602,
             message: format!("Unknown tool: {other}"),
@@ -518,6 +598,68 @@ async fn discord_search(ctx: &McpContext<'_>, args: &Value) -> Value {
             &results,
         )),
         Err(e) => tool_error(&format!("Discord search failed: {e}")),
+    }
+}
+
+/// Live listing of recent messages in a Discord channel (not semantic search).
+async fn discord_list_messages(ctx: &McpContext<'_>, args: &Value) -> Value {
+    let Some(lister) = ctx.discord_lister else {
+        return tool_error("Discord listing is unavailable (no Discord bot token configured).");
+    };
+    let channel_id = match resolve_discord_channel(ctx, lister, args).await {
+        Ok(id) => id,
+        Err(msg) => return tool_error(&msg),
+    };
+    let limit = ctx.cfg.resolve_limit(usize_arg(args, "limit"));
+
+    match lister.list_channel_messages(&channel_id, limit).await {
+        Ok(messages) => tool_text(format_discord_messages(&channel_id, &messages)),
+        Err(e) => tool_error(&format!("Discord message listing failed: {e}")),
+    }
+}
+
+/// Resolve the target channel id from `channel_id` (preferred) or `channel`
+/// name (resolved within the configured guild). A present-but-blank value is an
+/// error, as is the absence of both.
+async fn resolve_discord_channel(
+    ctx: &McpContext<'_>,
+    lister: &dyn DiscordMessageLister,
+    args: &Value,
+) -> Result<String, String> {
+    if let Some(id) = scoped_str_arg(args, "channel_id")? {
+        return Ok(id.to_string());
+    }
+    if let Some(name) = scoped_str_arg(args, "channel")? {
+        let guild = ctx.discord_guild_id.ok_or_else(|| {
+            "Channel-name resolution needs a configured guild_id; pass 'channel_id' instead."
+                .to_string()
+        })?;
+        let channels = lister
+            .list_guild_channels(guild)
+            .await
+            .map_err(|e| format!("Failed to list Discord channels: {e}"))?;
+        return channels
+            .iter()
+            .find(|c| c.name.as_deref() == Some(name))
+            .map(|c| c.id.clone())
+            .ok_or_else(|| format!("Channel '{name}' not found in the configured guild."));
+    }
+    Err("Provide 'channel_id' or 'channel'.".to_string())
+}
+
+/// Live listing of HelpScout conversations from the configured mailboxes.
+async fn helpscout_list_conversations(ctx: &McpContext<'_>, args: &Value) -> Value {
+    let Some(source) = ctx.helpscout else {
+        return tool_error("HelpScout listing is unavailable (HelpScout not configured).");
+    };
+    let limit = ctx.cfg.resolve_limit(usize_arg(args, "limit"));
+
+    match source.fetch_issues().await {
+        Ok(mut issues) => {
+            issues.truncate(limit);
+            tool_text(format_helpscout_conversations(&issues))
+        }
+        Err(e) => tool_error(&format!("HelpScout listing failed: {e}")),
     }
 }
 
@@ -669,6 +811,62 @@ fn format_symbols(
     out
 }
 
+fn format_discord_messages(channel_id: &str, messages: &[DiscordMessage]) -> String {
+    use std::fmt::Write;
+
+    if messages.is_empty() {
+        return format!("No messages found in channel {channel_id}.");
+    }
+
+    let mut out = format!(
+        "{} recent message(s) in channel {channel_id} (newest first):\n",
+        messages.len()
+    );
+    for msg in messages {
+        let author = msg
+            .author
+            .as_ref()
+            .map(|u| u.username.as_str())
+            .unwrap_or("unknown");
+        let content = truncate_on_boundary(&msg.content, 500);
+        let _ = write!(out, "\n**{}** · {}\n{}", author, msg.timestamp, content);
+        if !msg.embeds.is_empty() {
+            let _ = write!(out, "\n({} embed(s))", msg.embeds.len());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn format_helpscout_conversations(issues: &[claudear_core::types::Issue]) -> String {
+    use std::fmt::Write;
+
+    if issues.is_empty() {
+        return "No HelpScout conversations found.".to_string();
+    }
+
+    let mut out = format!("Found {} HelpScout conversation(s):\n", issues.len());
+    for issue in issues {
+        let _ = write!(out, "\n- **{}** {}", issue.short_id, issue.title);
+        if let Some(status) = issue
+            .get_metadata::<String>("status")
+            .filter(|s| !s.is_empty())
+        {
+            let _ = write!(out, " [{status}]");
+        }
+        if let Some(email) = issue
+            .get_metadata::<String>("customer_email")
+            .filter(|s| !s.is_empty())
+        {
+            let _ = write!(out, " — {email}");
+        }
+        if !issue.url.is_empty() {
+            let _ = write!(out, "\n  {}", issue.url);
+        }
+    }
+    out
+}
+
 fn truncate_on_boundary(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -711,7 +909,10 @@ mod tests {
     use crate::knowledgebase::{DiscordIndexer, DiscordMessageInput};
     use crate::repo::code_index::{CodeIndexer, CodeSearchService};
     use crate::storage::{SqliteTracker, UserStore};
+    use async_trait::async_trait;
     use axum::http::HeaderName;
+    use claudear_core::types::{Issue, MatchPriority, MatchResult};
+    use claudear_integrations::discord::DiscordUser;
 
     /// Build a live search environment (embedding client + a tracker with the
     /// vectorlite extension loaded). Returns `None` when either is unavailable,
@@ -749,6 +950,9 @@ mod tests {
             enabled: true,
             expose_code,
             expose_discord,
+            // Off by default here so most tests stay focused on code/discord;
+            // the HelpScout tests set it explicitly.
+            expose_helpscout: false,
             ..Default::default()
         }
     }
@@ -766,6 +970,9 @@ mod tests {
             discord_search: None,
             tracker,
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         }
     }
 
@@ -793,15 +1000,39 @@ mod tests {
     #[test]
     fn tool_definitions_respect_toggles() {
         let all = tool_names(&tool_definitions(&cfg(true, true)));
-        assert_eq!(all, vec!["code_search", "find_symbol", "discord_search"]);
+        assert_eq!(
+            all,
+            vec![
+                "code_search",
+                "find_symbol",
+                "discord_search",
+                "discord_list_messages"
+            ]
+        );
 
         let code_only = tool_names(&tool_definitions(&cfg(true, false)));
         assert_eq!(code_only, vec!["code_search", "find_symbol"]);
 
         let discord_only = tool_names(&tool_definitions(&cfg(false, true)));
-        assert_eq!(discord_only, vec!["discord_search"]);
+        assert_eq!(
+            discord_only,
+            vec!["discord_search", "discord_list_messages"]
+        );
 
         assert!(tool_definitions(&cfg(false, false)).is_empty());
+
+        // HelpScout is a separate toggle.
+        let hs = McpSearchServerConfig {
+            enabled: true,
+            expose_code: false,
+            expose_discord: false,
+            expose_helpscout: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_names(&tool_definitions(&hs)),
+            vec!["helpscout_list_conversations"]
+        );
     }
 
     #[test]
@@ -885,6 +1116,9 @@ mod tests {
             discord_search: None,
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
 
         // No scope keys → unscoped.
@@ -1248,6 +1482,9 @@ mod tests {
             discord_search: None,
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
 
         // No token → 401.
@@ -1276,6 +1513,9 @@ mod tests {
             discord_search: None,
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
 
         let mut bad = HeaderMap::new();
@@ -1307,6 +1547,9 @@ mod tests {
             discord_search: None,
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
         assert_eq!(
             handle_request(&ctx, &HeaderMap::new(), PING).await.status(),
@@ -1326,6 +1569,9 @@ mod tests {
             discord_search: None,
             tracker: tracker.as_ref(),
             cf_verifier: Some(&verifier),
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
         // Missing Cf-Access-Jwt-Assertion header → 403.
         assert_eq!(
@@ -1395,6 +1641,9 @@ mod tests {
             discord_search: None,
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
 
         let resp = post(
@@ -1493,6 +1742,9 @@ mod tests {
             discord_search: None,
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
 
         let resp = post(
@@ -1611,6 +1863,9 @@ mod tests {
             discord_search: Some(&service),
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
 
         let resp = post(
@@ -1653,6 +1908,9 @@ mod tests {
             discord_search: Some(&service),
             tracker: tracker.as_ref(),
             cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
         };
         let resp = post(
             &ctx_capped,
@@ -1710,5 +1968,280 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    // --- list tools (HelpScout + Discord) -----------------------------------
+
+    /// A fake HelpScout `IssueSource` returning canned conversations.
+    struct FakeHelpScout {
+        issues: Vec<Issue>,
+    }
+
+    #[async_trait]
+    impl IssueSource for FakeHelpScout {
+        fn name(&self) -> &str {
+            "helpscout"
+        }
+        fn display_name(&self) -> &str {
+            "HelpScout"
+        }
+        async fn fetch_issues(&self) -> crate::error::Result<Vec<Issue>> {
+            Ok(self.issues.clone())
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult {
+                matches: false,
+                reason: String::new(),
+                priority: MatchPriority::default(),
+            }
+        }
+        async fn build_issue_context(&self, _issue: &Issue) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn get_issue(&self, _issue_id: &str) -> crate::error::Result<Issue> {
+            Err(crate::error::Error::Other("not implemented".into()))
+        }
+    }
+
+    fn hs_issue(short: &str, title: &str, status: &str, email: &str) -> Issue {
+        let mut issue = Issue::new(
+            short,
+            short,
+            title,
+            "https://secure.helpscout.net/conversation/1",
+            "helpscout",
+        );
+        issue.set_metadata("status", status.to_string());
+        issue.set_metadata("customer_email", email.to_string());
+        issue
+    }
+
+    #[tokio::test]
+    async fn helpscout_list_tool_returns_conversations_and_applies_limit() {
+        let cfg = McpSearchServerConfig {
+            enabled: true,
+            expose_code: false,
+            expose_discord: false,
+            expose_helpscout: true,
+            max_limit: 2,
+            ..Default::default()
+        };
+        let source = FakeHelpScout {
+            issues: vec![
+                hs_issue("HS-1", "Login broken", "active", "a@x.com"),
+                hs_issue("HS-2", "Billing question", "pending", "b@x.com"),
+                hs_issue("HS-3", "Feature request", "active", "c@x.com"),
+            ],
+        };
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: &tracker,
+            cf_verifier: None,
+            helpscout: Some(&source),
+            discord_lister: None,
+            discord_guild_id: None,
+        };
+
+        let resp = post(
+            &ctx,
+            json!({ "id": 1, "method": "tools/call",
+                    "params": { "name": "helpscout_list_conversations", "arguments": { "limit": 10 } } }),
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // Limit caps 3 -> 2, and fields render.
+        assert!(
+            text.contains("Found 2 HelpScout conversation(s)"),
+            "got: {text}"
+        );
+        assert!(text.contains("HS-1") && text.contains("Login broken"));
+        assert!(text.contains("[active]") && text.contains("a@x.com"));
+        assert!(!text.contains("HS-3"), "limit not applied: {text}");
+    }
+
+    #[tokio::test]
+    async fn helpscout_list_tool_reports_unavailable() {
+        let cfg = McpSearchServerConfig {
+            enabled: true,
+            expose_helpscout: true,
+            ..Default::default()
+        };
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: &tracker,
+            cf_verifier: None,
+            helpscout: None,
+            discord_lister: None,
+            discord_guild_id: None,
+        };
+        let resp = post(
+            &ctx,
+            json!({ "id": 1, "method": "tools/call",
+                    "params": { "name": "helpscout_list_conversations", "arguments": {} } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    /// A fake Discord lister returning canned messages/channels.
+    struct FakeDiscord {
+        messages: Vec<DiscordMessage>,
+        channels: Vec<DiscordChannel>,
+    }
+
+    #[async_trait]
+    impl DiscordMessageLister for FakeDiscord {
+        async fn list_channel_messages(
+            &self,
+            _channel_id: &str,
+            limit: usize,
+        ) -> crate::error::Result<Vec<DiscordMessage>> {
+            Ok(self.messages.iter().take(limit).cloned().collect())
+        }
+        async fn list_guild_channels(
+            &self,
+            _guild_id: &str,
+        ) -> crate::error::Result<Vec<DiscordChannel>> {
+            Ok(self.channels.clone())
+        }
+    }
+
+    fn dmsg(id: &str, author: &str, content: &str) -> DiscordMessage {
+        DiscordMessage {
+            id: id.to_string(),
+            channel_id: "100".to_string(),
+            author: Some(DiscordUser {
+                id: "u1".to_string(),
+                username: author.to_string(),
+                discriminator: "0".to_string(),
+                avatar: None,
+                bot: false,
+            }),
+            content: content.to_string(),
+            timestamp: "2024-01-01T10:00:00Z".to_string(),
+            message_reference: None,
+            thread: None,
+            webhook_id: None,
+            embeds: Vec::new(),
+            mentions: Vec::new(),
+        }
+    }
+
+    fn dchan(id: &str, name: &str) -> DiscordChannel {
+        DiscordChannel {
+            id: id.to_string(),
+            channel_type: 0,
+            guild_id: Some("guild1".to_string()),
+            name: Some(name.to_string()),
+            parent_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn discord_list_messages_tool_lists_and_resolves_names() {
+        let cfg = cfg(false, true);
+        let lister = FakeDiscord {
+            messages: vec![
+                dmsg("1", "alice", "first message"),
+                dmsg("2", "bob", "second message"),
+            ],
+            channels: vec![dchan("100", "engineering"), dchan("200", "random")],
+        };
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: &tracker,
+            cf_verifier: None,
+            helpscout: None,
+            discord_lister: Some(&lister),
+            discord_guild_id: Some("guild1"),
+        };
+
+        // By channel id.
+        let resp = post(
+            &ctx,
+            json!({ "id": 1, "method": "tools/call",
+                    "params": { "name": "discord_list_messages", "arguments": { "channel_id": "100", "limit": 10 } } }),
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("alice") && text.contains("first message"),
+            "got: {text}"
+        );
+
+        // By channel name (resolved via guild channels).
+        let resp = post(
+            &ctx,
+            json!({ "id": 2, "method": "tools/call",
+                    "params": { "name": "discord_list_messages", "arguments": { "channel": "engineering" } } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"].get("isError"), None);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("message"));
+
+        // Unknown channel name -> tool error.
+        let resp = post(
+            &ctx,
+            json!({ "id": 3, "method": "tools/call",
+                    "params": { "name": "discord_list_messages", "arguments": { "channel": "nope" } } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+
+        // Neither channel nor channel_id -> tool error.
+        let resp = post(
+            &ctx,
+            json!({ "id": 4, "method": "tools/call",
+                    "params": { "name": "discord_list_messages", "arguments": {} } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn discord_list_messages_tool_reports_unavailable() {
+        let cfg = cfg(false, true);
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ctx = test_ctx(&cfg, &tracker); // discord_lister None
+        let resp = post(
+            &ctx,
+            json!({ "id": 1, "method": "tools/call",
+                    "params": { "name": "discord_list_messages", "arguments": { "channel_id": "100" } } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[test]
+    fn format_list_outputs_render() {
+        assert_eq!(
+            format_helpscout_conversations(&[]),
+            "No HelpScout conversations found."
+        );
+        let hs = format_helpscout_conversations(&[hs_issue("HS-9", "Oops", "active", "z@x.com")]);
+        assert!(hs.contains("HS-9") && hs.contains("Oops") && hs.contains("[active]"));
+
+        assert!(format_discord_messages("100", &[]).contains("No messages"));
+        let dm = format_discord_messages("100", &[dmsg("1", "alice", "hello world")]);
+        assert!(dm.contains("alice") && dm.contains("hello world"));
     }
 }

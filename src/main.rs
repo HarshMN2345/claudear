@@ -1143,6 +1143,46 @@ fn create_sources(
     sources.into_iter().map(InstrumentedSource::wrap).collect()
 }
 
+/// Build the live backends for the MCP list tools: a HelpScout source (for
+/// `helpscout_list_conversations`) and a Discord bot client + guild id (for
+/// `discord_list_messages`). Returns `None` for each when not configured.
+#[allow(clippy::type_complexity)]
+fn build_mcp_list_backends(
+    config: &Config,
+) -> (
+    Option<Arc<dyn IssueSource>>,
+    Option<Arc<claudear::discord::DiscordClient>>,
+    Option<String>,
+) {
+    let helpscout = config
+        .helpscout()
+        .filter(|c| {
+            c.enabled
+                && !c.app_id.expose().is_empty()
+                && !c.app_secret.expose().is_empty()
+                && !c.mailbox_ids.is_empty()
+        })
+        .map(|c| Arc::new(HelpScoutSource::new(c.clone())) as Arc<dyn IssueSource>);
+
+    let discord = config.discord_merged();
+    let bot_token = discord
+        .bot_token
+        .as_ref()
+        .map(|t| t.expose().to_string())
+        .filter(|t| !t.trim().is_empty());
+    let (discord_client, guild_id) = match bot_token {
+        Some(token) => (
+            claudear::discord::DiscordClient::new(token)
+                .ok()
+                .map(Arc::new),
+            discord.guild_id.clone().filter(|g| !g.trim().is_empty()),
+        ),
+        None => (None, None),
+    };
+
+    (helpscout, discord_client, guild_id)
+}
+
 fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
     let mut registry = WebhookHandlerRegistry::new();
 
@@ -3643,6 +3683,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 server.set_issue_embedding_service(issue_embedding_service_clone);
                 server.set_code_search_service(code_search_service_clone);
                 server.set_discord_search_service(discord_search_service_clone);
+                let (hs_source, discord_client, discord_guild) = build_mcp_list_backends(&config);
+                server.set_helpscout_source(hs_source);
+                server.set_discord_client(discord_client, discord_guild);
                 server.set_review_watcher(review_watcher_clone);
                 if enable_dashboard {
                     server.set_dashboard(std::path::PathBuf::from(config_path.clone()));
@@ -4295,6 +4338,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_issue_embedding_service(deps.issue_embedding_service);
             server.set_code_search_service(deps.code_search_service);
             server.set_discord_search_service(deps.discord_search_service);
+            let (hs_source, discord_client, discord_guild) = build_mcp_list_backends(&config);
+            server.set_helpscout_source(hs_source);
+            server.set_discord_client(discord_client, discord_guild);
             server.set_review_watcher(deps.review_watcher);
 
             let regression_handle = start_regression_monitoring(

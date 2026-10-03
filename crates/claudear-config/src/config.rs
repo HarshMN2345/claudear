@@ -541,8 +541,11 @@ pub struct McpSearchServerConfig {
     pub enabled: bool,
     /// Expose the `code_search` / `find_symbol` tools (requires code indexing).
     pub expose_code: bool,
-    /// Expose the `discord_search` tool (requires the Discord knowledgebase).
+    /// Expose the `discord_search` and `discord_list_messages` tools (require the
+    /// Discord knowledgebase / bot token respectively).
     pub expose_discord: bool,
+    /// Expose the `helpscout_list_conversations` tool (requires HelpScout).
+    pub expose_helpscout: bool,
     /// Default number of results returned by search tools when the caller
     /// omits `limit`.
     pub default_limit: usize,
@@ -590,6 +593,7 @@ impl Default for McpSearchServerConfig {
             enabled: true,
             expose_code: true,
             expose_discord: true,
+            expose_helpscout: true,
             default_limit: 10,
             max_limit: 50,
             allowed_origins: Vec::new(),
