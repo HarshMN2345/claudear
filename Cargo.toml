@@ -337,6 +337,7 @@ libc = { workspace = true }
 mockall = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = { workspace = true }
+tempfile = { workspace = true }
 
 [profile.dev]
 debug = 1                  # Line tables only (not full debuginfo)

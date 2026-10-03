@@ -150,6 +150,16 @@ impl SqliteTracker {
         self.indexing_tx.subscribe()
     }
 
+    /// Whether the vectorlite extension can be loaded for this tracker (and, as a
+    /// side effect, load it on the shared connection). Vector search returns no
+    /// results without it, so callers/tests can gate on this.
+    pub fn vectorlite_available(&self) -> bool {
+        match self.acquire_lock() {
+            Ok(conn) => try_load_vectorlite(&conn).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
     fn acquire_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|e| {

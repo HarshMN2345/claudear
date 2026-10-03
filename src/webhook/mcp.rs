@@ -709,9 +709,26 @@ fn tool_error(message: &str) -> Value {
 mod tests {
     use super::*;
     use crate::knowledgebase::{DiscordIndexer, DiscordMessageInput};
-    use crate::repo::code_index::CodeSearchService;
+    use crate::repo::code_index::{CodeIndexer, CodeSearchService};
     use crate::storage::{SqliteTracker, UserStore};
     use axum::http::HeaderName;
+
+    /// Build a live search environment (embedding client + a tracker with the
+    /// vectorlite extension loaded). Returns `None` when either is unavailable,
+    /// so the populated semantic-search tests skip locally but run in CI (where
+    /// both are installed) and there assert real results.
+    fn live_search_env() -> Option<(
+        Arc<dyn FixAttemptTracker>,
+        Arc<crate::feedback::EmbeddingClient>,
+    )> {
+        let emb = try_embedding_client()?;
+        let sqlite = SqliteTracker::in_memory().unwrap();
+        if !sqlite.vectorlite_available() {
+            return None;
+        }
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(sqlite);
+        Some((tracker, emb))
+    }
     use claudear_core::types::{CodeChunk, CodeSearchResult, CodeSymbol, Language, SymbolKind};
     use std::sync::Arc;
 
@@ -1423,11 +1440,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn code_search_tool_runs_through_a_live_service() {
-        let Some(emb) = try_embedding_client() else {
+    async fn code_search_tool_returns_populated_results() {
+        let Some((tracker, emb)) = live_search_env() else {
             return;
         };
-        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        // Index a tiny repo so the vector search has something to return.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.rs"),
+            "/// Parse the application configuration from disk.\n\
+             pub fn parse_config(path: &str) -> Config { load(path) }\n",
+        )
+        .unwrap();
+        CodeIndexer::new(tracker.clone(), emb.clone())
+            .index_repo("org/repo", dir.path())
+            .await
+            .unwrap();
+
         let service = CodeSearchService::new(tracker.clone(), emb);
         let c = cfg(true, false);
         let ctx = McpContext {
@@ -1443,25 +1473,23 @@ mod tests {
             json!({
                 "id": 1,
                 "method": "tools/call",
-                "params": { "name": "code_search", "arguments": { "query": "parse config" } }
+                "params": { "name": "code_search", "arguments": { "query": "parse configuration" } }
             }),
         )
         .await
         .unwrap();
 
-        // The live service runs (embeds + vector search); empty index yields the
-        // no-match text, but the tool path and formatting are exercised without a
-        // protocol or tool error.
         assert!(resp.get("error").is_none());
         assert_eq!(resp["result"].get("isError"), None);
-        assert!(!resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .is_empty());
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // Populated, labelled result (repo name + file) proves query is forwarded
+        // and results are rendered.
+        assert!(text.contains("code match"), "expected results: {text}");
+        assert!(text.contains("org/repo"), "missing repo label: {text}");
+        assert!(text.contains("config.rs"), "missing file: {text}");
 
-        // Forwarding is observable without vector results: a missing query and a
-        // malformed scope must surface as tool errors (so a regression that drops
-        // either argument check is caught).
+        // Forwarding is also observable on the error paths: a missing query and a
+        // malformed scope must surface as tool errors.
         let missing_query = post(
             &ctx,
             json!({ "id": 2, "method": "tools/call",
@@ -1483,11 +1511,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discord_search_tool_returns_results_through_tool() {
-        let Some(emb) = try_embedding_client() else {
+    async fn discord_search_tool_returns_populated_results() {
+        let Some((tracker, emb)) = live_search_env() else {
             return;
         };
-        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
 
         let indexer = DiscordIndexer::new(tracker.clone(), emb.clone());
         let msg = |id: &str, ts: &str| DiscordMessageInput {
@@ -1554,19 +1581,18 @@ mod tests {
         .await
         .unwrap();
 
-        // Runs through the tool against a populated index with no error; the
-        // retrieved context (or the no-results text when vectorlite is absent)
-        // is always a non-empty text block.
+        // Vector search is available (live_search_env gated on it), so results are
+        // populated and the channel scope is forwarded: the retrieved context
+        // references chan1 and never the foreign chan2.
         assert!(resp.get("error").is_none());
         assert_eq!(resp["result"].get("isError"), None);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(!text.is_empty());
-        // When vector search is available, the channel scope is forwarded: the
-        // retrieved context references chan1 and never the foreign chan2.
-        if text.contains("Relevant Discussions") {
-            assert!(text.contains("chan1"), "got: {text}");
-            assert!(!text.contains("chan2"), "channel scope leaked: {text}");
-        }
+        assert!(
+            text.contains("Relevant Discussions"),
+            "expected populated results: {text}"
+        );
+        assert!(text.contains("chan1"), "got: {text}");
+        assert!(!text.contains("chan2"), "channel scope leaked: {text}");
 
         // Forwarding is observable without vector results: a missing query and a
         // malformed channel_id scope must surface as tool errors.
