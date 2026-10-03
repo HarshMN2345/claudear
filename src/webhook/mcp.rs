@@ -502,7 +502,12 @@ async fn discord_search(ctx: &McpContext<'_>, args: &Value) -> Value {
         return tool_error("Missing required argument: query");
     };
 
-    let channel_id = str_arg(args, "channel_id");
+    // A present-but-invalid channel_id must error rather than silently search
+    // every channel (same rule as repo scoping for the code tools).
+    let channel_id = match scoped_str_arg(args, "channel_id") {
+        Ok(c) => c,
+        Err(msg) => return tool_error(&msg),
+    };
     let limit = ctx.cfg.resolve_limit(usize_arg(args, "limit"));
 
     match service.search(query, channel_id, limit).await {
@@ -527,6 +532,21 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn usize_arg(args: &Value, key: &str) -> Option<usize> {
     args.get(key).and_then(Value::as_u64).map(|v| v as usize)
+}
+
+/// Resolve an optional string scope argument: absent → `Ok(None)`, a non-empty
+/// string → `Ok(Some(..))`, and anything else present (wrong type, blank) →
+/// `Err`, so a malformed scope cannot silently broaden the search.
+fn scoped_str_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Some)
+            .ok_or_else(|| format!("Argument '{key}' must be a non-empty string.")),
+    }
 }
 
 /// Resolve an optional repo scope from the arguments into a repo id.
@@ -1438,6 +1458,28 @@ mod tests {
             .as_str()
             .unwrap()
             .is_empty());
+
+        // Forwarding is observable without vector results: a missing query and a
+        // malformed scope must surface as tool errors (so a regression that drops
+        // either argument check is caught).
+        let missing_query = post(
+            &ctx,
+            json!({ "id": 2, "method": "tools/call",
+                    "params": { "name": "code_search", "arguments": {} } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing_query["result"]["isError"], true);
+
+        let bad_scope = post(
+            &ctx,
+            json!({ "id": 3, "method": "tools/call",
+                    "params": { "name": "code_search",
+                                "arguments": { "query": "x", "repo": "   " } } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bad_scope["result"]["isError"], true);
     }
 
     #[tokio::test]
@@ -1466,6 +1508,23 @@ mod tests {
                 vec![
                     msg("1", "2024-01-01T10:00:00Z"),
                     msg("2", "2024-01-01T10:01:00Z"),
+                ],
+            )
+            .await
+            .unwrap();
+        // A second channel so a dropped channel scope would surface foreign hits.
+        let msg2 = |id: &str, ts: &str| DiscordMessageInput {
+            channel_id: "chan2".to_string(),
+            content: format!("unrelated billing chatter {id}"),
+            ..msg(id, ts)
+        };
+        indexer
+            .index(
+                "chan2",
+                false,
+                vec![
+                    msg2("3", "2024-01-02T10:00:00Z"),
+                    msg2("4", "2024-01-02T10:01:00Z"),
                 ],
             )
             .await
@@ -1502,11 +1561,33 @@ mod tests {
         assert_eq!(resp["result"].get("isError"), None);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.is_empty());
-        // When vector search is available, the retrieved context references the
-        // channel we indexed.
+        // When vector search is available, the channel scope is forwarded: the
+        // retrieved context references chan1 and never the foreign chan2.
         if text.contains("Relevant Discussions") {
             assert!(text.contains("chan1"), "got: {text}");
+            assert!(!text.contains("chan2"), "channel scope leaked: {text}");
         }
+
+        // Forwarding is observable without vector results: a missing query and a
+        // malformed channel_id scope must surface as tool errors.
+        let missing_query = post(
+            &ctx,
+            json!({ "id": 2, "method": "tools/call",
+                    "params": { "name": "discord_search", "arguments": {} } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing_query["result"]["isError"], true);
+
+        let bad_scope = post(
+            &ctx,
+            json!({ "id": 3, "method": "tools/call",
+                    "params": { "name": "discord_search",
+                                "arguments": { "query": "x", "channel_id": 123 } } }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bad_scope["result"]["isError"], true);
     }
 
     #[tokio::test]
