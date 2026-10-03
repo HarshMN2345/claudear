@@ -1575,10 +1575,11 @@ mod tests {
             )
             .await
             .unwrap();
-        // A second channel so a dropped channel scope would surface foreign hits.
+        // A second channel whose messages ALSO match the query, so if the channel
+        // filter were dropped these would rank into the results and be detected.
         let msg2 = |id: &str, ts: &str| DiscordMessageInput {
             channel_id: "chan2".to_string(),
-            content: format!("unrelated billing chatter {id}"),
+            content: format!("deploy rollback incident {id}"),
             ..msg(id, ts)
         };
         indexer
@@ -1594,13 +1595,14 @@ mod tests {
             .unwrap();
 
         let service = crate::knowledgebase::DiscordSearchService::new(tracker.clone(), emb);
-        // max_limit below the number of chan1 matches, so the cap is observable.
+        // High limit so every match could surface: the channel filter is the only
+        // thing keeping chan2 out, making a dropped filter observable.
         let c = McpSearchServerConfig {
             enabled: true,
             expose_code: false,
             expose_discord: true,
             default_limit: 10,
-            max_limit: 1,
+            max_limit: 10,
             ..Default::default()
         };
         let ctx = McpContext {
@@ -1626,8 +1628,9 @@ mod tests {
         .unwrap();
 
         // Vector search is available (live_search_env gated on it), so results are
-        // populated and the channel scope is forwarded: the retrieved context
-        // references chan1 and never the foreign chan2.
+        // populated and the channel scope is forwarded: even though chan2 also
+        // matches the query, the retrieved context references chan1 and never
+        // chan2 — so dropping the filter would fail this.
         assert!(resp.get("error").is_none());
         assert_eq!(resp["result"].get("isError"), None);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -1637,8 +1640,34 @@ mod tests {
         );
         assert!(text.contains("chan1"), "got: {text}");
         assert!(!text.contains("chan2"), "channel scope leaked: {text}");
-        // Limit forwarding: chan1 has multiple matching chunks but max_limit caps
-        // the output at one (results are numbered "### 1.", "### 2." ...).
+
+        // Limit forwarding: with max_limit = 1 the multi-chunk chan1 result set is
+        // capped to a single entry (results are numbered "### 1.", "### 2." ...).
+        let capped = McpSearchServerConfig {
+            max_limit: 1,
+            ..c.clone()
+        };
+        let ctx_capped = McpContext {
+            cfg: &capped,
+            code_search: None,
+            discord_search: Some(&service),
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+        };
+        let resp = post(
+            &ctx_capped,
+            json!({
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "discord_search",
+                    "arguments": { "query": "deploy rollback", "channel_id": "chan1", "limit": 10 }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("### 1."), "expected a result entry: {text}");
         assert!(!text.contains("### 2."), "limit not applied: {text}");
 

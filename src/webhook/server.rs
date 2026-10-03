@@ -39,6 +39,10 @@ const PROCESSING_ENTRY_TTL_SECS: u64 = 3600;
 /// Maximum number of entries in the processing set before forced cleanup.
 const MAX_PROCESSING_ENTRIES: usize = 1000;
 
+/// Maximum concurrent `/mcp` requests. Semantic searches serialize on the shared
+/// embedding pool, so this caps queued blocking work under a burst.
+const MCP_MAX_CONCURRENCY: usize = 8;
+
 /// State shared across handlers.
 pub(crate) struct AppState {
     pub(crate) config: Config,
@@ -321,11 +325,18 @@ impl WebhookServer {
                     HeaderName::from_static("mcp-protocol-version"),
                     HeaderName::from_static("cf-access-jwt-assertion"),
                 ]);
+            // Bound concurrent MCP work: semantic searches each queue a blocking
+            // embedding job on a shared pool, so an unbounded burst of
+            // authenticated requests would pile up. Cap in-flight requests like
+            // the webhook route does (CORS stays outermost so preflight is free).
+            let mcp_stack = tower::ServiceBuilder::new()
+                .layer(mcp_cors)
+                .layer(ConcurrencyLimitLayer::new(MCP_MAX_CONCURRENCY));
             webhook_routes = webhook_routes.route(
                 "/mcp",
                 get(super::mcp::mcp_get_handler)
                     .post(super::mcp::mcp_post_handler)
-                    .layer(mcp_cors),
+                    .layer(mcp_stack),
             );
             tracing::info!("MCP search server enabled at /mcp");
         }
