@@ -55,6 +55,7 @@ struct McpContext<'a> {
     code_search: Option<&'a CodeSearchService>,
     discord_search: Option<&'a DiscordSearchService>,
     tracker: &'a dyn FixAttemptTracker,
+    cf_verifier: Option<&'a CfAccessVerifier>,
 }
 
 /// Outcome of handling a POST: either a bare 202 ack (for notifications) or a
@@ -87,40 +88,42 @@ pub(crate) async fn mcp_post_handler(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let cfg = &state.config.mcp_server;
+    let ctx = McpContext {
+        cfg: &state.config.mcp_server,
+        code_search: state.code_search_service.as_deref(),
+        discord_search: state.discord_search_service.as_deref(),
+        tracker: state.tracker.as_ref(),
+        cf_verifier: state.mcp_cf_verifier.as_deref(),
+    };
+    handle_request(&ctx, &headers, &body).await
+}
 
+/// Enforce the request gate (Origin, Cloudflare Access, bearer token) and then
+/// dispatch. Independent of axum extractors so the full HTTP path — including
+/// authentication outcomes — can be exercised in tests.
+async fn handle_request(ctx: &McpContext<'_>, headers: &HeaderMap, body: &[u8]) -> Response {
     // DNS-rebinding guard: a browser always sends `Origin`, so reject any origin
     // not explicitly allow-listed. CLI / server-to-server clients send none and
     // are allowed through.
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok());
-    if !origin_allowed(&cfg.allowed_origins, origin) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(rpc_error(
-                Value::Null,
-                -32001,
-                "Origin not allowed".to_string(),
-            )),
-        )
-            .into_response();
+    if !origin_allowed(&ctx.cfg.allowed_origins, origin) {
+        return forbidden("Origin not allowed");
     }
 
     // Enforce that the request transited Cloudflare Access (e.g. WARP) when
     // required, before any token/tool work.
-    if cfg.require_cloudflare_access {
-        if let Err(resp) =
-            enforce_cloudflare_access(&headers, state.mcp_cf_verifier.as_deref()).await
-        {
+    if ctx.cfg.require_cloudflare_access {
+        if let Err(resp) = enforce_cloudflare_access(headers, ctx.cf_verifier).await {
             return resp;
         }
     }
 
     // Require a per-user personal access token when configured, and identify the
     // caller for attribution.
-    if cfg.require_auth {
-        match authenticate_bearer(&headers, state.tracker.as_ref()) {
+    if ctx.cfg.require_auth {
+        match authenticate_bearer(headers, ctx.tracker) {
             Ok(user) => {
                 tracing::info!(
                     component = "mcp",
@@ -132,14 +135,7 @@ pub(crate) async fn mcp_post_handler(
         }
     }
 
-    let ctx = McpContext {
-        cfg,
-        code_search: state.code_search_service.as_deref(),
-        discord_search: state.discord_search_service.as_deref(),
-        tracker: state.tracker.as_ref(),
-    };
-
-    match process_post(&ctx, &body).await {
+    match process_post(ctx, body).await {
         PostOutcome::Accepted => StatusCode::ACCEPTED.into_response(),
         PostOutcome::Json(value) => Json(value).into_response(),
     }
@@ -559,11 +555,12 @@ fn resolve_repo(ctx: &McpContext<'_>, args: &Value) -> Result<Option<i64>, Strin
 /// Map every indexed repo id to its name, for labelling results. Falls back to
 /// an empty map (results then show `repo#<id>`) if the lookup fails.
 fn repo_name_map(tracker: &dyn FixAttemptTracker) -> HashMap<i64, String> {
+    // Reads only (id, name) so repos populated purely by code indexing (which
+    // lack discovery-index metadata) are still labelled with their name.
     tracker
-        .list_indexed_repos()
+        .list_repo_id_names()
         .unwrap_or_default()
         .into_iter()
-        .map(|r| (r.id, r.name))
         .collect()
 }
 
@@ -720,6 +717,7 @@ mod tests {
             code_search: None,
             discord_search: None,
             tracker,
+            cf_verifier: None,
         }
     }
 
@@ -1154,6 +1152,91 @@ mod tests {
         assert_eq!(user.email, "dev@example.com");
     }
 
+    // --- end-to-end gate tests through the HTTP handler (handle_request) -----
+
+    const PING: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+
+    #[tokio::test]
+    async fn handler_requires_bearer_token() {
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let uid = tracker.create_user("d@e.com", "h", "D", "viewer").unwrap();
+        let secret = "cldr_handler_secret";
+        tracker
+            .create_api_token(uid, "t", &hash_token(secret), "cldr_h", None)
+            .unwrap();
+
+        let cfg = cfg(true, true); // require_auth is true by default
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+        };
+
+        // No token → 401.
+        let resp = handle_request(&ctx, &HeaderMap::new(), PING).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Valid token → 200.
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {secret}").parse().unwrap(),
+        );
+        let resp = handle_request(&ctx, &h, PING).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_disallowed_origin() {
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut cfg = cfg(true, true);
+        cfg.require_auth = false; // isolate the Origin check
+        cfg.allowed_origins = vec!["https://ok.example".to_string()];
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+        };
+
+        let mut bad = HeaderMap::new();
+        bad.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        assert_eq!(
+            handle_request(&ctx, &bad, PING).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut ok = HeaderMap::new();
+        ok.insert(header::ORIGIN, "https://ok.example".parse().unwrap());
+        assert_eq!(
+            handle_request(&ctx, &ok, PING).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_enforces_cloudflare_access_when_required() {
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let mut cfg = cfg(true, true);
+        cfg.require_auth = false;
+        cfg.require_cloudflare_access = true;
+        // No verifier configured → the gate fails closed with 403.
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+        };
+        assert_eq!(
+            handle_request(&ctx, &HeaderMap::new(), PING).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
     #[tokio::test]
     async fn find_symbol_tool_scopes_by_repo_and_applies_limit() {
         // Needs a real CodeSearchService (construction requires an embedding
@@ -1204,6 +1287,7 @@ mod tests {
             code_search: Some(&service),
             discord_search: None,
             tracker: tracker.as_ref(),
+            cf_verifier: None,
         };
 
         let resp = post(

@@ -4163,6 +4163,15 @@ impl RepoStore for SqliteTracker {
         .map_err(Into::into)
     }
 
+    fn list_repo_id_names(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare("SELECT id, name FROM repositories")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // --- Analytics ---
 
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {

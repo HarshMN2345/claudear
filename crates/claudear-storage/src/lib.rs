@@ -1448,6 +1448,12 @@ pub trait RepoStore: Send + Sync {
         Ok(None)
     }
 
+    /// List every repository's (id, name), reading only those two columns so it
+    /// works for repos lacking discovery-index metadata. For labelling results.
+    fn list_repo_id_names(&self) -> Result<Vec<(i64, String)>> {
+        Ok(Vec::new())
+    }
+
     /// Get or create a repository ID by name.
     fn get_or_create_repo_id(&self, _name: &str) -> Result<i64> {
         Ok(0)
