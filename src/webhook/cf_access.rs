@@ -131,6 +131,10 @@ impl CfAccessVerifier {
             DecodingKey::from_jwk(&jwk).map_err(|e| format!("invalid Cloudflare key: {e}"))?;
 
         let mut validation = Validation::new(header.alg);
+        // jsonwebtoken only requires `exp` by default and validates aud/iss only
+        // when present. Require them so a signed token without aud/iss cannot pass
+        // without proving it belongs to the configured Access application.
+        validation.set_required_spec_claims(&["exp", "aud", "iss"]);
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
 
@@ -355,6 +359,28 @@ LylW2Cn3jMwQSP7PPLXmTZU=
         v.seed_cache_for_test(&jwks_json()).await; // cache holds only KID
         let tok = sign("aud-tag", ISS, (now_secs() + 3600) as usize, "rotated-kid");
         // Cooldown (seeded) blocks a refetch, so the unknown key simply misses.
+        assert!(v.verify(&tok).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_token_missing_aud_or_iss() {
+        #[derive(Serialize)]
+        struct BareClaims {
+            exp: usize,
+        }
+        let v = verifier();
+        v.seed_cache_for_test(&jwks_json()).await;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_string());
+        // Correctly signed, exp valid, but no aud/iss claims at all.
+        let tok = encode(
+            &header,
+            &BareClaims {
+                exp: (now_secs() + 3600) as usize,
+            },
+            &EncodingKey::from_rsa_pem(PRIV_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
         assert!(v.verify(&tok).await.is_err());
     }
 

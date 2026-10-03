@@ -13091,6 +13091,53 @@ mod tests {
     }
 
     #[test]
+    fn test_api_token_expiry_is_enforced_on_lookup() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("tok@test.com", "hash", "Tok", "viewer")
+            .unwrap();
+
+        // Past expiry → not resolvable.
+        tracker
+            .create_api_token(
+                user_id,
+                "past",
+                "hash_past",
+                "cldr_p",
+                Some("2000-01-01 00:00:00"),
+            )
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_past")
+            .unwrap()
+            .is_none());
+
+        // Future expiry → resolvable.
+        tracker
+            .create_api_token(
+                user_id,
+                "future",
+                "hash_future",
+                "cldr_f",
+                Some("2099-12-31 23:59:59"),
+            )
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_future")
+            .unwrap()
+            .is_some());
+
+        // No expiry → resolvable.
+        tracker
+            .create_api_token(user_id, "forever", "hash_forever", "cldr_x", None)
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_forever")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn test_delete_session() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let user_id = tracker
