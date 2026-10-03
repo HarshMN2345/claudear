@@ -681,6 +681,7 @@ mod tests {
     use super::*;
     use crate::repo::code_index::CodeSearchService;
     use crate::storage::{SqliteTracker, UserStore};
+    use axum::http::HeaderName;
     use claudear_core::types::{CodeChunk, CodeSearchResult, CodeSymbol, Language, SymbolKind};
     use std::sync::Arc;
 
@@ -1223,6 +1224,7 @@ mod tests {
         let mut cfg = cfg(true, true);
         cfg.require_auth = false;
         cfg.require_cloudflare_access = true;
+
         // No verifier configured → the gate fails closed with 403.
         let ctx = McpContext {
             cfg: &cfg,
@@ -1233,6 +1235,36 @@ mod tests {
         };
         assert_eq!(
             handle_request(&ctx, &HeaderMap::new(), PING).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // With a *configured* verifier: a missing assertion and a malformed
+        // assertion are both rejected (a genuine assertion is verified end-to-end
+        // in cf_access's own tests, which hold the signing key).
+        let verifier = CfAccessVerifier::new(&crate::config::CloudflareAccessConfig {
+            team_domain: "team.cloudflareaccess.com".to_string(),
+            audience: "aud-tag".to_string(),
+        });
+        let ctx = McpContext {
+            cfg: &cfg,
+            code_search: None,
+            discord_search: None,
+            tracker: tracker.as_ref(),
+            cf_verifier: Some(&verifier),
+        };
+        // Missing Cf-Access-Jwt-Assertion header → 403.
+        assert_eq!(
+            handle_request(&ctx, &HeaderMap::new(), PING).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // Malformed assertion → 403 (fails before any network).
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("cf-access-jwt-assertion"),
+            "not-a-jwt".parse().unwrap(),
+        );
+        assert_eq!(
+            handle_request(&ctx, &h, PING).await.status(),
             StatusCode::FORBIDDEN
         );
     }

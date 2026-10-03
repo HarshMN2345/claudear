@@ -3046,6 +3046,66 @@ mod tests {
             .with_state(state)
     }
 
+    /// Router-level coverage of the /mcp bearer gate: exercises real State
+    /// extraction and routing (not just the shared handler helper).
+    #[tokio::test]
+    async fn test_router_mcp_requires_valid_token() {
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let uid = tracker
+            .create_user("mcp@test.com", "h", "Mcp", "viewer")
+            .unwrap();
+        let secret = "cldr_router_secret";
+        tracker
+            .create_api_token(
+                uid,
+                "router",
+                &crate::webhook::mcp::hash_token(secret),
+                "cldr_r",
+                None,
+            )
+            .unwrap();
+        let state = make_app_state(WebhookHandlerRegistry::new(), tracker, None);
+        // test_config() enables the MCP server with require_auth = true.
+        let app = Router::new()
+            .route("/mcp", post(crate::webhook::mcp::mcp_post_handler))
+            .with_state(state);
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let req = |auth: Option<&str>| {
+            let mut b = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json");
+            if let Some(a) = auth {
+                b = b.header("authorization", a);
+            }
+            b.body(Body::from(body)).unwrap()
+        };
+
+        // Missing token → 401.
+        assert_eq!(
+            app.clone().oneshot(req(None)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Invalid token → 401.
+        assert_eq!(
+            app.clone()
+                .oneshot(req(Some("Bearer wrong")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Valid token → 200.
+        assert_eq!(
+            app.oneshot(req(Some(&format!("Bearer {secret}"))))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
     #[tokio::test]
     async fn test_router_health_endpoint_oneshot() {
         let mut handlers = WebhookHandlerRegistry::new();
