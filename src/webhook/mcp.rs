@@ -532,22 +532,31 @@ fn usize_arg(args: &Value, key: &str) -> Option<usize> {
 /// Resolve an optional repo scope from the arguments into a repo id.
 ///
 /// Accepts either `repo_id` (integer) directly, or `repo` (name) which is
-/// looked up in the index. Returns `Ok(None)` when neither is supplied, and
-/// `Err` with a user-facing message when a given name is not indexed.
+/// looked up in the index. Returns `Ok(None)` only when neither key is present.
+/// A key that is present but malformed (wrong type, blank name, unknown repo) is
+/// an `Err` rather than a silent fall-through to an unscoped search, which would
+/// otherwise leak results from other repositories.
 fn resolve_repo(ctx: &McpContext<'_>, args: &Value) -> Result<Option<i64>, String> {
-    if let Some(id) = args.get("repo_id").and_then(Value::as_i64) {
-        return Ok(Some(id));
+    if let Some(value) = args.get("repo_id") {
+        return match value.as_i64() {
+            Some(id) => Ok(Some(id)),
+            None => Err("Argument 'repo_id' must be an integer.".to_string()),
+        };
     }
-    let Some(name) = str_arg(args, "repo") else {
-        return Ok(None);
-    };
-    // Resolve by id only: a repo populated purely by code indexing may lack
-    // discovery-index metadata, which get_indexed_repo requires.
-    match ctx.tracker.get_repo_id_by_name(name) {
-        Ok(Some(id)) => Ok(Some(id)),
-        Ok(None) => Err(format!("Repository '{name}' is not indexed.")),
-        Err(e) => Err(format!("Failed to look up repository '{name}': {e}")),
+    if let Some(value) = args.get("repo") {
+        let name = value.as_str().map(str::trim).filter(|s| !s.is_empty());
+        let Some(name) = name else {
+            return Err("Argument 'repo' must be a non-empty string.".to_string());
+        };
+        // Resolve by id only: a repo populated purely by code indexing may lack
+        // discovery-index metadata, which get_indexed_repo requires.
+        return match ctx.tracker.get_repo_id_by_name(name) {
+            Ok(Some(id)) => Ok(Some(id)),
+            Ok(None) => Err(format!("Repository '{name}' is not indexed.")),
+            Err(e) => Err(format!("Failed to look up repository '{name}': {e}")),
+        };
     }
+    Ok(None)
 }
 
 // --- result formatting ------------------------------------------------------
@@ -679,6 +688,7 @@ fn tool_error(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledgebase::{DiscordIndexer, DiscordMessageInput};
     use crate::repo::code_index::CodeSearchService;
     use crate::storage::{SqliteTracker, UserStore};
     use axum::http::HeaderName;
@@ -825,6 +835,34 @@ mod tests {
         assert_eq!(str_arg(&args, "blank"), None);
         assert_eq!(str_arg(&args, "missing"), None);
         assert_eq!(str_arg(&args, "n"), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_rejects_malformed_scope() {
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let known = tracker.get_or_create_repo_id("org/known").unwrap();
+        let c = cfg(true, true);
+        let ctx = McpContext {
+            cfg: &c,
+            code_search: None,
+            discord_search: None,
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+        };
+
+        // No scope keys → unscoped.
+        assert_eq!(resolve_repo(&ctx, &json!({})), Ok(None));
+        // Valid repo_id / repo.
+        assert_eq!(resolve_repo(&ctx, &json!({ "repo_id": 5 })), Ok(Some(5)));
+        assert_eq!(
+            resolve_repo(&ctx, &json!({ "repo": "org/known" })),
+            Ok(Some(known))
+        );
+        // Present-but-malformed must error, not silently broaden to all repos.
+        assert!(resolve_repo(&ctx, &json!({ "repo_id": "x" })).is_err());
+        assert!(resolve_repo(&ctx, &json!({ "repo": 123 })).is_err());
+        assert!(resolve_repo(&ctx, &json!({ "repo": "   " })).is_err());
+        assert!(resolve_repo(&ctx, &json!({ "repo": "org/missing" })).is_err());
     }
 
     #[test]
@@ -1362,6 +1400,113 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bad["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn code_search_tool_runs_through_a_live_service() {
+        let Some(emb) = try_embedding_client() else {
+            return;
+        };
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+        let service = CodeSearchService::new(tracker.clone(), emb);
+        let c = cfg(true, false);
+        let ctx = McpContext {
+            cfg: &c,
+            code_search: Some(&service),
+            discord_search: None,
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+        };
+
+        let resp = post(
+            &ctx,
+            json!({
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "code_search", "arguments": { "query": "parse config" } }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The live service runs (embeds + vector search); empty index yields the
+        // no-match text, but the tool path and formatting are exercised without a
+        // protocol or tool error.
+        assert!(resp.get("error").is_none());
+        assert_eq!(resp["result"].get("isError"), None);
+        assert!(!resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_search_tool_returns_results_through_tool() {
+        let Some(emb) = try_embedding_client() else {
+            return;
+        };
+        let tracker: Arc<dyn FixAttemptTracker> = Arc::new(SqliteTracker::in_memory().unwrap());
+
+        let indexer = DiscordIndexer::new(tracker.clone(), emb.clone());
+        let msg = |id: &str, ts: &str| DiscordMessageInput {
+            message_id: id.to_string(),
+            channel_id: "chan1".to_string(),
+            guild_id: "guild1".to_string(),
+            channel_name: "general".to_string(),
+            is_thread: false,
+            author: "alice".to_string(),
+            content: format!("deploy rollback discussion {id}"),
+            timestamp: ts.to_string(),
+            reply_to: None,
+        };
+        indexer
+            .index(
+                "chan1",
+                false,
+                vec![
+                    msg("1", "2024-01-01T10:00:00Z"),
+                    msg("2", "2024-01-01T10:01:00Z"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let service = crate::knowledgebase::DiscordSearchService::new(tracker.clone(), emb);
+        let c = cfg(false, true);
+        let ctx = McpContext {
+            cfg: &c,
+            code_search: None,
+            discord_search: Some(&service),
+            tracker: tracker.as_ref(),
+            cf_verifier: None,
+        };
+
+        let resp = post(
+            &ctx,
+            json!({
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "discord_search",
+                    "arguments": { "query": "deploy rollback", "channel_id": "chan1" }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Runs through the tool against a populated index with no error; the
+        // retrieved context (or the no-results text when vectorlite is absent)
+        // is always a non-empty text block.
+        assert!(resp.get("error").is_none());
+        assert_eq!(resp["result"].get("isError"), None);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.is_empty());
+        // When vector search is available, the retrieved context references the
+        // channel we indexed.
+        if text.contains("Relevant Discussions") {
+            assert!(text.contains("chan1"), "got: {text}");
+        }
     }
 
     #[tokio::test]
