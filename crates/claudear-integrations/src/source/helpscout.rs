@@ -621,6 +621,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_list_conversations_forwards_status() {
+        let list = r#"{"_embedded":{"conversations":[
+            {"id":1,"number":1,"subject":"Closed one","status":"closed","mailboxId":1,
+             "primaryCustomer":{"id":1,"email":"a@b.com"}}
+        ]}}"#;
+        // The conversations response only matches when the URL carries
+        // status=closed, so a successful fetch proves the status was forwarded.
+        let mock = MockHttpClient::new(vec![
+            ("/v2/oauth2/token", 200, TOKEN_BODY),
+            ("status=closed", 200, list),
+        ]);
+        let source = HelpScoutSource::with_http_client(test_config(), mock);
+        let issues = source.list_conversations(Some("closed")).await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "1");
+
+        // A different status does not hit the status=closed stub -> 404 -> error,
+        // confirming the status really goes into the query (not hardcoded).
+        let mock2 = MockHttpClient::new(vec![
+            ("/v2/oauth2/token", 200, TOKEN_BODY),
+            ("status=closed", 200, list),
+        ]);
+        let source2 = HelpScoutSource::with_http_client(test_config(), mock2);
+        assert!(source2.list_conversations(Some("active")).await.is_err());
+    }
+
     #[test]
     fn test_matches_criteria_by_tag() {
         let source = HelpScoutSource::with_http_client(test_config(), MockHttpClient::new(vec![]));

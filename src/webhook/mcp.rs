@@ -616,17 +616,24 @@ fn resolve_search_channel(ctx: &McpContext<'_>, args: &Value) -> Result<Option<S
         return Ok(Some(id.to_string()));
     }
     if let Some(name) = scoped_str_arg(args, "channel")? {
-        let wanted = normalize_channel_name(name);
         let channels = ctx
             .tracker
             .list_discord_channels()
             .map_err(|e| format!("Failed to list indexed channels: {e}"))?;
-        return channels
-            .iter()
-            .find(|c| {
-                c.name
-                    .as_deref()
-                    .is_some_and(|n| normalize_channel_name(n) == wanted)
+        // Prefer an exact (case-insensitive) name before a loose match.
+        let exact = channels.iter().find(|c| {
+            c.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        });
+        let wanted = normalize_channel_name(name);
+        return exact
+            .or_else(|| {
+                channels.iter().find(|c| {
+                    c.name
+                        .as_deref()
+                        .is_some_and(|n| normalize_channel_name(n) == wanted)
+                })
             })
             .map(|c| Some(c.channel_id.clone()))
             .ok_or_else(|| format!("Channel '{name}' not found in the indexed channels."));
@@ -671,13 +678,21 @@ async fn resolve_discord_channel(
             .list_guild_channels(guild)
             .await
             .map_err(|e| format!("Failed to list Discord channels: {e}"))?;
+        // Prefer an exact (case-insensitive) name, falling back to a loose match,
+        // so `foo-bar` wins over `foobar` when both exist.
+        let exact = channels.iter().find(|c| {
+            c.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        });
         let wanted = normalize_channel_name(name);
-        return channels
-            .iter()
-            .find(|c| {
-                c.name
-                    .as_deref()
-                    .is_some_and(|n| normalize_channel_name(n) == wanted)
+        return exact
+            .or_else(|| {
+                channels.iter().find(|c| {
+                    c.name
+                        .as_deref()
+                        .is_some_and(|n| normalize_channel_name(n) == wanted)
+                })
             })
             .map(|c| c.id.clone())
             .ok_or_else(|| format!("Channel '{name}' not found in the configured guild."));
@@ -685,11 +700,13 @@ async fn resolve_discord_channel(
     Err("Provide 'channel_id' or 'channel'.".to_string())
 }
 
-/// Normalize a channel name for loose matching: lowercase, keep only ASCII
-/// alphanumerics. So "🗄-database", "Database", and "database" all compare equal.
+/// Normalize a channel name for loose matching: lowercase, keep alphanumerics
+/// (Unicode-aware, so non-Latin names like `日本語` survive), dropping spaces,
+/// punctuation and emoji. So "🗄-database", "Database", and "database" compare
+/// equal, while distinct non-ASCII names stay distinct.
 fn normalize_channel_name(name: &str) -> String {
     name.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -2375,6 +2392,13 @@ mod tests {
         assert_eq!(normalize_channel_name("DATA_BASE"), want); // underscores dropped
                                                                // Different words stay distinct.
         assert_ne!(normalize_channel_name("databases"), want);
+        // Non-ASCII letters are preserved (not collapsed to empty), so distinct
+        // non-Latin names remain distinct.
+        assert!(!normalize_channel_name("日本語").is_empty());
+        assert_ne!(
+            normalize_channel_name("日本語"),
+            normalize_channel_name("中文")
+        );
     }
 
     #[test]
@@ -2462,6 +2486,26 @@ mod tests {
         assert!(resolve_search_channel(&ctx, &json!({ "channel": "nope" })).is_err());
         // No scope -> None.
         assert_eq!(resolve_search_channel(&ctx, &json!({})).unwrap(), None);
+
+        // Exact name wins over a looser collision: with both "foo-bar" and
+        // "foobar" present, requesting "foo-bar" resolves to the exact channel.
+        for (id, name) in [("1", "foo-bar"), ("2", "foobar")] {
+            tracker
+                .upsert_discord_channel(
+                    id,
+                    Some("guild1"),
+                    None,
+                    Some(name),
+                    Some(0),
+                    claudear_core::types::DiscordChannelKind::Channel,
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            resolve_search_channel(&ctx, &json!({ "channel": "foo-bar" })).unwrap(),
+            Some("1".to_string())
+        );
     }
 
     #[tokio::test]
