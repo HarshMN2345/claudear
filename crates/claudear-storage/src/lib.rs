@@ -1440,6 +1440,14 @@ pub trait RepoStore: Send + Sync {
         Ok(None)
     }
 
+    /// Look up a repository id by name, reading only the id. Unlike
+    /// [`Self::get_indexed_repo`] this does not require discovery-index metadata
+    /// (e.g. `last_indexed_at`), so it resolves repos populated purely by code
+    /// indexing (`get_or_create_repo_id`).
+    fn get_repo_id_by_name(&self, _name: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
     /// Get or create a repository ID by name.
     fn get_or_create_repo_id(&self, _name: &str) -> Result<i64> {
         Ok(0)

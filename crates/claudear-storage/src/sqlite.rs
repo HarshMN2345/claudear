@@ -4152,6 +4152,17 @@ impl RepoStore for SqliteTracker {
         }
     }
 
+    fn get_repo_id_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.acquire_lock()?;
+        conn.query_row(
+            "SELECT id FROM repositories WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     // --- Analytics ---
 
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {

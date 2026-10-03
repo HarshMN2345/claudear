@@ -545,8 +545,10 @@ fn resolve_repo(ctx: &McpContext<'_>, args: &Value) -> Result<Option<i64>, Strin
     let Some(name) = str_arg(args, "repo") else {
         return Ok(None);
     };
-    match ctx.tracker.get_indexed_repo(name) {
-        Ok(Some(repo)) => Ok(Some(repo.id)),
+    // Resolve by id only: a repo populated purely by code indexing may lack
+    // discovery-index metadata, which get_indexed_repo requires.
+    match ctx.tracker.get_repo_id_by_name(name) {
+        Ok(Some(id)) => Ok(Some(id)),
         Ok(None) => Err(format!("Repository '{name}' is not indexed.")),
         Err(e) => Err(format!("Failed to look up repository '{name}': {e}")),
     }
@@ -1211,7 +1213,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "find_symbol",
-                    "arguments": { "name": "handle_", "repo_id": repo_id, "limit": 5 }
+                    "arguments": { "name": "handle_", "repo": "org/repo", "limit": 5 }
                 }
             }),
         )

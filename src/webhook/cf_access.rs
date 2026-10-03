@@ -37,6 +37,12 @@ const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Timeout for the JWKS fetch so a slow Cloudflare response cannot pile up.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hard ceiling on how long cached keys stay trusted once refreshes stop
+/// succeeding. Past the TTL we still serve cached keys so a transient Cloudflare
+/// outage doesn't lock everyone out, but beyond this we fail closed — otherwise
+/// a key Cloudflare has revoked could keep validating assertions indefinitely.
+const MAX_KEY_AGE: Duration = Duration::from_secs(24 * 3600);
+
 /// Claims we care about from a Cloudflare Access JWT.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CfAccessClaims {
@@ -152,13 +158,15 @@ impl CfAccessVerifier {
         }
     }
 
-    /// A key from the cache regardless of age.
+    /// A key from the cache, tolerating staleness up to `MAX_KEY_AGE` (so a
+    /// failed refresh during a transient outage still serves recent keys) but
+    /// failing closed beyond it, so a revoked key cannot stay trusted forever.
     async fn cached_key(&self, kid: &str) -> Option<jsonwebtoken::jwk::Jwk> {
-        self.cache
-            .read()
-            .await
-            .as_ref()
-            .and_then(|c| c.keys.find(kid).cloned())
+        let guard = self.cache.read().await;
+        match guard.as_ref() {
+            Some(c) if c.fetched_at.elapsed() < MAX_KEY_AGE => c.keys.find(kid).cloned(),
+            _ => None,
+        }
     }
 
     /// Refresh the JWKS, coalescing concurrent callers and enforcing a cooldown
@@ -213,11 +221,17 @@ impl CfAccessVerifier {
     /// a recent refresh so an unknown-kid lookup does not trigger a real fetch.
     #[cfg(test)]
     async fn seed_cache_for_test(&self, jwks_json: &str) {
+        self.seed_cache_aged_for_test(jwks_json, Duration::ZERO)
+            .await;
+    }
+
+    /// Seed the cache as if it were fetched `age` ago, to test staleness bounds.
+    #[cfg(test)]
+    async fn seed_cache_aged_for_test(&self, jwks_json: &str, age: Duration) {
         let keys: JwkSet = serde_json::from_str(jwks_json).unwrap();
-        *self.cache.write().await = Some(CachedJwks {
-            keys,
-            fetched_at: Instant::now(),
-        });
+        let fetched_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        *self.cache.write().await = Some(CachedJwks { keys, fetched_at });
+        // Mark a recent attempt so lookups don't trigger a real network fetch.
         *self.refresh_gate.lock().await = Some(Instant::now());
     }
 }
@@ -381,6 +395,17 @@ LylW2Cn3jMwQSP7PPLXmTZU=
             &EncodingKey::from_rsa_pem(PRIV_PEM.as_bytes()).unwrap(),
         )
         .unwrap();
+        assert!(v.verify(&tok).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_keys_older_than_max_age() {
+        let v = verifier();
+        // Cache fetched well beyond MAX_KEY_AGE and no refetch allowed (cooldown):
+        // even a valid token must fail closed rather than trust a stale key.
+        v.seed_cache_aged_for_test(&jwks_json(), MAX_KEY_AGE + Duration::from_secs(60))
+            .await;
+        let tok = sign("aud-tag", ISS, (now_secs() + 3600) as usize, KID);
         assert!(v.verify(&tok).await.is_err());
     }
 
