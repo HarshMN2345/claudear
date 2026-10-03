@@ -2487,8 +2487,11 @@ mod tests {
         // No scope -> None.
         assert_eq!(resolve_search_channel(&ctx, &json!({})).unwrap(), None);
 
-        // Exact name wins over a looser collision: with both "foo-bar" and
-        // "foobar" present, requesting "foo-bar" resolves to the exact channel.
+        // Exact name wins over a looser collision. Seed both "foo-bar" (id 1)
+        // and "foobar" (id 2); the registry orders by name so "foo-bar" is first.
+        // Request the EXACT "foobar": a loose-only resolver would wrongly return
+        // the first normalized match ("foo-bar", id 1), so only exact-before-loose
+        // yields id 2 — making this fail without the exact step.
         for (id, name) in [("1", "foo-bar"), ("2", "foobar")] {
             tracker
                 .upsert_discord_channel(
@@ -2503,8 +2506,8 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            resolve_search_channel(&ctx, &json!({ "channel": "foo-bar" })).unwrap(),
-            Some("1".to_string())
+            resolve_search_channel(&ctx, &json!({ "channel": "foobar" })).unwrap(),
+            Some("2".to_string())
         );
     }
 
