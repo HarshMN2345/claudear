@@ -186,6 +186,43 @@ impl<H: HttpClient> HelpScoutSource<H> {
             .await
     }
 
+    /// The status used when none is requested: the configured trigger status,
+    /// or "active" when unset.
+    fn default_status(&self) -> &str {
+        if self.config.trigger_status.trim().is_empty() {
+            "active"
+        } else {
+            self.config.trigger_status.as_str()
+        }
+    }
+
+    /// List conversations across the configured mailboxes filtered by `status`
+    /// (a HelpScout status such as "active"/"pending"/"closed", or "all").
+    async fn fetch_with_status(&self, status: &str) -> Result<Vec<Issue>> {
+        let mut issues = Vec::new();
+        for mailbox in &self.config.mailbox_ids {
+            let path = format!(
+                "/v2/conversations?mailbox={}&status={}&embed=threads",
+                urlencoding(mailbox),
+                urlencoding(status),
+            );
+            let resp = self.api_get(&path).await?;
+            if !resp.is_success() {
+                return Err(Error::source(
+                    "helpscout",
+                    format!("list conversations failed ({}): {}", resp.status, resp.body),
+                ));
+            }
+            let list: ConversationsListResponse = resp.json()?;
+            if let Some(embedded) = list.embedded {
+                for c in embedded.conversations {
+                    issues.push(self.map_conversation(c));
+                }
+            }
+        }
+        Ok(issues)
+    }
+
     /// Fetch the threads for a conversation (used to build full context).
     async fn fetch_threads(&self, conversation_id: &str) -> Vec<HsThread> {
         match self
@@ -323,34 +360,15 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
     }
 
     async fn fetch_issues(&self) -> Result<Vec<Issue>> {
-        let status = if self.config.trigger_status.trim().is_empty() {
-            "active"
-        } else {
-            self.config.trigger_status.as_str()
-        };
+        self.fetch_with_status(self.default_status()).await
+    }
 
-        let mut issues = Vec::new();
-        for mailbox in &self.config.mailbox_ids {
-            let path = format!(
-                "/v2/conversations?mailbox={}&status={}&embed=threads",
-                urlencoding(mailbox),
-                urlencoding(status),
-            );
-            let resp = self.api_get(&path).await?;
-            if !resp.is_success() {
-                return Err(Error::source(
-                    "helpscout",
-                    format!("list conversations failed ({}): {}", resp.status, resp.body),
-                ));
-            }
-            let list: ConversationsListResponse = resp.json()?;
-            if let Some(embedded) = list.embedded {
-                for c in embedded.conversations {
-                    issues.push(self.map_conversation(c));
-                }
-            }
-        }
-        Ok(issues)
+    async fn list_conversations(&self, status: Option<&str>) -> Result<Vec<Issue>> {
+        let status = status
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.default_status());
+        self.fetch_with_status(status).await
     }
 
     fn matches_criteria(&self, issue: &Issue) -> MatchResult {
