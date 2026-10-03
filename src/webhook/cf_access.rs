@@ -204,4 +204,186 @@ impl CfAccessVerifier {
             .await
             .map_err(|e| format!("failed to parse Cloudflare certs: {e}"))
     }
+
+    /// Seed the JWKS cache directly, bypassing the network, for tests. Also marks
+    /// a recent refresh so an unknown-kid lookup does not trigger a real fetch.
+    #[cfg(test)]
+    async fn seed_cache_for_test(&self, jwks_json: &str) {
+        let keys: JwkSet = serde_json::from_str(jwks_json).unwrap();
+        *self.cache.write().await = Some(CachedJwks {
+            keys,
+            fetched_at: Instant::now(),
+        });
+        *self.refresh_gate.lock().await = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde::Serialize;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const KID: &str = "test-kid";
+    const N_B64U: &str = "yLRaUXCSXU1OGkgaW4mvOsneI31gRVz0-wHGUpWR1k6x0QsbQp7qaYi1ypOaEnJrro_8cpYmbxblkcyqDPWweXAHJjXwCXBlJ67nEByt5Ni6WIodAShztX0djx4oqyms8YLuaJSWl3_RaMJFGUMdm4Py_JG-Mq38Jt10Gh-GmN1BgSZ2PIGws8wNrt7AM3-ndvBef7ggXAnY4D34T8bI28dcU2K82hpNdJXJ9R0JU-GcFZJGa1ntVX8Lp_fpq0jhUaZvcmxrZMAYGVCrJW1y8EeViqBsIHEND1GA7-PCXiiM_4fIib5v17BtU_7mmgDTLkgZtHjq8KAAwYyh8pRqhw";
+    const E_B64U: &str = "AQAB";
+    const PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDItFpRcJJdTU4a
+SBpbia86yd4jfWBFXPT7AcZSlZHWTrHRCxtCnuppiLXKk5oScmuuj/xyliZvFuWR
+zKoM9bB5cAcmNfAJcGUnrucQHK3k2LpYih0BKHO1fR2PHiirKazxgu5olJaXf9Fo
+wkUZQx2bg/L8kb4yrfwm3XQaH4aY3UGBJnY8gbCzzA2u3sAzf6d28F5/uCBcCdjg
+PfhPxsjbx1xTYrzaGk10lcn1HQlT4ZwVkkZrWe1Vfwun9+mrSOFRpm9ybGtkwBgZ
+UKslbXLwR5WKoGwgcQ0PUYDv48JeKIz/h8iJvm/XsG1T/uaaANMuSBm0eOrwoADB
+jKHylGqHAgMBAAECggEAJOqbhEhO+69o8seZZYXtP8R6wg9hIlEHVJYOewk84mzm
+IxvGX1ooptG5EnJU0BjQurKMTi1VE3DkOA2rp6eXVrbm8b3REYNlb8epg5qq16GP
+oRKCZECjC9pgEf+LnnQTdfbN0FmoW2RsybaWDB/+taivDIroL501+JYaMWXkFYCk
+95pIpECBy4F4bNUKtuNJAqE0CF0HhPCSY6UiFRD4gxpKWHZFWb5RdZUvVaPerzwb
+txln1WHzx+mWZT/2k0YqK2ogy51azNl6uwAz52GkcBidbwBuVHMR1FDlI1LH6Xlc
+3gILNs0Vm/1Ahm+PwPsLT7iR9ZWtt6KQ9dW/sEPSGQKBgQD/8qQdRrzBXOZFdS/4
+xI1oquxSTPVwzSuJWWDiyhILzgrnEmxKKafPbIdbTqFfeeumzc9gj8O/epySLaR9
+LxDVc+0AkxYtkYQ6nbX+8cFcKAiz1x9Mf0CUiMM6iVtfW7j76oyJPUbNan/sqxxr
+955bgBxVMBJf+bKCxX1SG29zzwKBgQDIvtQP1H+gmnpz0Bqxedc+qSPrtw3oyBFp
+BF+EJBbs8PbhvKz47WIE0D4nPAHysRLUqqtmlDmCLc6O86e6L5oORlomPLOfM9hY
+8aEsVTGTxwX8xpauvKaYVIx7QSWeoGv4bxoe+AXsagyiF9suHe8635+h2vWLq1mp
+AIPeuMvzyQKBgFl3+xBU0tSQ4dmzzjIamwfUf8mBJ2boAWkAulJsqoQ/4SXHFd2S
+1Bs459PuF5DlcI+db/lkJ9v+Q08B73bnBe5nmJhT0jPZoyxORvk4jwvk3q3m7AT0
+kqGZcQ08SJl72Z0N71Rl/CMAMHmNkuDW7R81GDJbHIE6KsF1wYn7FymXAoGAB9zp
+o4EYSqsiVrz0/rSeCLdJT+dIpTCI9gsUzrE3MKqzkN36DHoH19ZsSM8h6GalLS1O
+L2No6T9wEstaa4GH0D1TNKI2CutV8w3r2TexDG/EPUVuC4QaJmdRZVaE6bSw5fc8
+F7BxUvRIcGTs0d6cSzsNHqLb8U+R4HvDroqgenkCgYEAg+asFSLxqQt+6NAYB7uJ
+tL+l70KcE5q+L+xza0c9oyfg2Cvm0vB9QZavmGTPY7cJPBXDiFsNyAS2gQiw7Vey
+n+7mIzY6zICzzi4Zgyj3hixDCl/7tJKRFHTtUXMeYeCLbqhJ2UQNuoUoW3t9ryq4
+LylW2Cn3jMwQSP7PPLXmTZU=
+-----END PRIVATE KEY-----
+";
+
+    #[derive(Serialize)]
+    struct TestClaims {
+        aud: String,
+        iss: String,
+        exp: usize,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        email: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        common_name: String,
+    }
+
+    fn jwks_json() -> String {
+        format!(
+            r#"{{"keys":[{{"kty":"RSA","use":"sig","alg":"RS256","kid":"{KID}","n":"{N_B64U}","e":"{E_B64U}"}}]}}"#
+        )
+    }
+
+    fn verifier() -> CfAccessVerifier {
+        CfAccessVerifier::new(&CloudflareAccessConfig {
+            team_domain: "team.cloudflareaccess.com".to_string(),
+            audience: "aud-tag".to_string(),
+        })
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn sign(aud: &str, iss: &str, exp: usize, kid: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        let claims = TestClaims {
+            aud: aud.to_string(),
+            iss: iss.to_string(),
+            exp,
+            email: "dev@example.com".to_string(),
+            common_name: String::new(),
+        };
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(PRIV_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    const ISS: &str = "https://team.cloudflareaccess.com";
+
+    #[tokio::test]
+    async fn verifies_a_valid_token() {
+        let v = verifier();
+        v.seed_cache_for_test(&jwks_json()).await;
+        let tok = sign("aud-tag", ISS, (now_secs() + 3600) as usize, KID);
+        let claims = v.verify(&tok).await.expect("valid token");
+        assert_eq!(claims.email, "dev@example.com");
+        assert_eq!(claims.principal(), "dev@example.com");
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_audience() {
+        let v = verifier();
+        v.seed_cache_for_test(&jwks_json()).await;
+        let tok = sign("other-aud", ISS, (now_secs() + 3600) as usize, KID);
+        assert!(v.verify(&tok).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_issuer() {
+        let v = verifier();
+        v.seed_cache_for_test(&jwks_json()).await;
+        let tok = sign(
+            "aud-tag",
+            "https://evil.example.com",
+            (now_secs() + 3600) as usize,
+            KID,
+        );
+        assert!(v.verify(&tok).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_token() {
+        let v = verifier();
+        v.seed_cache_for_test(&jwks_json()).await;
+        // Well past the default 60s leeway.
+        let tok = sign("aud-tag", ISS, (now_secs() - 3600) as usize, KID);
+        assert!(v.verify(&tok).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_kid() {
+        let v = verifier();
+        v.seed_cache_for_test(&jwks_json()).await; // cache holds only KID
+        let tok = sign("aud-tag", ISS, (now_secs() + 3600) as usize, "rotated-kid");
+        // Cooldown (seeded) blocks a refetch, so the unknown key simply misses.
+        assert!(v.verify(&tok).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_when_not_configured() {
+        let v = CfAccessVerifier::new(&CloudflareAccessConfig::default());
+        assert!(!v.is_configured());
+        assert!(v.verify("anything").await.is_err());
+    }
+
+    #[test]
+    fn principal_prefers_email_then_common_name_then_sub() {
+        let email = CfAccessClaims {
+            email: "a@b.c".into(),
+            common_name: "svc".into(),
+            sub: "s".into(),
+        };
+        assert_eq!(email.principal(), "a@b.c");
+        let svc = CfAccessClaims {
+            email: String::new(),
+            common_name: "svc".into(),
+            sub: "s".into(),
+        };
+        assert_eq!(svc.principal(), "svc");
+        let sub = CfAccessClaims {
+            email: String::new(),
+            common_name: String::new(),
+            sub: "s".into(),
+        };
+        assert_eq!(sub.principal(), "s");
+    }
 }

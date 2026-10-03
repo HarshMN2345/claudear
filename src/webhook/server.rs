@@ -15,7 +15,7 @@ use crate::users::UserRegistry;
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, Method, StatusCode},
     response::{IntoResponse, Json},
     routing::get,
     Router,
@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tower::limit::ConcurrencyLimitLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[cfg(test)]
 use axum::routing::post;
@@ -298,9 +299,33 @@ impl WebhookServer {
         // It exposes the existing code/Discord search services as MCP tools over
         // the Streamable HTTP transport (POST for requests, GET rejected).
         if state.config.mcp_server.enabled {
+            // Browser MCP clients on an allow-listed origin send a CORS preflight
+            // for the bearer-authenticated POST; without CORS on this route the
+            // preflight 405s and the call is blocked. The webhook router has no
+            // CORS of its own (unlike the dashboard routes), so scope a CORS
+            // layer to /mcp driven by the same allow-list. An empty allow-list
+            // matches nothing, so non-browser clients (which send no Origin) are
+            // unaffected and browsers stay blocked by default.
+            let allowed_origins = state.config.mcp_server.allowed_origins.clone();
+            let mcp_cors = CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(move |origin, _| {
+                    origin
+                        .to_str()
+                        .map(|o| allowed_origins.iter().any(|a| a == o))
+                        .unwrap_or(false)
+                }))
+                .allow_methods([Method::POST, Method::OPTIONS])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::AUTHORIZATION,
+                    HeaderName::from_static("mcp-protocol-version"),
+                    HeaderName::from_static("cf-access-jwt-assertion"),
+                ]);
             webhook_routes = webhook_routes.route(
                 "/mcp",
-                get(super::mcp::mcp_get_handler).post(super::mcp::mcp_post_handler),
+                get(super::mcp::mcp_get_handler)
+                    .post(super::mcp::mcp_post_handler)
+                    .layer(mcp_cors),
             );
             tracing::info!("MCP search server enabled at /mcp");
         }
