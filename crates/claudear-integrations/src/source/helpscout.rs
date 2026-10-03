@@ -58,6 +58,10 @@ struct HsConversation {
     tags: Vec<HsTag>,
     #[serde(default)]
     primary_customer: Option<HsCustomer>,
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<String>,
+    #[serde(default, rename = "userUpdatedAt")]
+    user_updated_at: Option<String>,
     #[serde(default, rename = "_embedded")]
     embedded: Option<ThreadsEmbedded>,
 }
@@ -212,6 +216,15 @@ impl<H: HttpClient> HelpScoutSource<H> {
 
         let mut issue = Issue::new(c.id.to_string(), short_id, title, url, "helpscout");
 
+        // Capture timestamps so consumers (e.g. the MCP list tool) can order
+        // conversations globally; `updated_at` falls back to `created_at`.
+        issue.created_at = c.created_at.as_deref().and_then(parse_rfc3339);
+        issue.updated_at = c
+            .user_updated_at
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .or(issue.created_at);
+
         // Prefer the latest customer thread body; fall back to the preview.
         let body = c
             .embedded
@@ -240,6 +253,13 @@ impl<H: HttpClient> HelpScoutSource<H> {
         }
         issue
     }
+}
+
+/// Parse an RFC3339 timestamp into UTC, ignoring malformed values.
+fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
 }
 
 /// Return the body of the most recent customer-authored thread, if any.

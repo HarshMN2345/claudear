@@ -513,10 +513,104 @@ pub struct Config {
     /// Scheduled reports / digests configuration group.
     #[serde(default)]
     pub reports: ReportsConfig,
+    /// Built-in MCP search server (exposes code/Discord knowledge search over
+    /// the existing HTTP port). Distinct from the `mcp` field above, which is
+    /// client-side config for MCP servers attached to Claude runs.
+    #[serde(default)]
+    pub mcp_server: McpSearchServerConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
     PathBuf::from("./storage")
+}
+
+/// Built-in MCP search server configuration.
+///
+/// When enabled, a `POST /mcp` endpoint is mounted on the same HTTP server as
+/// the webhooks/dashboard, exposing the existing semantic search services
+/// (code + Discord knowledge) as MCP tools over the Streamable HTTP transport.
+///
+/// Enabled by default. The endpoint is unauthenticated and shares the webhook
+/// port, so browser `Origin` values are rejected unless allow-listed (see
+/// `allowed_origins`) to guard against DNS-rebinding; set `enabled = false` to
+/// turn it off entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSearchServerConfig {
+    /// Enable the built-in MCP search server.
+    pub enabled: bool,
+    /// Expose the `code_search` / `find_symbol` tools (requires code indexing).
+    pub expose_code: bool,
+    /// Expose the `discord_search` and `discord_list_messages` tools (require the
+    /// Discord knowledgebase / bot token respectively).
+    pub expose_discord: bool,
+    /// Expose the `helpscout_list_conversations` tool (requires HelpScout).
+    pub expose_helpscout: bool,
+    /// Default number of results returned by search tools when the caller
+    /// omits `limit`.
+    pub default_limit: usize,
+    /// Hard cap on the number of results a single search tool call may return.
+    pub max_limit: usize,
+    /// Browser `Origin` values allowed to call the endpoint. Requests with no
+    /// `Origin` header (CLI/server-to-server MCP clients) are always allowed;
+    /// requests carrying an `Origin` not in this list are rejected with 403 to
+    /// defend against DNS-rebinding attacks, per the MCP Streamable HTTP spec.
+    /// Empty (the default) blocks all browser origins.
+    pub allowed_origins: Vec<String>,
+    /// Require a per-user personal access token (`Authorization: Bearer <token>`)
+    /// on every `/mcp` request. Tokens are minted by portal users. Enabled by
+    /// default so the endpoint is never unauthenticated.
+    pub require_auth: bool,
+    /// Require a valid Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`) on every
+    /// `/mcp` request, so traffic that did not transit the Cloudflare tunnel /
+    /// Access (e.g. WARP) is rejected. Verified against `cf_access`.
+    pub require_cloudflare_access: bool,
+    /// Cloudflare Access verification settings, used when
+    /// `require_cloudflare_access` is set.
+    pub cf_access: CloudflareAccessConfig,
+}
+
+/// Cloudflare Access JWT verification settings.
+///
+/// When `[mcp_server].require_cloudflare_access` is true, each request must
+/// carry a `Cf-Access-Jwt-Assertion` header holding a JWT that Cloudflare Access
+/// signs after the user authenticates (including via WARP). The token is
+/// verified against the team's public keys (JWKS) at
+/// `https://<team_domain>/cdn-cgi/access/certs` and must list `audience` in its
+/// `aud` claim.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudflareAccessConfig {
+    /// Team domain, e.g. "yourteam.cloudflareaccess.com" (no scheme).
+    pub team_domain: String,
+    /// The Access application audience (AUD) tag the token must contain.
+    pub audience: String,
+}
+
+impl Default for McpSearchServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            expose_code: true,
+            expose_discord: true,
+            expose_helpscout: true,
+            default_limit: 10,
+            max_limit: 50,
+            allowed_origins: Vec::new(),
+            require_auth: true,
+            require_cloudflare_access: false,
+            cf_access: CloudflareAccessConfig::default(),
+        }
+    }
+}
+
+impl McpSearchServerConfig {
+    /// Clamp a caller-supplied limit into `[1, max_limit]`, falling back to
+    /// `default_limit` when none was supplied.
+    pub fn resolve_limit(&self, requested: Option<usize>) -> usize {
+        let max = self.max_limit.max(1);
+        requested.unwrap_or(self.default_limit).clamp(1, max)
+    }
 }
 
 /// Dashboard display & estimation configuration.
@@ -708,6 +802,7 @@ impl Default for Config {
             qa: QaConfig::default(),
             knowledgebase: KnowledgebasesConfig::default(),
             reports: ReportsConfig::default(),
+            mcp_server: McpSearchServerConfig::default(),
         }
     }
 }

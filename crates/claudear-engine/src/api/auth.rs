@@ -950,6 +950,7 @@ mod tests {
             qa: claudear_config::config::QaConfig::default(),
             knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
             reports: claudear_config::config::ReportsConfig::default(),
+            mcp_server: claudear_config::config::McpSearchServerConfig::default(),
         }
     }
 
@@ -2732,5 +2733,151 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(resp["avatar_url"].as_str().unwrap().ends_with(".jpg"));
+    }
+
+    // --- API token authorization boundaries ---------------------------------
+
+    fn session_cookie(token: &str) -> String {
+        format!("claudear_session={token}")
+    }
+
+    #[tokio::test]
+    async fn test_minting_a_users_token_is_admin_only() {
+        let (router, tracker) = create_test_app();
+        let (admin_id, admin_tok) = seed_admin(&tracker);
+        let (viewer_id, viewer_tok) = seed_viewer(&tracker);
+
+        // Viewer cannot mint a token for another user (AdminUser extractor → 403).
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/users/{admin_id}/tokens"))
+                    .header("content-type", "application/json")
+                    .header("cookie", session_cookie(&viewer_tok))
+                    .body(Body::from(r#"{"name":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Admin can, and receives the one-time secret.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/users/{viewer_id}/tokens"))
+                    .header("content-type", "application/json")
+                    .header("cookie", session_cookie(&admin_tok))
+                    .body(Body::from(r#"{"name":"ci"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["secret"].as_str().unwrap().starts_with("cldr_"));
+    }
+
+    #[tokio::test]
+    async fn test_token_revocation_is_owner_scoped() {
+        let (router, tracker) = create_test_app();
+        let (admin_id, admin_tok) = seed_admin(&tracker);
+        let (viewer_id, viewer_tok) = seed_viewer(&tracker);
+
+        let admin_token = tracker
+            .create_api_token(admin_id, "adm", "hash_admin", "cldr_adm", None)
+            .unwrap();
+
+        // A viewer cannot revoke another user's token: the delete is owner-scoped,
+        // so it reports 404 and leaves the token in place.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tokens/{}", admin_token.id))
+                    .header("cookie", session_cookie(&viewer_tok))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(tracker.list_api_tokens(admin_id).unwrap().len(), 1);
+
+        // An admin may revoke anyone's token.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tokens/{}", admin_token.id))
+                    .header("cookie", session_cookie(&admin_tok))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(tracker.list_api_tokens(admin_id).unwrap().len(), 0);
+
+        // A user may revoke their own token.
+        let own = tracker
+            .create_api_token(viewer_id, "v", "hash_v", "cldr_v", None)
+            .unwrap();
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tokens/{}", own.id))
+                    .header("cookie", session_cookie(&viewer_tok))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(tracker.list_api_tokens(viewer_id).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_listing_all_tokens_is_admin_only() {
+        let (router, tracker) = create_test_app();
+        let (_admin_id, admin_tok) = seed_admin(&tracker);
+        let (_viewer_id, viewer_tok) = seed_viewer(&tracker);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/tokens/all")
+                    .header("cookie", session_cookie(&viewer_tok))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/tokens/all")
+                    .header("cookie", session_cookie(&admin_tok))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

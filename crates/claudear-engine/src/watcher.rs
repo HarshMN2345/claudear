@@ -5611,6 +5611,7 @@ mod tests {
             qa: claudear_config::config::QaConfig::default(),
             knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
             reports: claudear_config::config::ReportsConfig::default(),
+            mcp_server: claudear_config::config::McpSearchServerConfig::default(),
         }
     }
 
