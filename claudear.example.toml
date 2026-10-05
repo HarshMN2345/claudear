@@ -1371,7 +1371,9 @@ max_entries = 10
 
 # Replies from these Discord user ids count as the team's. Thread authors
 # holding one of team_roles count too, but the authors table only has people
-# who opened a thread, so list most staff here.
+# who opened a thread, so list most staff here. With drafts on, include the
+# threads bot too: otherwise an answer it posts reads as a community reply and
+# the thread is drafted again.
 team_user_ids = []
 team_roles = ["Core"]
 
