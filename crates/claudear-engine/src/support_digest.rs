@@ -29,8 +29,9 @@ const PAGE_LIMIT: usize = 100;
 /// Most rows read from one table per scan.
 const MAX_ROWS: usize = 10_000;
 
-/// Newest messages read per thread; longer threads are ranked on these.
-const MESSAGE_LIMIT: usize = 100;
+/// Newest messages read per thread, paged 100 at a time. Support threads
+/// rarely come close; a longer one is ranked on these.
+const MESSAGE_LIMIT: usize = 1_000;
 
 /// Threads whose messages are read at the same time.
 const CONCURRENT_READS: usize = 8;
