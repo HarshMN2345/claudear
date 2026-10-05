@@ -95,9 +95,13 @@ enum IssueRun {
     /// A human refused approval, so the run did no work and closed the
     /// issue's attempt as declined.
     Declined,
+    /// No usable answer came to the approval request, as it went unanswered
+    /// or its reply was not understood, so the run did no work and left the
+    /// issue's attempt for a later run to ask again.
+    Unanswered,
     /// The issue was skipped, such as a `deploy_qa` tip that already has a
-    /// verdict, a review rerun whose PR repository is not indexed, an approval
-    /// request that went unanswered or a run its [`Admission`] refused.
+    /// verdict, a review rerun whose PR repository is not indexed or a run its
+    /// [`Admission`] refused.
     Skipped,
     /// The issue is already being processed, so no run started.
     Busy,
@@ -125,9 +129,10 @@ pub enum RetryOutcome {
     /// for a later retry.
     Busy,
     /// The retry could not run. A transient error, such as a network error or
-    /// a pause for a rate limit, leaves the attempt as it was; any other error
-    /// spent the attempt's retry and marked it failed, unless the retry itself
-    /// could not be spent.
+    /// a pause for a rate limit, leaves the attempt as it was, and an approval
+    /// request that got no usable answer marks it failed with its retry given
+    /// back; any other error spent the attempt's retry and marked it failed,
+    /// unless the retry itself could not be spent.
     Failed(claudear_core::error::Error),
 }
 
@@ -3125,7 +3130,8 @@ Create a PR with your changes.{custom_instructions}"#,
     /// watcher is stopping or paused for a rate limit, because the issue is
     /// already being processed, or because loading it failed transiently, such
     /// as on a network error, leaves the attempt as it was, and a run that ends
-    /// on a rate limit gets its retry back.
+    /// on a rate limit gets its retry back, as does one whose approval request
+    /// got no usable answer, so a later run asks again.
     pub async fn retry(&self, attempt: &FixAttempt, reason: &str) -> RetryOutcome {
         let _claim = self.claim_run();
         if self.is_stopped() {
@@ -3181,12 +3187,20 @@ Create a PR with your changes.{custom_instructions}"#,
             .await;
         let skipped =
             || claudear_core::error::Error::Other(format!("{} was skipped", attempt.short_id));
+        let unanswered = || {
+            claudear_core::error::Error::Other(format!(
+                "{} got no usable answer to its approval request",
+                attempt.short_id
+            ))
+        };
         match (run, spend) {
             (IssueRun::Processed, Some(Ok(()))) => {
                 self.refund_rate_limited_retry(attempt);
                 RetryOutcome::Ran
             }
             (IssueRun::Processed | IssueRun::Declined, _) => RetryOutcome::Ran,
+            (IssueRun::Unanswered, Some(Ok(()))) => self.refund_retry(attempt, unanswered()),
+            (IssueRun::Unanswered, _) => RetryOutcome::Failed(unanswered()),
             (IssueRun::Stopping, _) => RetryOutcome::Stopping,
             (IssueRun::Busy, _) => RetryOutcome::Busy,
             (IssueRun::Paused, _) => {
@@ -3240,6 +3254,29 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %attempt.short_id,
                 error = %mark_error,
                 "Failed to restore retry attempt state after trigger error"
+            );
+        }
+        RetryOutcome::Failed(error)
+    }
+
+    /// Give back the retry `attempt` spent on a run that did no work for a
+    /// reason that says nothing about the issue, and mark it failed with
+    /// `error` so a later retry runs it again.
+    fn refund_retry(
+        &self,
+        attempt: &FixAttempt,
+        error: claudear_core::error::Error,
+    ) -> RetryOutcome {
+        let message = format!("{RETRY_TRIGGER_FAILED}: {error}");
+        if let Err(refund_error) =
+            self.tracker
+                .mark_failed_uncharged(&attempt.source, &attempt.issue_id, &message)
+        {
+            tracing::warn!(
+                component = "watcher",
+                short_id = %attempt.short_id,
+                error = %refund_error,
+                "Failed to refund retry of a run that did no work"
             );
         }
         RetryOutcome::Failed(error)
@@ -4616,7 +4653,8 @@ Create a PR with your changes.{custom_instructions}"#,
     /// [declined](FixAttemptStatus::Declined), so neither an orphan sweep nor
     /// the retry manager runs the issue again and asks once more. An approval
     /// request left unanswered, or answered in a way that is not understood,
-    /// skips the issue and leaves its attempt for a later run to ask again.
+    /// ends the run [unanswered](IssueRun::Unanswered) and leaves its attempt
+    /// for a later run to ask again.
     ///
     /// From the moment the attempt is recorded until the run ends, a
     /// [`Heartbeat`] shows orphan sweeps in every process that the run is
@@ -4885,7 +4923,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     return IssueRun::Declined;
                 }
                 ApprovalDecision::Unrecognized | ApprovalDecision::Unanswered => {
-                    return IssueRun::Skipped;
+                    return IssueRun::Unanswered;
                 }
             }
         }
@@ -5616,7 +5654,7 @@ Create a PR with your changes.{custom_instructions}"#,
             .await;
         match run {
             IssueRun::Processed | IssueRun::Declined => Ok(()),
-            IssueRun::Skipped | IssueRun::Busy | IssueRun::Paused => {
+            IssueRun::Unanswered | IssueRun::Skipped | IssueRun::Busy | IssueRun::Paused => {
                 Err(claudear_core::error::Error::source(
                     source_name,
                     format!(
@@ -18974,9 +19012,78 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_retry_unanswered_at_approval_is_refunded_and_asked_again() {
+        for reply in [None, Some("maybe later")] {
+            let notifier = Arc::new(match reply {
+                Some(answer) => ApprovalMockNotifier::with_reply(answer),
+                None => ApprovalMockNotifier::with_no_reply(),
+            });
+            let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+            let issue = test_issue();
+            tracker
+                .record_attempt(&issue.source, &issue.id, &issue.short_id)
+                .unwrap();
+            tracker
+                .mark_failed(&issue.source, &issue.id, "agent crashed")
+                .unwrap();
+            let failed = tracker
+                .get_attempt(&issue.source, &issue.id)
+                .unwrap()
+                .unwrap();
+            let source = Arc::new(MockSource::with_issues(&issue.source, vec![issue.clone()]))
+                as Arc<dyn IssueSource>;
+            let agent_calls = Arc::new(AtomicUsize::new(0));
+            let mut watcher =
+                create_approval_watcher(notifier.clone(), tracker.clone(), true, Some(60));
+            watcher.sources = vec![source];
+            watcher.agent = Arc::new(ScriptedQaAgent {
+                calls: Arc::clone(&agent_calls),
+                answer: QaAnswer::Crash,
+            });
+            watcher.config.retry = single_retry_config().retry;
+            watcher.set_running(true);
+
+            watcher.process_ready_retries().await.unwrap();
+            let unanswered = tracker
+                .get_attempt(&issue.source, &issue.id)
+                .unwrap()
+                .unwrap();
+            watcher.process_ready_retries().await.unwrap();
+
+            assert_eq!(
+                (unanswered.status, unanswered.retry_count),
+                (FixAttemptStatus::Failed, failed.retry_count),
+                "a retry whose approval request was answered with {reply:?} did no work, so it \
+                 must give back the retry it spent and leave the attempt failed, not pending"
+            );
+            assert!(
+                RetryManager::new(watcher.config.retry.clone(), tracker.clone())
+                    .should_retry(&unanswered),
+                "a retry whose approval request was answered with {reply:?} must keep the \
+                 attempt's only retry"
+            );
+            assert_eq!(
+                notifier.ask_count(),
+                2,
+                "a retry whose approval request was answered with {reply:?} must leave the \
+                 attempt for a later run to ask again"
+            );
+            assert_eq!(
+                agent_calls.load(AtomicOrdering::SeqCst),
+                0,
+                "a retry whose approval request was answered with {reply:?} must not run the agent"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_approval_request_without_a_refusal_leaves_the_attempt_open() {
-        for reply in [None, Some("maybe later"), Some("use org/unknown")] {
+        for (reply, expected) in [
+            (None, IssueRun::Unanswered),
+            (Some("maybe later"), IssueRun::Unanswered),
+            (Some("use org/unknown"), IssueRun::Skipped),
+        ] {
             let notifier = Arc::new(match reply {
                 Some(answer) => ApprovalMockNotifier::with_reply(answer),
                 None => ApprovalMockNotifier::with_no_reply(),
@@ -19000,10 +19107,9 @@ mod tests {
                 .await;
 
             assert_eq!(
-                outcome,
-                IssueRun::Skipped,
-                "an approval request answered with {reply:?} was not refused, so the issue must \
-                 only be skipped"
+                outcome, expected,
+                "an approval request answered with {reply:?} was not refused, so the run must end \
+                 {expected:?} rather than declined"
             );
             assert_eq!(
                 tracker
