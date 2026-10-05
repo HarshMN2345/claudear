@@ -1481,20 +1481,23 @@ async fn support_drafts_handler(
 
 #[derive(Deserialize)]
 struct ReviewDraftRequest {
+    /// The `updated_at` of the draft the reviewer saw.
+    revision: String,
     status: crate::support_digest::DraftStatus,
     #[serde(default)]
     answer: Option<String>,
 }
 
 /// Approve or reject a support draft, optionally with an edited answer. The
-/// threads project posts an approved draft to its Discord thread.
+/// threads project posts an approved draft to its Discord thread. `409` when
+/// the draft changed since the reviewer loaded it.
 async fn review_draft_handler(
     admin: AdminUser,
     State(state): State<ApiState>,
     Path(thread_id): Path<String>,
     Json(body): Json<ReviewDraftRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    use crate::support_digest::DraftStatus;
+    use crate::support_digest::{DraftStatus, ReviewOutcome};
 
     let cfg = &state.config.reports.support_digest;
     if !cfg.enabled || !cfg.drafts {
@@ -1519,21 +1522,20 @@ async fn review_draft_handler(
         StatusCode::INTERNAL_SERVER_ERROR
     };
     let store = crate::support_digest::ThreadsStore::new(cfg).map_err(internal)?;
-    match store.draft(&thread_id).await.map_err(internal)? {
-        None => return Err(StatusCode::NOT_FOUND),
-        // Already on its way to the forum.
-        Some(draft) if matches!(draft.status, DraftStatus::Approved | DraftStatus::Sent) => {
-            return Err(StatusCode::CONFLICT)
-        }
-        Some(_) => {}
-    }
     match store
-        .review_draft(&thread_id, body.status, answer, &admin.0.email)
+        .review_draft(
+            &thread_id,
+            &body.revision,
+            body.status,
+            answer,
+            &admin.0.email,
+        )
         .await
         .map_err(internal)?
     {
-        true => Ok(StatusCode::NO_CONTENT),
-        false => Err(StatusCode::NOT_FOUND),
+        ReviewOutcome::Saved => Ok(StatusCode::NO_CONTENT),
+        ReviewOutcome::Missing => Err(StatusCode::NOT_FOUND),
+        ReviewOutcome::Stale => Err(StatusCode::CONFLICT),
     }
 }
 

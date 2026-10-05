@@ -139,7 +139,7 @@ static ALSO_AFFECTED: LazyLock<Regex> = LazyLock::new(|| {
 
 static FIXED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\b(solved|fixed|works now|it works|working now|resolved|figured it out|sorted|that (worked|did it|fixed it)|you['’]?re (right|correct)|expected results?)\b",
+        r"(?i)\b(solved|fixed|works now|it works|working now|resolved|figured it out|sorted|that (worked|did it|fixed it)|you['’]?re (right|correct)|(returns?|returned|got|now (get|see)) the expected results?)\b",
     )
     .expect("valid pattern")
 });

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
+use futures::{StreamExt, TryStreamExt};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,12 @@ const PAGE_LIMIT: usize = 100;
 
 /// Most rows read from one table per scan.
 const MAX_ROWS: usize = 10_000;
+
+/// Newest messages read per thread; longer threads are ranked on these.
+const MESSAGE_LIMIT: usize = 100;
+
+/// Threads whose messages are read at the same time.
+const CONCURRENT_READS: usize = 8;
 
 /// How many likely-resolved threads a digest lists.
 const RESOLVED_LIMIT: usize = 5;
@@ -55,8 +62,6 @@ struct ThreadRow {
 struct MessageRow {
     #[serde(rename = "$id")]
     id: String,
-    #[serde(rename = "threadId")]
-    thread_id: String,
     author: String,
     author_id: Option<String>,
     message: String,
@@ -68,16 +73,28 @@ struct AuthorRow {
     discord_id: String,
 }
 
-/// Where a suggested answer stands. The threads project posts `approved`
-/// drafts and moves them to `sent` or `failed`.
+/// Where a suggested answer stands. The threads project claims `approved`
+/// drafts as `sending` while it posts them, then moves them to `sent` or
+/// `failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DraftStatus {
     Pending,
     Approved,
     Rejected,
+    Sending,
     Sent,
     Failed,
+}
+
+/// What became of a reviewer's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewOutcome {
+    Saved,
+    Missing,
+    /// The draft changed since the reviewer loaded it, or is already being
+    /// posted.
+    Stale,
 }
 
 /// A suggested answer in the `drafts` table; its row id is the thread id.
@@ -148,6 +165,7 @@ impl ThreadsStore {
                     ]}),
                     json!({"method": "greaterThan", "attribute": "last_activity", "values": [since.to_rfc3339()]}),
                 ],
+                MAX_ROWS,
             )
             .await?;
         let rows: Vec<ThreadRow> = rows
@@ -167,6 +185,7 @@ impl ThreadsStore {
                 .list_rows(
                     "authors",
                     vec![json!({"method": "contains", "attribute": "roles", "values": self.config.team_roles})],
+                    MAX_ROWS,
                 )
                 .await?;
             team.extend(authors.into_iter().map(|author| author.discord_id));
@@ -185,8 +204,22 @@ impl ThreadsStore {
         .transpose()
     }
 
-    /// Write a pending answer for the thread, replacing any earlier draft.
-    pub async fn save_draft(&self, thread: &SupportThread, answer: &str) -> Result<()> {
+    /// Write a pending answer for the thread over the draft it replaces.
+    /// `revision` is that draft's `$updatedAt`, or `None` when there was none.
+    /// When the draft changed meanwhile, such as a reviewer acting on it, nothing
+    /// is written and this returns `false`. Appwrite has no conditional writes,
+    /// so the check runs right before the write.
+    pub async fn save_draft(
+        &self,
+        thread: &SupportThread,
+        answer: &str,
+        revision: Option<&str>,
+    ) -> Result<bool> {
+        let current = self.draft(&thread.id).await?;
+        if current.as_ref().map(|draft| draft.updated_at.as_str()) != revision {
+            return Ok(false);
+        }
+
         let answer: String = answer.chars().take(MAX_ANSWER_CHARS).collect();
         let data = json!({
             "threadId": thread.id,
@@ -195,6 +228,7 @@ impl ThreadsStore {
             "answeredMessageId": thread.messages.last().map(|message| &message.id),
             "reviewer": null,
             "sentMessageId": null,
+            "sentChunks": 0,
             "error": null,
         });
         self.request(
@@ -204,21 +238,39 @@ impl ThreadsStore {
         )
         .await?
         .ok_or_else(|| Error::Other("drafts table not found".to_string()))?;
-        Ok(())
+        Ok(true)
     }
 
-    /// Set a reviewer's decision, and their edited answer if given. Approving
-    /// makes the threads project post the answer. `false` when no draft exists.
+    /// Set a reviewer's decision, and their edited answer if given, on the
+    /// draft revision they reviewed (its `$updatedAt`). Approving makes the
+    /// threads project post the answer.
     pub async fn review_draft(
         &self,
         thread_id: &str,
+        revision: &str,
         status: DraftStatus,
         answer: Option<&str>,
         reviewer: &str,
-    ) -> Result<bool> {
+    ) -> Result<ReviewOutcome> {
+        let Some(draft) = self.draft(thread_id).await? else {
+            return Ok(ReviewOutcome::Missing);
+        };
+        if draft.updated_at != revision
+            || matches!(
+                draft.status,
+                DraftStatus::Approved | DraftStatus::Sending | DraftStatus::Sent
+            )
+        {
+            return Ok(ReviewOutcome::Stale);
+        }
+
         let mut data = json!({ "status": status, "reviewer": reviewer });
         if let Some(answer) = answer {
             data["answer"] = json!(answer.chars().take(MAX_ANSWER_CHARS).collect::<String>());
+            // A failed post resumes after the chunks it already sent; edited
+            // text is posted from the start.
+            data["sentChunks"] = json!(0);
+            data["sentMessageId"] = Value::Null;
         }
         let updated = self
             .request(
@@ -227,7 +279,10 @@ impl ThreadsStore {
                 Some(json!({ "data": data })),
             )
             .await?;
-        Ok(updated.is_some())
+        Ok(match updated {
+            Some(_) => ReviewOutcome::Saved,
+            None => ReviewOutcome::Missing,
+        })
     }
 
     /// How many drafts wait for a reviewer.
@@ -267,6 +322,7 @@ impl ThreadsStore {
                     json!({"method": "equal", "attribute": "status", "values": [DraftStatus::Pending, DraftStatus::Failed]}),
                     json!({"method": "orderAsc", "attribute": "$updatedAt"}),
                 ],
+                MAX_ROWS,
             )
             .await?;
 
@@ -277,6 +333,7 @@ impl ThreadsStore {
                 .list_rows(
                     "threads",
                     vec![json!({"method": "equal", "attribute": "$id", "values": ids})],
+                    MAX_ROWS,
                 )
                 .await?;
             threads.extend(
@@ -315,72 +372,89 @@ impl ThreadsStore {
             .collect())
     }
 
-    /// Attach each thread's messages, oldest first, dropping threads without any.
+    /// Attach each thread's newest [`MESSAGE_LIMIT`] messages, oldest first,
+    /// dropping threads without any.
     async fn with_messages(&self, rows: Vec<ThreadRow>) -> Result<Vec<SupportThread>> {
-        let mut by_thread: HashMap<String, Vec<MessageRow>> = HashMap::new();
-        for chunk in rows.chunks(PAGE_LIMIT) {
-            let ids: Vec<&str> = chunk.iter().map(|row| row.id.as_str()).collect();
-            let page: Vec<MessageRow> = self
-                .list_rows(
-                    "messages",
-                    vec![json!({"method": "equal", "attribute": "threadId", "values": ids})],
-                )
-                .await?;
-            for message in page {
-                by_thread
-                    .entry(message.thread_id.clone())
-                    .or_default()
-                    .push(message);
-            }
-        }
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let owner_id = row.author_id.clone().unwrap_or_default();
-                let mut messages: Vec<SupportMessage> = by_thread
-                    .remove(&row.id)?
-                    .into_iter()
-                    .filter_map(|message| {
-                        let timestamp = DateTime::parse_from_rfc3339(&message.timestamp)
-                            .ok()?
-                            .with_timezone(&Utc);
-                        // Older rows have no author id; match the poster by name.
-                        let author_id = match message.author_id.filter(|id| !id.is_empty()) {
-                            Some(id) => id,
-                            None if message.author == row.author => owner_id.clone(),
-                            None => format!("name:{}", message.author),
-                        };
-                        Some(SupportMessage {
-                            id: message.id,
-                            author_id,
-                            author: message.author,
-                            content: message.message,
-                            timestamp,
-                        })
-                    })
-                    .collect();
-                messages.sort_by_key(|message| message.timestamp);
-                Some(SupportThread {
-                    url: format!(
-                        "https://discord.com/channels/{}/{}",
-                        self.config.guild_id, row.id
-                    ),
-                    id: row.id,
-                    title: row.title,
-                    owner_id,
-                    tags: row.tags.unwrap_or_default(),
-                    messages,
-                })
+        let threads: Vec<Option<SupportThread>> = futures::stream::iter(rows)
+            .map(|row| async move {
+                let messages: Vec<MessageRow> = self
+                    .list_rows(
+                        "messages",
+                        vec![
+                            json!({"method": "equal", "attribute": "threadId", "values": [row.id]}),
+                            json!({"method": "orderDesc", "attribute": "timestamp"}),
+                        ],
+                        MESSAGE_LIMIT,
+                    )
+                    .await?;
+                Ok::<_, Error>(self.thread(row, messages))
             })
-            .collect())
+            .buffered(CONCURRENT_READS)
+            .try_collect()
+            .await?;
+        Ok(threads.into_iter().flatten().collect())
     }
 
-    /// Every row of a table matching `queries`, paged by cursor up to [`MAX_ROWS`].
+    /// A thread with its messages oldest first, or `None` without messages.
+    fn thread(&self, row: ThreadRow, messages: Vec<MessageRow>) -> Option<SupportThread> {
+        // Rows synced before author ids existed have none: take the poster's id
+        // from one of their newer messages, or fall back to their name.
+        let owner_id = row
+            .author_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                messages
+                    .iter()
+                    .filter(|message| message.author == row.author)
+                    .find_map(|message| message.author_id.clone().filter(|id| !id.is_empty()))
+            })
+            .unwrap_or_else(|| format!("name:{}", row.author));
+
+        let mut messages: Vec<SupportMessage> = messages
+            .into_iter()
+            .filter_map(|message| {
+                let timestamp = DateTime::parse_from_rfc3339(&message.timestamp)
+                    .ok()?
+                    .with_timezone(&Utc);
+                let author_id = match message.author_id.filter(|id| !id.is_empty()) {
+                    Some(id) => id,
+                    None if message.author == row.author => owner_id.clone(),
+                    None => format!("name:{}", message.author),
+                };
+                Some(SupportMessage {
+                    id: message.id,
+                    author_id,
+                    author: message.author,
+                    content: message.message,
+                    timestamp,
+                })
+            })
+            .collect();
+        if messages.is_empty() {
+            return None;
+        }
+        messages.sort_by_key(|message| message.timestamp);
+
+        Some(SupportThread {
+            url: format!(
+                "https://discord.com/channels/{}/{}",
+                self.config.guild_id, row.id
+            ),
+            id: row.id,
+            title: row.title,
+            owner_id,
+            tags: row.tags.unwrap_or_default(),
+            messages,
+        })
+    }
+
+    /// Rows of a table matching `queries`, paged by cursor up to `max`.
     async fn list_rows<T: DeserializeOwned>(
         &self,
         table: &str,
         queries: Vec<Value>,
+        max: usize,
     ) -> Result<Vec<T>> {
         #[derive(Deserialize)]
         struct Page {
@@ -389,7 +463,7 @@ impl ThreadsStore {
 
         let mut rows = Vec::new();
         let mut cursor: Option<String> = None;
-        while rows.len() < MAX_ROWS {
+        while rows.len() < max {
             let mut params: Vec<(&str, String)> = queries
                 .iter()
                 .chain(&[json!({"method": "limit", "values": [PAGE_LIMIT]})])

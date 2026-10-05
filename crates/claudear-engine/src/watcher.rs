@@ -2859,6 +2859,10 @@ Create a PR with your changes.{custom_instructions}"#,
         let Some(orchestrator) = self.support_digest.as_ref() else {
             return Ok(());
         };
+        let _claim = self.claim_run();
+        if self.is_stopped() {
+            return Ok(());
+        }
         let (mut digest, threads) = orchestrator.collect().await?;
 
         if self.config.reports.support_digest.drafts {
@@ -2901,7 +2905,8 @@ Create a PR with your changes.{custom_instructions}"#,
 
     /// Write a suggested answer for the digest's threads whose draft is missing
     /// or older than their latest message, trying at most `max_drafts` per scan.
-    /// Drafts a reviewer already approved are left alone.
+    /// Drafts that are approved or being posted are left alone, and so is any
+    /// draft a reviewer acts on while its replacement is written.
     async fn write_support_drafts(
         &self,
         store: &crate::support_digest::ThreadsStore,
@@ -2910,35 +2915,38 @@ Create a PR with your changes.{custom_instructions}"#,
     ) {
         let mut attempts = 0;
         for entry in &digest.needs_reply {
-            if attempts >= self.config.reports.support_digest.max_drafts {
+            if attempts >= self.config.reports.support_digest.max_drafts || self.is_stopped() {
                 break;
             }
             let Some(thread) = threads.iter().find(|thread| thread.id == entry.thread_id) else {
                 continue;
             };
             let latest = thread.messages.last().map(|message| message.id.as_str());
-            match store.draft(&thread.id).await {
+            let revision = match store.draft(&thread.id).await {
                 Ok(Some(draft))
-                    if draft.status == DraftStatus::Approved
+                    if matches!(draft.status, DraftStatus::Approved | DraftStatus::Sending)
                         || draft.answered_message_id.as_deref() == latest =>
                 {
                     continue;
                 }
-                Ok(_) => {}
+                Ok(draft) => draft.map(|draft| draft.updated_at),
                 Err(e) => {
                     tracing::warn!(component = "digest", thread = %thread.id, error = %e, "Failed to read support draft");
                     continue;
                 }
-            }
+            };
 
             attempts += 1;
             let saved = match self.answer_support_thread(thread).await {
-                Ok(answer) => store.save_draft(thread, &answer).await,
+                Ok(answer) => store.save_draft(thread, &answer, revision.as_deref()).await,
                 Err(e) => Err(e),
             };
             match saved {
-                Ok(()) => {
+                Ok(true) => {
                     tracing::info!(component = "digest", thread = %thread.id, "Wrote support draft")
+                }
+                Ok(false) => {
+                    tracing::info!(component = "digest", thread = %thread.id, "Support draft changed while answering; kept it")
                 }
                 Err(e) => {
                     tracing::warn!(component = "digest", thread = %thread.id, error = %e, "Failed to write support draft")

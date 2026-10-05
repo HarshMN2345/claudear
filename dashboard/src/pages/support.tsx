@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import useSWR from 'swr'
 import { ExternalLink } from 'lucide-react'
 import { fetchSupportDrafts, reviewSupportDraft, type SupportDraft } from '../lib/api'
@@ -14,7 +14,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../co
 export default function SupportPage() {
   const { user } = useAuth()
   const isAdmin = user?.role === 'admin'
-  const { data: drafts, isLoading, mutate } = useSWR<SupportDraft[]>('support-drafts', fetchSupportDrafts, {
+  const { data: drafts, error, isLoading, mutate } = useSWR<SupportDraft[]>('support-drafts', fetchSupportDrafts, {
     refreshInterval: 60000,
   })
 
@@ -25,7 +25,10 @@ export default function SupportPage() {
         description="Suggested answers to Discord support threads. Approved answers are posted to the thread by the threads bot."
       />
       {isLoading && <CardStackSkeleton />}
-      {!isLoading && (drafts ?? []).length === 0 && <EmptyState message="No drafts waiting for review" />}
+      {error && !drafts && (
+        <p className="text-sm text-destructive py-8 text-center">Could not load drafts. The threads project may be unreachable.</p>
+      )}
+      {!isLoading && !error && (drafts ?? []).length === 0 && <EmptyState message="No drafts waiting for review" />}
       <div className="space-y-4">
         {(drafts ?? []).map(draft => (
           <DraftCard key={draft.thread_id} draft={draft} isAdmin={isAdmin} onReviewed={() => mutate()} />
@@ -36,20 +39,38 @@ export default function SupportPage() {
 }
 
 function DraftCard({ draft, isAdmin, onReviewed }: { draft: SupportDraft; isAdmin: boolean; onReviewed: () => void }) {
+  // The revision being edited. A rewritten draft replaces it when there are no
+  // local edits; otherwise the reviewer decides, since approving an old
+  // revision is refused.
+  const [base, setBase] = useState({ answer: draft.answer, revision: draft.updated_at })
   const [answer, setAnswer] = useState(draft.answer)
   const [saving, setSaving] = useState(false)
   const [failed, setFailed] = useState(false)
+  const dirty = answer !== base.answer
+  const rewritten = draft.updated_at !== base.revision
+
+  useEffect(() => {
+    if (rewritten && !dirty) {
+      setBase({ answer: draft.answer, revision: draft.updated_at })
+      setAnswer(draft.answer)
+    }
+  }, [rewritten, dirty, draft.answer, draft.updated_at])
+
+  function loadRewrite() {
+    setBase({ answer: draft.answer, revision: draft.updated_at })
+    setAnswer(draft.answer)
+  }
 
   async function review(status: 'approved' | 'rejected') {
     setSaving(true)
     setFailed(false)
     try {
-      await reviewSupportDraft(draft.thread_id, status, answer !== draft.answer ? answer : undefined)
-      onReviewed()
+      await reviewSupportDraft(draft.thread_id, base.revision, status, dirty ? answer : undefined)
     } catch {
       setFailed(true)
     } finally {
       setSaving(false)
+      onReviewed()
     }
   }
 
@@ -81,6 +102,14 @@ function DraftCard({ draft, isAdmin, onReviewed }: { draft: SupportDraft; isAdmi
             </div>
           ))}
         </div>
+        {rewritten && dirty && (
+          <div className="flex items-center gap-3 rounded-md border border-destructive/40 p-3 text-sm">
+            <span>This draft was rewritten after you started editing.</span>
+            <button onClick={loadRewrite} className="px-3 py-1.5 border rounded-md text-sm hover:bg-muted">
+              Load the new draft
+            </button>
+          </div>
+        )}
         <textarea
           value={answer}
           onChange={e => setAnswer(e.target.value)}
@@ -92,19 +121,23 @@ function DraftCard({ draft, isAdmin, onReviewed }: { draft: SupportDraft; isAdmi
           <div className="flex items-center gap-3">
             <button
               onClick={() => review('approved')}
-              disabled={saving || !answer.trim()}
+              disabled={saving || rewritten || !answer.trim()}
               className="px-3 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
             >
               Approve and post
             </button>
             <button
               onClick={() => review('rejected')}
-              disabled={saving}
+              disabled={saving || rewritten}
               className="px-3 py-2 border rounded-md text-sm hover:bg-muted disabled:opacity-50"
             >
               Reject
             </button>
-            {failed && <span className="text-sm text-destructive">Could not save the review. Try again.</span>}
+            {failed && (
+              <span className="text-sm text-destructive">
+                Could not save the review. The draft may have changed; check it and try again.
+              </span>
+            )}
           </div>
         ) : (
           <p className="text-sm text-muted-foreground">Only admins can approve answers.</p>
