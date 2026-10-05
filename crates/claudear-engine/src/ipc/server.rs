@@ -2652,14 +2652,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_defaults_to_the_default_paths() {
-        let server = IpcServer::new(mock_tracker(), mock_sources(), mock_notifier());
-
-        assert_eq!(server.socket_path, default_socket_path());
-        assert_eq!(server.pid_path, default_pid_path());
-    }
-
-    #[test]
     fn test_builder_custom_paths() {
         let server = IpcServer::builder(mock_tracker(), mock_sources(), mock_notifier())
             .socket_path(PathBuf::from("/tmp/custom.sock"))

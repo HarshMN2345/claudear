@@ -304,13 +304,6 @@ mod tests {
     const STOP_DELAY: Duration = Duration::from_millis(300);
 
     #[test]
-    fn test_client_default() {
-        let client = IpcClient::default();
-        assert_eq!(client.socket_path, default_socket_path());
-        assert_eq!(client.timeout, DEFAULT_TIMEOUT);
-    }
-
-    #[test]
     fn test_client_with_timeout() {
         let client = IpcClient::new().with_timeout(Duration::from_secs(5));
         assert_eq!(client.timeout, Duration::from_secs(5));

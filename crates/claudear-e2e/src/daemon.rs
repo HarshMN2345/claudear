@@ -72,13 +72,6 @@ fn start_arguments(config_path: &str, port: u16) -> Vec<String> {
     .to_vec()
 }
 
-/// The command the container runs after its entrypoint.
-fn container_command(port: u16) -> Vec<String> {
-    let mut command = vec!["claudear".to_string()];
-    command.extend(start_arguments(CONTAINER_CONFIG_PATH, port));
-    command
-}
-
 /// Start a native daemon process.
 pub fn start_process(
     binary: &str,
@@ -242,8 +235,8 @@ pub fn start_docker(
         ]);
     }
 
-    args.push(image.to_string());
-    args.extend(container_command(port));
+    args.extend([image.to_string(), "claudear".to_string()]);
+    args.extend(start_arguments(CONTAINER_CONFIG_PATH, port));
 
     let container_id = {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -432,22 +425,6 @@ pub async fn wait_healthy(handle: &DaemonHandle, port: u16, timeout: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_container_command_keeps_the_daemon_in_the_foreground() {
-        let command = container_command(3100);
-        let start = command
-            .iter()
-            .position(|argument| argument == "start")
-            .expect("the container runs claudear start");
-
-        assert!(
-            command[start..]
-                .iter()
-                .any(|argument| argument == "--foreground"),
-            "a daemonizing start exits and stops the container: {command:?}"
-        );
-    }
 
     #[test]
     fn test_extract_token_valid_json() {

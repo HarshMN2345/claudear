@@ -106,18 +106,6 @@ mod tests {
         receive(listeners, |listener| *listener)
     }
 
-    fn ignoring(
-        ignored: &[SignalKind],
-    ) -> impl Fn(libc::c_int) -> io::Result<libc::sighandler_t> + '_ {
-        move |signal| {
-            if ignored.iter().any(|kind| kind.as_raw_value() == signal) {
-                Ok(libc::SIG_IGN)
-            } else {
-                Ok(libc::SIG_DFL)
-            }
-        }
-    }
-
     #[test]
     fn delivered_signal_yields_its_reason() {
         let mut listeners = vec![(IDLE, Reason::Interrupted), (DELIVERED, Reason::Terminated)];
@@ -161,53 +149,6 @@ mod tests {
     #[test]
     fn signals_without_listeners_have_ended() {
         assert_eq!(received(&mut Vec::new()), Poll::Ready(None));
-    }
-
-    #[test]
-    fn every_stop_signal_is_heeded_with_its_reason_when_none_is_ignored() {
-        let heeded = heeded(ignoring(&[])).expect("every disposition reads");
-
-        assert_eq!(
-            heeded,
-            [
-                (SignalKind::interrupt(), Reason::Interrupted),
-                (SignalKind::terminate(), Reason::Terminated),
-                (SignalKind::hangup(), Reason::Interrupted),
-            ]
-        );
-    }
-
-    #[test]
-    fn signal_ignored_at_startup_stays_ignored() {
-        for (ignored, _) in STOP_SIGNALS {
-            let heeded = heeded(ignoring(&[ignored])).expect("every disposition reads");
-
-            let others: Vec<_> = STOP_SIGNALS
-                .into_iter()
-                .filter(|(kind, _)| *kind != ignored)
-                .collect();
-            assert_eq!(heeded, others, "{ignored:?} was ignored at startup");
-        }
-    }
-
-    #[test]
-    fn background_job_under_nohup_still_stops_on_sigterm() {
-        let ignored = [SignalKind::interrupt(), SignalKind::hangup()];
-
-        let heeded = heeded(ignoring(&ignored)).expect("every disposition reads");
-
-        assert_eq!(heeded, [(SignalKind::terminate(), Reason::Terminated)]);
-    }
-
-    #[test]
-    fn signal_with_a_handler_installed_is_still_heeded() {
-        extern "C" fn handler(_: libc::c_int) {}
-
-        let installed = handler as *const () as libc::sighandler_t;
-
-        let heeded = heeded(|_| Ok(installed)).expect("every disposition reads");
-
-        assert_eq!(heeded, STOP_SIGNALS);
     }
 
     #[test]

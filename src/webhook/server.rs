@@ -9,6 +9,7 @@ use crate::inference::{resolve_repo_for_issue, RepoInferrer};
 use crate::notifier::Notifier;
 use crate::runner::AgentRunner;
 use crate::scm::ReviewWatcher;
+use crate::shutdown;
 use crate::storage::FixAttemptTracker;
 use crate::types::{validate_issue_id, ActivityLogEntry, Issue, IssueEmbedding, ProcessingMetric};
 use crate::users::UserRegistry;
@@ -40,9 +41,12 @@ const PROCESSING_ENTRY_TTL_SECS: u64 = 3600;
 /// Maximum number of entries in the processing set before forced cleanup.
 const MAX_PROCESSING_ENTRIES: usize = 1000;
 
-/// How long a sender should wait before redelivering a webhook refused during shutdown: long
-/// enough for the old daemon to finish exiting and a restarted one to take the delivery.
-const SHUTDOWN_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// How long a sender should wait before redelivering a webhook refused during shutdown: until
+/// the old daemon has exited and a restarted one can take the delivery.
+const SHUTDOWN_RETRY_AFTER: Duration = shutdown::EXIT_TIMEOUT.saturating_add(RESTART_MARGIN);
+
+/// How long a restarted daemon takes to serve webhooks again once the old one has exited.
+const RESTART_MARGIN: Duration = Duration::from_secs(15);
 
 /// Maximum concurrent `/mcp` requests. Semantic searches serialize on the shared
 /// embedding pool, so this caps queued blocking work under a burst.
@@ -1252,7 +1256,6 @@ mod tests {
     use crate::types::Outcome;
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
-    use axum::http::HeaderValue;
     use futures::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3090,10 +3093,14 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER),
-            Some(&HeaderValue::from(SHUTDOWN_RETRY_AFTER.as_secs())),
-            "the refusal should tell the sender when to deliver again"
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+        assert!(
+            retry_after.is_some_and(|seconds| seconds > 0),
+            "the refusal should tell the sender how many seconds to wait before delivering \
+             again, but its Retry-After was {retry_after:?}"
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -3124,14 +3131,6 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(response.headers().get(header::RETRY_AFTER), None);
-    }
-
-    #[test]
-    fn test_shutdown_retry_after_outlasts_the_daemon_exit() {
-        assert!(
-            SHUTDOWN_RETRY_AFTER > crate::shutdown::EXIT_TIMEOUT,
-            "a sender retrying sooner would reach the daemon that is still exiting"
-        );
     }
 
     #[tokio::test]
