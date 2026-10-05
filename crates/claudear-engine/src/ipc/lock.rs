@@ -2,6 +2,7 @@
 
 use claudear_core::error::{Error, Result};
 use std::fs::{File, OpenOptions, TryLockError};
+use std::io::ErrorKind;
 use std::path::Path;
 
 const ALREADY_RUNNING: &str =
@@ -36,13 +37,16 @@ impl Lock {
     }
 
     /// Whether a holder has the lock on the file at `path`. A file that does not exist is not
-    /// held.
+    /// held; a lock that cannot be checked counts as held, so no daemon passes for stopped
+    /// without having exited.
     ///
     /// Checking takes a shared lock for a moment, so checks never mistake each other for a
     /// holder.
     pub fn is_held(path: &Path) -> bool {
-        File::open(path)
-            .is_ok_and(|file| matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock)))
+        match File::open(path) {
+            Ok(file) => file.try_lock_shared().is_err(),
+            Err(error) => error.kind() != ErrorKind::NotFound,
+        }
     }
 }
 
@@ -83,5 +87,17 @@ mod tests {
         assert!(path.exists(), "releasing the lock leaves its file");
         assert!(!Lock::is_held(&path));
         Lock::acquire(&path).expect("checking must not keep the lock");
+    }
+
+    #[test]
+    fn test_is_held_when_the_lock_cannot_be_checked() {
+        let directory = short_temporary_directory();
+        let file = directory.path().join("not-a-directory");
+        std::fs::write(&file, "").unwrap();
+
+        assert!(
+            Lock::is_held(&file.join("claudear.lock")),
+            "a lock that cannot be checked must not pass for free"
+        );
     }
 }
