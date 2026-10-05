@@ -2,6 +2,9 @@
 members = ["crates/*"]
 resolver = "2"
 
+[workspace.lints.clippy]
+double_must_use = "allow"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "process", "signal", "fs", "net", "io-util", "macros"] }
@@ -71,6 +74,7 @@ graphql_client = { version = "0.16", features = ["reqwest-rustls"] }
 futures = "0.3"
 futures-util = "0.3"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 
 # Regex
@@ -146,6 +150,9 @@ tempfile = "3"
 mockall = "0.14"
 http-body-util = "0.1"
 
+# Shared infrastructure
+abnegate-index = "0.1.0"
+
 # Internal crates
 claudear-core = { path = "crates/claudear-core" }
 claudear-config = { path = "crates/claudear-config" }
@@ -158,6 +165,9 @@ claudear-engine = { path = "crates/claudear-engine" }
 name = "claudear"
 version = "1.0.0"
 edition = "2021"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "claudear"
@@ -248,6 +258,7 @@ graphql_client = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 
 # Regex
@@ -328,6 +339,7 @@ libc = { workspace = true }
 mockall = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = { workspace = true }
+tempfile = { workspace = true }
 
 [profile.dev]
 debug = 1                  # Line tables only (not full debuginfo)

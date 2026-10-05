@@ -3,6 +3,9 @@ name = "claudear-storage"
 version = "1.0.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 sqlite = ["dep:rusqlite", "claudear-core/sqlite"]
@@ -38,3 +41,6 @@ hex = { workspace = true }
 
 # Random (for test utilities)
 rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

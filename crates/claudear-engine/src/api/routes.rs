@@ -209,6 +209,26 @@ pub fn create_api_router_full(
                 .put(update_user_handler)
                 .delete(delete_user_handler),
         )
+        // Personal access token routes (for the MCP server and other clients)
+        .route(
+            "/api/tokens",
+            axum::routing::get(super::tokens::list_tokens_handler)
+                .post(super::tokens::create_token_handler),
+        )
+        .route(
+            "/api/tokens/all",
+            axum::routing::get(super::tokens::list_all_tokens_handler),
+        )
+        .route(
+            "/api/tokens/{id}",
+            axum::routing::delete(super::tokens::revoke_token_handler),
+        )
+        // Admin: manage a specific user's tokens from the Users screen.
+        .route(
+            "/api/users/{id}/tokens",
+            axum::routing::get(super::tokens::list_user_tokens_handler)
+                .post(super::tokens::create_user_token_handler),
+        )
         // Model browsing & download routes
         .route(
             "/api/chat/models/browse",
@@ -649,6 +669,7 @@ fn get_attempts(tracker: &Arc<dyn FixAttemptTracker>, limit: Option<usize>) -> V
         FixAttemptStatus::Merged,
         FixAttemptStatus::Closed,
         FixAttemptStatus::CannotFix,
+        FixAttemptStatus::Declined,
     ] {
         if let Ok(attempts) = tracker.get_attempts_by_status(status) {
             all.extend(attempts);
@@ -677,6 +698,7 @@ fn get_attempt_records(tracker: &Arc<dyn FixAttemptTracker>) -> Vec<FixAttempt> 
         FixAttemptStatus::Merged,
         FixAttemptStatus::Closed,
         FixAttemptStatus::CannotFix,
+        FixAttemptStatus::Declined,
     ] {
         if let Ok(attempts) = tracker.get_attempts_by_status(status) {
             all.extend(attempts);
@@ -2387,7 +2409,7 @@ async fn telemetry_timeseries_handler(
                 FixAttemptStatus::Merged => point.merged += 1,
                 FixAttemptStatus::Closed => point.closed += 1,
                 FixAttemptStatus::CannotFix => point.cannot_fix += 1,
-                FixAttemptStatus::Answered => {}
+                FixAttemptStatus::Answered | FixAttemptStatus::Declined => {}
             }
         }
     }
@@ -3146,6 +3168,7 @@ mod tests {
             qa: claudear_config::config::QaConfig::default(),
             knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
             reports: claudear_config::config::ReportsConfig::default(),
+            mcp_server: claudear_config::config::McpSearchServerConfig::default(),
         }
     }
 
