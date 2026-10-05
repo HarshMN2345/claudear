@@ -495,6 +495,11 @@ pub trait ActivityStore: Send + Sync {
     }
 
     /// Upsert a PR record. Returns the row ID.
+    ///
+    /// An existing record keeps its review cycle count, which only
+    /// [`Self::charge_pr_review_cycle`] and [`Self::refund_pr_review_cycle`]
+    /// change, so a writer holding a stale copy of the record cannot undo
+    /// cycles another process counted.
     fn upsert_pr(&self, _pr: &PrRecord) -> Result<i64> {
         Ok(0)
     }
@@ -502,6 +507,26 @@ pub trait ActivityStore: Send + Sync {
     /// Get a PR record by URL.
     fn get_pr(&self, _pr_url: &str) -> Result<Option<PrRecord>> {
         Ok(None)
+    }
+
+    /// Count one review-driven rerun of `pr` toward `cap`, returning `false`
+    /// without counting it once `pr` has used all `cap`. A PR with no record
+    /// yet gets one from `pr`'s URL, repository, number, status, creation
+    /// time and links to its attempt and issue. The cap is checked and the
+    /// rerun counted in one step, so processes sharing the store never count
+    /// more than `cap` reruns between them.
+    ///
+    /// Default returns `true` without counting anything: a store that keeps
+    /// no PR records enforces no cap.
+    fn charge_pr_review_cycle(&self, _pr: &PrRecord, _cap: i32) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Give back one review-driven rerun of `pr_url` counted by
+    /// [`Self::charge_pr_review_cycle`], never going below zero, so reruns
+    /// other processes counted meanwhile stay counted.
+    fn refund_pr_review_cycle(&self, _pr_url: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Update a PR's status.
@@ -3491,6 +3516,21 @@ mod tests {
                 .get_pr("https://github.com/org/repo/pull/1")
                 .unwrap()
                 .is_none());
+        }
+
+        #[test]
+        fn test_default_charge_pr_review_cycle_enforces_no_cap() {
+            let store = MockActivityExt;
+            let pr = PrRecord::new("https://github.com/org/repo/pull/1", "org/repo", 1);
+            assert!(store.charge_pr_review_cycle(&pr, 0).unwrap());
+        }
+
+        #[test]
+        fn test_default_refund_pr_review_cycle_succeeds() {
+            let store = MockActivityExt;
+            assert!(store
+                .refund_pr_review_cycle("https://github.com/org/repo/pull/1")
+                .is_ok());
         }
 
         #[test]

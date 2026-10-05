@@ -59,6 +59,10 @@ const REVIEW_RERUN_DEFERRED_DECISION: &str = "review_rerun_deferred";
 /// review feedback on it and leaves the PR to humans.
 const MAX_REVIEW_CYCLES: i32 = 3;
 
+/// Activity recorded when a PR has used [`MAX_REVIEW_CYCLES`] and is left to
+/// humans.
+const REVIEW_CYCLE_CAP_REACHED_ACTIVITY: &str = "review_cycle_cap_reached";
+
 /// Why an attempt is closed as declined when a human refuses approval.
 const APPROVAL_DECLINED_REASON: &str = "Approval declined";
 
@@ -351,6 +355,19 @@ enum ReviewOutcome {
     /// The rerun waits for the PR's repository to be indexed, so the
     /// feedback stays outstanding without spending any of its retries.
     Deferred,
+}
+
+/// What became of the review cycle [charged](Watcher::charge_review_cycle)
+/// for a review rerun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewCycleCharge {
+    /// The cycle counts toward [`MAX_REVIEW_CYCLES`], so a rerun that never
+    /// starts gives it back.
+    Charged,
+    /// The PR has used [`MAX_REVIEW_CYCLES`], so no rerun may start.
+    CapReached,
+    /// The cycle could not be counted, so the rerun starts without it.
+    Uncounted,
 }
 
 /// What became of an issue handed to [`Watcher::process_issue`].
@@ -1536,6 +1553,10 @@ impl Watcher {
     /// to the cap. A rerun whose PR repository cannot be resolved from the
     /// index is [deferred](ReviewOutcome::Deferred) before anything can
     /// charge the feedback for it, and runs once the repository is indexed.
+    ///
+    /// A PR that has used the cap is left to humans before any work starts,
+    /// and the cap is enforced again when the cycle is charged, since another
+    /// process sharing the database may take the PR's last cycle in between.
     async fn process_review_action(
         &self,
         attempt: &claudear_core::types::FixAttempt,
@@ -1552,29 +1573,7 @@ impl Watcher {
         if let Some(ref pr_url) = attempt.pr_url {
             if let Some(pr_record) = self.review_cycle_record(attempt, pr_url) {
                 if pr_record.review_cycles >= MAX_REVIEW_CYCLES {
-                    tracing::warn!(
-                        pr_url = %pr_url,
-                        short_id = %attempt.short_id,
-                        review_cycles = pr_record.review_cycles,
-                        "Review cycle cap reached; leaving PR to humans"
-                    );
-                    self.tracker
-                        .record_activity(
-                            &ActivityLogEntry::new(
-                                "review_cycle_cap_reached",
-                                format!(
-                                    "Stopped addressing review feedback for {} after {} cycles",
-                                    attempt.short_id, pr_record.review_cycles
-                                ),
-                            )
-                            .with_source(attempt.source.clone())
-                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
-                            .with_metadata(json!({ "pr_url": pr_url })),
-                        )
-                        .ok();
-                    if let Some(rw) = &self.review_watcher {
-                        rw.unwatch_pr(pr_url);
-                    }
+                    self.leave_pr_to_humans(attempt, pr_url, pr_record.review_cycles);
                     return Ok(ReviewOutcome::Handled);
                 }
             }
@@ -1709,14 +1708,47 @@ impl Watcher {
             "Re-processing issue to address review feedback"
         );
 
-        let charged = self.charge_review_cycle(attempt, pr_url);
+        let charge = self.charge_review_cycle(attempt, pr_url);
+        if charge == ReviewCycleCharge::CapReached {
+            self.leave_pr_to_humans(attempt, pr_url, MAX_REVIEW_CYCLES);
+            return Ok(ReviewOutcome::Handled);
+        }
         let rerun = self
             .rerun_with_review_feedback(attempt, feedback, existing_pr_branch)
             .await;
-        if rerun.is_err() && charged {
-            self.refund_review_cycle(attempt, pr_url);
+        if rerun.is_err() && charge == ReviewCycleCharge::Charged {
+            self.refund_review_cycle(pr_url);
         }
         rerun.map(|()| ReviewOutcome::Handled)
+    }
+
+    /// Stop answering review feedback on `pr_url`, which has used
+    /// `review_cycles` of its [`MAX_REVIEW_CYCLES`], and leave the PR to
+    /// humans.
+    fn leave_pr_to_humans(&self, attempt: &FixAttempt, pr_url: &str, review_cycles: i32) {
+        tracing::warn!(
+            pr_url = %pr_url,
+            short_id = %attempt.short_id,
+            review_cycles,
+            "Review cycle cap reached; leaving PR to humans"
+        );
+        self.tracker
+            .record_activity(
+                &ActivityLogEntry::new(
+                    REVIEW_CYCLE_CAP_REACHED_ACTIVITY,
+                    format!(
+                        "Stopped addressing review feedback for {} after {} cycles",
+                        attempt.short_id, review_cycles
+                    ),
+                )
+                .with_source(attempt.source.clone())
+                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                .with_metadata(json!({ "pr_url": pr_url })),
+            )
+            .ok();
+        if let Some(review_watcher) = &self.review_watcher {
+            review_watcher.unwatch_pr(pr_url);
+        }
     }
 
     /// Leave `attempt`'s review feedback outstanding because the repository of
@@ -1863,33 +1895,34 @@ impl Watcher {
         }
     }
 
-    /// Count a review-driven rerun of `pr_url` toward [`MAX_REVIEW_CYCLES`],
-    /// returning whether it was counted.
-    fn charge_review_cycle(&self, attempt: &FixAttempt, pr_url: &str) -> bool {
-        let Some(mut record) = self.review_cycle_record(attempt, pr_url) else {
-            return false;
+    /// Count a review-driven rerun of `pr_url` toward [`MAX_REVIEW_CYCLES`]
+    /// unless the PR has used them all. Storage checks the cap and counts the
+    /// cycle in one step, so processes sharing the database cannot both take
+    /// the PR's last cycle.
+    fn charge_review_cycle(&self, attempt: &FixAttempt, pr_url: &str) -> ReviewCycleCharge {
+        let Some(record) = self.review_cycle_record(attempt, pr_url) else {
+            return ReviewCycleCharge::Uncounted;
         };
-        record.review_cycles += 1;
-        record.last_review_at = Some(Utc::now());
-        match self.tracker.upsert_pr(&record) {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::warn!(pr_url = %pr_url, error = %e, "Failed to update PR review cycles");
-                false
+        match self
+            .tracker
+            .charge_pr_review_cycle(&record, MAX_REVIEW_CYCLES)
+        {
+            Ok(true) => ReviewCycleCharge::Charged,
+            Ok(false) => ReviewCycleCharge::CapReached,
+            Err(error) => {
+                tracing::warn!(pr_url = %pr_url, error = %error, "Failed to update PR review cycles");
+                ReviewCycleCharge::Uncounted
             }
         }
     }
 
     /// Give back the review cycle charged for a rerun of `pr_url` that never
     /// started, so reruns that keep failing to start cannot use up
-    /// [`MAX_REVIEW_CYCLES`] before any feedback is addressed.
-    fn refund_review_cycle(&self, attempt: &FixAttempt, pr_url: &str) {
-        let Some(mut record) = self.review_cycle_record(attempt, pr_url) else {
-            return;
-        };
-        record.review_cycles = record.review_cycles.saturating_sub(1).max(0);
-        if let Err(e) = self.tracker.upsert_pr(&record) {
-            tracing::warn!(pr_url = %pr_url, error = %e, "Failed to refund PR review cycle");
+    /// [`MAX_REVIEW_CYCLES`] before any feedback is addressed. Only that one
+    /// cycle is given back, whatever other processes counted meanwhile.
+    fn refund_review_cycle(&self, pr_url: &str) {
+        if let Err(error) = self.tracker.refund_pr_review_cycle(pr_url) {
+            tracing::warn!(pr_url = %pr_url, error = %error, "Failed to refund PR review cycle");
         }
     }
 

@@ -2666,7 +2666,8 @@ impl ActivityStore for SqliteTracker {
 
     /// Upsert a PR record.
     ///
-    /// Creates a new record or updates an existing one based on pr_url.
+    /// Creates a new record or updates an existing one based on pr_url,
+    /// leaving an existing record's review cycle count as it is.
     fn upsert_pr(&self, pr: &claudear_core::types::PrRecord) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
@@ -2704,7 +2705,6 @@ impl ActivityStore for SqliteTracker {
                 last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
                 time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
                 time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
-                review_cycles = excluded.review_cycles,
                 files_changed = COALESCE(excluded.files_changed, prs.files_changed),
                 lines_added = COALESCE(excluded.lines_added, prs.lines_added),
                 lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
@@ -2773,6 +2773,64 @@ impl ActivityStore for SqliteTracker {
 
         let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
         Ok(result)
+    }
+
+    /// Count one review-driven rerun of a PR below `cap`, creating the PR's
+    /// record in the same transaction when it has none.
+    fn charge_pr_review_cycle(
+        &self,
+        pr: &claudear_core::types::PrRecord,
+        cap: i32,
+    ) -> Result<bool> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            r#"
+            INSERT INTO prs (
+                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                status, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(pr_url) DO NOTHING
+            "#,
+            params![
+                pr.pr_url,
+                pr.scm_repo,
+                pr.pr_number,
+                pr.attempt_id,
+                pr.issue_id,
+                pr.issue_source,
+                pr.status,
+                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+        let charged = transaction.execute(
+            r#"
+            UPDATE prs SET
+                review_cycles = COALESCE(review_cycles, 0) + 1,
+                last_review_at = datetime('now'),
+                updated_at = datetime('now')
+            WHERE pr_url = ?1 AND COALESCE(review_cycles, 0) < ?2
+            "#,
+            params![pr.pr_url, cap],
+        )?;
+        transaction.commit()?;
+        Ok(charged > 0)
+    }
+
+    /// Give back one counted review-driven rerun of a PR, never going below
+    /// zero.
+    fn refund_pr_review_cycle(&self, pr_url: &str) -> Result<()> {
+        let connection = self.acquire_lock()?;
+        connection.execute(
+            r#"
+            UPDATE prs SET
+                review_cycles = review_cycles - 1,
+                updated_at = datetime('now')
+            WHERE pr_url = ?1 AND review_cycles > 0
+            "#,
+            params![pr_url],
+        )?;
+        Ok(())
     }
 
     /// Update PR status.
@@ -18059,6 +18117,110 @@ mod tests {
         assert_eq!(fetched.status, "merged");
         assert_eq!(fetched.approvals_count, 2);
         assert_eq!(fetched.comments_count, 5);
+    }
+
+    #[test]
+    fn test_upsert_pr_keeps_counted_review_cycles() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        tracker.upsert_pr(&pr).unwrap();
+        let mut stale = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+        stale.status = "merged".to_string();
+        tracker.upsert_pr(&stale).unwrap();
+
+        let fetched = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+        assert_eq!(fetched.status, "merged");
+        assert_eq!(
+            fetched.review_cycles, 1,
+            "a stale copy of the record must not undo a counted review cycle"
+        );
+    }
+
+    #[test]
+    fn test_charge_pr_review_cycle_creates_a_missing_record() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = claudear_core::types::PrRecord::for_issue(
+            "https://github.com/org/repo/pull/1",
+            "org/repo",
+            1,
+            "linear",
+            "ISSUE-1",
+        );
+
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+
+        let fetched = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+        assert_eq!(fetched.scm_repo, "org/repo");
+        assert_eq!(fetched.pr_number, 1);
+        assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
+        assert_eq!(fetched.issue_id.as_deref(), Some("ISSUE-1"));
+        assert_eq!(fetched.status, "open");
+        assert_eq!(fetched.review_cycles, 1);
+        assert!(fetched.last_review_at.is_some());
+    }
+
+    #[test]
+    fn test_charge_pr_review_cycle_counts_nothing_past_the_cap() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let cap = 2;
+
+        for _ in 0..cap {
+            assert!(tracker.charge_pr_review_cycle(&pr, cap).unwrap());
+        }
+
+        assert!(
+            !tracker.charge_pr_review_cycle(&pr, cap).unwrap(),
+            "a PR that used every review cycle must not be charged another"
+        );
+        assert_eq!(
+            tracker.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles,
+            cap
+        );
+    }
+
+    #[test]
+    fn test_refund_pr_review_cycle_gives_back_one_cycle_and_stops_at_zero() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let review_cycles = || tracker.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles;
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert_eq!(review_cycles(), 1);
+
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert_eq!(
+            review_cycles(),
+            0,
+            "a refund must never take the count below zero"
+        );
+    }
+
+    #[test]
+    fn test_review_cycles_are_shared_by_processes_on_one_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let daemon = SqliteTracker::new(&path).unwrap();
+        let webhook = SqliteTracker::new(path).unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+
+        assert!(daemon.charge_pr_review_cycle(&pr, 1).unwrap());
+        assert!(
+            !webhook.charge_pr_review_cycle(&pr, 1).unwrap(),
+            "a cycle the daemon counted must count against the webhook process's cap"
+        );
+
+        daemon.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert!(
+            webhook.charge_pr_review_cycle(&pr, 1).unwrap(),
+            "a cycle the daemon gave back must be free for the webhook process"
+        );
+        assert_eq!(daemon.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles, 1);
     }
 
     #[test]
