@@ -9,8 +9,8 @@ use claudear::{
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
     ipc::{
-        default_socket_path, get_daemon_pid, is_daemon_running, print_response, IpcClient,
-        IpcServer,
+        default_lock_path, default_socket_path, is_daemon_running, print_response, IpcClient,
+        IpcServer, Lock,
     },
     notifier::{
         CompositeNotifier, ConsoleNotifier, DiscordNotifier, EmailNotifier, Notifier, PushNotifier,
@@ -1988,12 +1988,12 @@ impl Daemon<'_> {
 
 /// Wait up to [`shutdown::EXIT_TIMEOUT`] for the daemon to exit, reporting progress every
 /// [`STOP_PROGRESS_INTERVAL`].
-async fn wait_for_exit(client: &IpcClient, pid: Option<u32>) -> anyhow::Result<()> {
+async fn wait_for_exit(client: &IpcClient) -> anyhow::Result<()> {
     let started = Instant::now();
     loop {
         let remaining = shutdown::EXIT_TIMEOUT.saturating_sub(started.elapsed());
         if client
-            .wait_until_stopped(pid, STOP_PROGRESS_INTERVAL.min(remaining))
+            .wait_until_stopped(STOP_PROGRESS_INTERVAL.min(remaining))
             .await
         {
             return Ok(());
@@ -2204,7 +2204,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let pid = get_daemon_pid();
             let client = IpcClient::new();
             match client.shutdown().await {
                 Ok(response) => {
@@ -2219,13 +2218,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 "Waiting up to {}s for in-flight runs to finish and the daemon to exit...",
                 shutdown::EXIT_TIMEOUT.as_secs()
             );
-            wait_for_exit(&client, pid).await?;
-            match pid {
-                Some(_) => println!("Daemon stopped."),
-                None => println!(
-                    "The daemon closed its control socket; its PID is unknown, so its exit could not be confirmed."
-                ),
-            }
+            wait_for_exit(&client).await?;
+            println!("Daemon stopped.");
             return Ok(());
         }
 
@@ -3688,6 +3682,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         foreground: _,
     } = &cli.command
     {
+        // Leaked so that only the kernel frees it, as this process exits: no other daemon can
+        // start before then, even while this one is still shutting down.
+        let lock: &'static Lock = Box::leak(Box::new(Lock::acquire(&default_lock_path())?));
         if is_daemon_running() {
             anyhow::bail!("A daemon is already running. Stop it first with 'claudear stop'");
         }
@@ -3880,7 +3877,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             Service::new(HOUSEKEEPING_SERVICE, async move { worker.start().await })
         };
         let ipc = Service::new(IPC_SERVICE, async {
-            ipc_server.start().await.map_err(anyhow::Error::from)
+            ipc_server.start(lock).await.map_err(anyhow::Error::from)
         });
 
         let daemon = Daemon {

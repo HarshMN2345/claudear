@@ -4,8 +4,7 @@ use super::protocol::{
     ActivityEntry, ActivityType, IpcCommand, IpcData, IpcResponse, WatcherState,
 };
 use super::{
-    cleanup_stale_files, default_pid_path, default_socket_path, is_accepting, read_pid_file,
-    write_pid_file,
+    default_pid_path, default_socket_path, is_accepting, read_pid_file, write_pid_file, Lock,
 };
 use crate::watcher::{RetryOutcome, Watcher, MANUAL_TRIGGER};
 use claudear_core::error::{Error, Result};
@@ -263,20 +262,23 @@ impl IpcServer {
     }
 
     /// Serve IPC requests until this future is dropped; it returns only if setup fails, such
-    /// as when another daemon already listens on the socket, whose files it leaves alone.
+    /// as when a daemon that takes no [`Lock`] already listens on the socket, whose files it
+    /// leaves alone.
+    ///
+    /// Only the holder of the daemon's [`Lock`] can start serving: no other daemon that takes
+    /// the lock can be running, so a socket file nothing accepts on is left over from one that
+    /// exited and is replaced.
     ///
     /// A `Shutdown` request marks the server as stopping but keeps it answering, so status
     /// stays available while the daemon drains. Dropping the future removes the socket and
     /// PID files, unless another daemon has replaced them by then.
-    pub async fn start(&self) -> Result<()> {
+    pub async fn start(&self, _lock: &Lock) -> Result<()> {
         if is_accepting(&self.socket_path) {
             return Err(Error::Other(format!(
                 "{ALREADY_LISTENING} {}. Stop it first with 'claudear stop'",
                 self.socket_path.display()
             )));
         }
-        cleanup_stale_files(&self.socket_path, &self.pid_path);
-
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
         }
@@ -987,9 +989,14 @@ mod tests {
         pid_path: PathBuf,
     }
 
+    fn lock_in(directory: &Path) -> Lock {
+        Lock::acquire(&directory.join("claudear.lock")).expect("take the daemon lock")
+    }
+
     async fn start_in(directory: &Path) -> StartedServer {
         let socket_path = directory.join("claudear.sock");
         let pid_path = directory.join("claudear.pid");
+        let lock = lock_in(directory);
         let server = Arc::new(
             IpcServer::builder(mock_tracker(), mock_sources(), mock_notifier())
                 .socket_path(socket_path.clone())
@@ -998,7 +1005,7 @@ mod tests {
         );
         let task = tokio::spawn({
             let server = server.clone();
-            async move { server.start().await }
+            async move { server.start(&lock).await }
         });
         let client = IpcClient::with_socket_path(socket_path.clone()).with_timeout(REQUEST_TIMEOUT);
 
@@ -2772,8 +2779,9 @@ mod tests {
             .socket_path(socket_path.clone())
             .pid_path(pid_path.clone())
             .build();
+        let lock = lock_in(directory.path());
 
-        let error = tokio::time::timeout(STARTUP_TIMEOUT, server.start())
+        let error = tokio::time::timeout(STARTUP_TIMEOUT, server.start(&lock))
             .await
             .expect("start should fail instead of serving")
             .expect_err("start should refuse a socket another daemon listens on");

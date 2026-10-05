@@ -3,10 +3,12 @@
 //! Enables the CLI to communicate with a running watcher daemon.
 
 mod client;
+mod lock;
 mod protocol;
 mod server;
 
 pub use client::{print_response, IpcClient};
+pub use lock::Lock;
 pub use protocol::{IpcCommand, IpcData, IpcResponse, WatcherState};
 pub use server::IpcServer;
 
@@ -59,14 +61,14 @@ pub fn default_pid_path() -> PathBuf {
     ipc_runtime_dir().join("claudear.pid")
 }
 
+/// Default path of the file the running `claudear start` daemon holds its [`Lock`] on.
+pub fn default_lock_path() -> PathBuf {
+    ipc_runtime_dir().join("claudear.lock")
+}
+
 /// Check if a watcher daemon is running.
 pub fn is_daemon_running() -> bool {
     is_accepting(&default_socket_path())
-}
-
-/// Get the PID of the running daemon, if any.
-pub fn get_daemon_pid() -> Option<u32> {
-    read_pid_file(&default_pid_path())
 }
 
 /// Whether a listener is accepting connections on the socket at `socket_path`.
@@ -82,52 +84,6 @@ fn read_pid_file(pid_path: &Path) -> Option<u32> {
 /// Write the current process PID to `pid_path`.
 fn write_pid_file(pid_path: &Path) -> std::io::Result<()> {
     std::fs::write(pid_path, std::process::id().to_string())
-}
-
-/// Remove the socket and PID files a crashed daemon left behind.
-fn cleanup_stale_files(socket_path: &Path, pid_path: &Path) {
-    match read_pid_file(pid_path) {
-        Some(pid) if is_process_running(pid) => {}
-        Some(pid) => {
-            tracing::info!("Cleaning up stale files from previous run (PID {})", pid);
-            let _ = std::fs::remove_file(pid_path);
-            let _ = std::fs::remove_file(socket_path);
-        }
-        None if socket_path.exists() && !is_accepting(socket_path) => {
-            tracing::info!("Cleaning up stale socket file");
-            let _ = std::fs::remove_file(socket_path);
-        }
-        None => {}
-    }
-}
-
-/// Check if a process with the given PID is running.
-fn is_process_running(pid: u32) -> bool {
-    // Try to check /proc on Linux
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
-    }
-
-    // On macOS/BSD, use kill(pid, 0) to check if process exists
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: kill with signal 0 doesn't actually send a signal,
-        // it just checks if the process exists and we have permission to signal it.
-        // Returns 0 if process exists, -1 if not (with errno set to ESRCH).
-        match i32::try_from(pid) {
-            Ok(pid_i32) => unsafe { libc::kill(pid_i32, 0) == 0 },
-            Err(_) => false, // PID exceeds i32::MAX, cannot be valid
-        }
-    }
-
-    // Fallback for other platforms
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid; // Suppress unused warning
-                     // Assume running if we can't check
-        true
-    }
 }
 
 /// A temporary directory under `/tmp`, so socket paths inside it stay within the Unix socket
@@ -210,74 +166,5 @@ mod tests {
         drop(listener);
         assert!(socket_path.exists(), "dropping a listener leaves its file");
         assert!(!is_accepting(&socket_path));
-    }
-
-    #[test]
-    fn test_is_process_running_with_own_pid() {
-        // Our own process is guaranteed to be running and we have permission to signal it.
-        let own_pid = std::process::id();
-        assert!(
-            is_process_running(own_pid),
-            "Our own PID ({}) should be reported as running",
-            own_pid
-        );
-    }
-
-    #[test]
-    fn test_is_process_running_with_invalid_pid() {
-        // u32::MAX is extremely unlikely to be a valid PID on any system.
-        assert!(
-            !is_process_running(u32::MAX),
-            "PID u32::MAX should not be reported as running"
-        );
-    }
-
-    #[test]
-    fn test_cleanup_stale_files_removes_files_of_a_dead_daemon() {
-        let directory = short_temporary_directory();
-        let socket_path = directory.path().join("claudear.sock");
-        let pid_path = directory.path().join("claudear.pid");
-        drop(UnixListener::bind(&socket_path).unwrap());
-        std::fs::write(&pid_path, u32::MAX.to_string()).unwrap();
-
-        cleanup_stale_files(&socket_path, &pid_path);
-
-        assert!(!socket_path.exists(), "stale socket should be removed");
-        assert!(!pid_path.exists(), "stale PID file should be removed");
-    }
-
-    #[test]
-    fn test_cleanup_stale_files_keeps_files_of_a_live_daemon() {
-        let directory = short_temporary_directory();
-        let socket_path = directory.path().join("claudear.sock");
-        let pid_path = directory.path().join("claudear.pid");
-        let _listener = UnixListener::bind(&socket_path).unwrap();
-        write_pid_file(&pid_path).unwrap();
-
-        cleanup_stale_files(&socket_path, &pid_path);
-
-        assert!(socket_path.exists(), "live socket should be kept");
-        assert_eq!(read_pid_file(&pid_path), Some(std::process::id()));
-    }
-
-    #[test]
-    fn test_cleanup_stale_files_removes_a_socket_without_pid_once_nothing_listens() {
-        let directory = short_temporary_directory();
-        let socket_path = directory.path().join("claudear.sock");
-        let pid_path = directory.path().join("claudear.pid");
-        let listener = UnixListener::bind(&socket_path).unwrap();
-
-        cleanup_stale_files(&socket_path, &pid_path);
-        assert!(
-            socket_path.exists(),
-            "a socket that still accepts should be kept"
-        );
-
-        drop(listener);
-        cleanup_stale_files(&socket_path, &pid_path);
-        assert!(
-            !socket_path.exists(),
-            "a socket nothing listens on should be removed"
-        );
     }
 }

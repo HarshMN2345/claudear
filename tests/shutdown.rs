@@ -3,13 +3,14 @@
 mod sandbox;
 
 use claudear::ipc::{IpcClient, IpcData, IpcResponse};
-use claudear::shutdown;
 use sandbox::Sandbox;
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::net::SocketAddr;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixListener;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,7 +20,6 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Instant};
 
 const STARTUP_WAIT: Duration = Duration::from_secs(40);
-const STOP_MARGIN: Duration = Duration::from_secs(4);
 const EXIT_WAIT: Duration = Duration::from_secs(20);
 const HANGUP_WAIT: Duration = Duration::from_secs(2);
 const SUSPEND_WAIT: Duration = Duration::from_secs(5);
@@ -34,7 +34,7 @@ const POLL: &str = "poll";
 const ACTION: &str = "action";
 const STOP: &str = "stop";
 const STOPPED: &str = "Daemon stopped.";
-const SOCKET_CLOSED: &str = "The daemon closed its control socket";
+const ALREADY_RUNNING: &str = "Another claudear daemon is already running";
 const FORCED_NOTICE: &str = "Shutdown forced";
 const ISSUE_KEY: &str = "SANDBOX-1";
 
@@ -187,14 +187,15 @@ impl Sandbox {
         }
     }
 
+    /// Runs `claudear stop`, which must succeed well before its own timeout: the sandbox's
+    /// daemon has no runs to drain.
     async fn stop(&self) {
-        let deadline = shutdown::EXIT_TIMEOUT + STOP_MARGIN;
-        let stop = timeout(deadline, self.command(STOP, &["stop"]).status())
+        let stop = timeout(EXIT_WAIT, self.command(STOP, &["stop"]).status())
             .await
             .unwrap_or_else(|_| {
                 panic!(
                     "claudear stop did not return within {}s\n{}",
-                    deadline.as_secs(),
+                    EXIT_WAIT.as_secs(),
                     self.diagnostics()
                 )
             })
@@ -334,6 +335,26 @@ impl Sandbox {
 
     fn pid_file(&self) -> PathBuf {
         self.runtime_directory().join("claudear.pid")
+    }
+
+    fn lock_file(&self) -> PathBuf {
+        self.runtime_directory().join("claudear.lock")
+    }
+
+    /// Takes the daemon lock, as a daemon still starting up holds it before it listens on its
+    /// socket.
+    fn hold_lock(&self) -> File {
+        fs::create_dir_all(self.runtime_directory()).expect("create the runtime directory");
+        let lock = File::create(self.lock_file()).expect("create the lock file");
+        lock.try_lock().expect("take the daemon lock");
+        lock
+    }
+
+    /// Leaves a socket file that nothing listens on at the daemon's socket path, as a daemon that
+    /// crashed does, and returns its inode.
+    fn leave_stale_socket(&self) -> u64 {
+        drop(UnixListener::bind(self.socket()).expect("bind the daemon's socket"));
+        inode(&self.socket()).expect("the socket file outlives its listener")
     }
 
     fn daemon_pid(&self) -> Option<libc::pid_t> {
@@ -481,6 +502,12 @@ impl Request {
     }
 }
 
+fn inode(path: &Path) -> Option<u64> {
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| metadata.ino())
+}
+
 fn pid_of(daemon: &Child) -> libc::pid_t {
     let id = daemon.id().expect("the daemon has not been reaped");
     libc::pid_t::try_from(id).expect("the PID fits in pid_t")
@@ -598,7 +625,7 @@ async fn stop_returns_once_the_daemon_has_exited() {
     sandbox.stop().await;
 
     assert!(
-        !is_alive(pid),
+        !is_running(pid).await,
         "claudear stop returned before the daemon exited\n{}",
         sandbox.diagnostics()
     );
@@ -617,27 +644,67 @@ async fn stop_returns_once_the_daemon_has_exited() {
 }
 
 #[tokio::test]
-async fn stop_without_the_pid_file_reports_only_the_closed_socket() {
+async fn stop_returns_once_the_daemon_has_exited_before_anything_reaps_it() {
     let sandbox = Sandbox::new();
     let mut daemon = sandbox.start().await;
-    fs::remove_file(sandbox.pid_file()).expect("remove the PID file");
+    let pid = pid_of(&daemon);
 
     sandbox.stop().await;
 
-    let output = sandbox.read(STOP);
     assert!(
-        !output.contains(STOPPED),
-        "claudear stop claimed the daemon had exited without knowing its PID\n{}",
+        !is_running(pid).await,
+        "claudear stop returned before the daemon exited\n{}",
         sandbox.diagnostics()
     );
     assert!(
-        output.contains(SOCKET_CLOSED),
-        "claudear stop did not report the closed socket\n{}",
+        sandbox.read(STOP).contains(STOPPED),
+        "claudear stop did not report the exit\n{}",
         sandbox.diagnostics()
     );
     let status = sandbox.wait_for_exit(&mut daemon).await;
     assert_exited_cleanly(status, &sandbox);
     sandbox.assert_files_removed();
+}
+
+#[tokio::test]
+async fn start_refuses_while_another_daemon_holds_the_lock() {
+    let sandbox = Sandbox::new();
+    let _lock = sandbox.hold_lock();
+    let socket = sandbox.leave_stale_socket();
+
+    let mut daemon = sandbox.daemon().spawn().expect("spawn the daemon");
+    let status = timeout(STARTUP_WAIT, daemon.wait())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the daemon was still running {}s after starting while another held the lock\n{}",
+                STARTUP_WAIT.as_secs(),
+                sandbox.diagnostics()
+            )
+        })
+        .expect("wait for the daemon");
+
+    assert!(
+        !status.success(),
+        "the daemon started while another held the lock\n{}",
+        sandbox.diagnostics()
+    );
+    assert!(
+        sandbox.read(DAEMON).contains(ALREADY_RUNNING),
+        "the daemon did not report that another one is running\n{}",
+        sandbox.diagnostics()
+    );
+    assert_eq!(
+        inode(&sandbox.socket()),
+        Some(socket),
+        "the daemon replaced the socket while another held the lock\n{}",
+        sandbox.diagnostics()
+    );
+    assert!(
+        !sandbox.pid_file().exists(),
+        "the daemon wrote its PID while another held the lock\n{}",
+        sandbox.diagnostics()
+    );
 }
 
 #[tokio::test]
