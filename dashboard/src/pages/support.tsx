@@ -53,12 +53,14 @@ function DraftCard({ draft, isAdmin, onReviewed }: { draft: SupportDraft; isAdmi
     if (rewritten && !dirty) {
       setBase({ answer: draft.answer, revision: draft.updated_at })
       setAnswer(draft.answer)
+      setFailed(false)
     }
   }, [rewritten, dirty, draft.answer, draft.updated_at])
 
   function loadRewrite() {
     setBase({ answer: draft.answer, revision: draft.updated_at })
     setAnswer(draft.answer)
+    setFailed(false)
   }
 
   async function review(status: 'approved' | 'rejected') {
