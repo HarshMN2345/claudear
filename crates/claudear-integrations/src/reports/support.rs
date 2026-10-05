@@ -169,7 +169,7 @@ static PROMISE: LazyLock<Regex> = LazyLock::new(|| {
 
 // Posters often mark threads solved in the title instead of with the tag.
 static SOLVED_TITLE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\s*\[(solved?|closed|fixed|resolved)\]").expect("valid pattern")
+    Regex::new(r"(?i)^\s*\[(solved|closed|fixed|resolved)\]").expect("valid pattern")
 });
 
 /// Whether the poster marked the thread solved in its title.
