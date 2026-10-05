@@ -19,7 +19,7 @@ use claudear_core::error::Result;
 use claudear_core::types::{
     ActionKind, ActivityLogEntry, AskRequest, BlockingQuestion, DeployQaTip, DeployQaTipStatus,
     FixAttempt, FixAttemptStats, FixAttemptStatus, Issue, IssueEmbedding, IssueType, MatchPriority,
-    MatchResult, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
+    MatchResult, PrRecord, ProcessingMetric, RegressionWatch, ReplyKind, TimelineEventStatus,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -1579,6 +1579,8 @@ impl Watcher {
     ///
     /// This creates a new Claude session with the original issue context plus
     /// the review feedback appended to help Claude understand what to fix.
+    /// A rerun counts toward the PR's [`MAX_REVIEW_CYCLES`] only once its run
+    /// is admitted, so feedback refused by a stop or a busy issue costs none.
     async fn process_review_action(
         &self,
         attempt: &claudear_core::types::FixAttempt,
@@ -1592,60 +1594,8 @@ impl Watcher {
             "Processing review feedback for issue"
         );
 
-        // Increment the review_cycles count
-        if let Some(ref pr_url) = attempt.pr_url {
-            // Cascade PRs are watched without a PR record; create one so the cap counts them too
-            let pr_record = match self.tracker.get_pr(pr_url) {
-                Ok(Some(record)) => Some(record),
-                Ok(None) => match (&attempt.scm_repo, attempt.scm_pr_number) {
-                    (Some(repo), Some(number)) => {
-                        let mut record = claudear_core::types::PrRecord::new(pr_url, repo, number);
-                        record.attempt_id = Some(attempt.id);
-                        record.issue_id = Some(attempt.issue_id.clone());
-                        record.issue_source = Some(attempt.source.clone());
-                        Some(record)
-                    }
-                    _ => None,
-                },
-                Err(e) => {
-                    tracing::warn!(pr_url = %pr_url, error = %e, "Failed to load PR record for review cycle cap");
-                    None
-                }
-            };
-            // Update the PR record with incremented review_cycles
-            if let Some(mut pr_record) = pr_record {
-                if pr_record.review_cycles >= MAX_REVIEW_CYCLES {
-                    tracing::warn!(
-                        pr_url = %pr_url,
-                        short_id = %attempt.short_id,
-                        review_cycles = pr_record.review_cycles,
-                        "Review cycle cap reached; leaving PR to humans"
-                    );
-                    self.tracker
-                        .record_activity(
-                            &ActivityLogEntry::new(
-                                "review_cycle_cap_reached",
-                                format!(
-                                    "Stopped addressing review feedback for {} after {} cycles",
-                                    attempt.short_id, pr_record.review_cycles
-                                ),
-                            )
-                            .with_source(attempt.source.clone())
-                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
-                            .with_metadata(json!({ "pr_url": pr_url })),
-                        )
-                        .ok();
-                    if let Some(rw) = &self.review_watcher {
-                        rw.unwatch_pr(pr_url);
-                    }
-                    return Ok(());
-                }
-                pr_record.review_cycles += 1;
-                pr_record.last_review_at = Some(chrono::Utc::now());
-                if let Err(e) = self.tracker.upsert_pr(&pr_record) {
-                    tracing::warn!(error = %e, "Failed to update PR review cycles");
-                }
-            }
+        if self.review_cycle_cap_reached(attempt) {
+            return Ok(());
         }
 
         if self.config.learning.review_classification {
@@ -1802,6 +1752,10 @@ impl Watcher {
                     existing_pr_branch.clone(),
                     Some("Review feedback received".into()),
                     attempt.scm_repo.as_deref(),
+                    Some(Box::new(move || {
+                        self.count_review_cycle(attempt);
+                        true
+                    })),
                 )
                 .await
             {
@@ -1835,6 +1789,87 @@ impl Watcher {
         }
 
         Ok(())
+    }
+
+    /// Whether `attempt`'s PR has had its [`MAX_REVIEW_CYCLES`] review reruns,
+    /// in which case the PR is left to humans and its reviews are no longer
+    /// followed.
+    fn review_cycle_cap_reached(&self, attempt: &FixAttempt) -> bool {
+        let Some(pr_url) = attempt.pr_url.as_deref() else {
+            return false;
+        };
+        let Some(record) = self.review_pr_record(attempt, pr_url) else {
+            return false;
+        };
+        if record.review_cycles < MAX_REVIEW_CYCLES {
+            return false;
+        }
+        tracing::warn!(
+            pr_url = %pr_url,
+            short_id = %attempt.short_id,
+            review_cycles = record.review_cycles,
+            "Review cycle cap reached; leaving PR to humans"
+        );
+        self.tracker
+            .record_activity(
+                &ActivityLogEntry::new(
+                    "review_cycle_cap_reached",
+                    format!(
+                        "Stopped addressing review feedback for {} after {} cycles",
+                        attempt.short_id, record.review_cycles
+                    ),
+                )
+                .with_source(attempt.source.clone())
+                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                .with_metadata(json!({ "pr_url": pr_url })),
+            )
+            .ok();
+        if let Some(review_watcher) = &self.review_watcher {
+            review_watcher.unwatch_pr(pr_url);
+        }
+        true
+    }
+
+    /// Count a review rerun of `attempt`, once its run is admitted, toward its
+    /// PR's [`MAX_REVIEW_CYCLES`].
+    fn count_review_cycle(&self, attempt: &FixAttempt) {
+        let Some(pr_url) = attempt.pr_url.as_deref() else {
+            return;
+        };
+        let Some(mut record) = self.review_pr_record(attempt, pr_url) else {
+            return;
+        };
+        record.review_cycles += 1;
+        record.last_review_at = Some(Utc::now());
+        if let Err(error) = self.tracker.upsert_pr(&record) {
+            tracing::warn!(pr_url = %pr_url, %error, "Failed to update PR review cycles");
+        }
+    }
+
+    /// The record of `attempt`'s PR that its review cycles are counted on. A
+    /// cascade PR is watched without one, so a new record stands in for it.
+    fn review_pr_record(&self, attempt: &FixAttempt, pr_url: &str) -> Option<PrRecord> {
+        match self.tracker.get_pr(pr_url) {
+            Ok(Some(record)) => Some(record),
+            Ok(None) => {
+                let (Some(repo), Some(number)) = (&attempt.scm_repo, attempt.scm_pr_number) else {
+                    return None;
+                };
+                let mut record = PrRecord::new(pr_url, repo, number);
+                record.attempt_id = Some(attempt.id);
+                record.issue_id = Some(attempt.issue_id.clone());
+                record.issue_source = Some(attempt.source.clone());
+                Some(record)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    pr_url = %pr_url,
+                    %error,
+                    "Failed to load PR record for review cycle cap"
+                );
+                None
+            }
+        }
     }
 
     /// Trigger cascade processing for downstream repos after a PR is merged
@@ -5295,12 +5330,15 @@ Create a PR with your changes.{custom_instructions}"#,
             existing_pr_branch,
             trigger_reason,
             None,
+            None,
         )
         .await
     }
 
     /// `pr_repo` pins a review rerun to the repo of the PR under review. It must
     /// come from the reviewed attempt: a cascade row shares its parent's issue id.
+    /// `admission` is passed on to [`Self::process_issue`].
+    #[expect(clippy::too_many_arguments)]
     async fn trigger_issue_inner(
         &self,
         source_name: &str,
@@ -5309,6 +5347,7 @@ Create a PR with your changes.{custom_instructions}"#,
         existing_pr_branch: Option<String>,
         trigger_reason: Option<String>,
         pr_repo: Option<&str>,
+        admission: Option<Admission<'_>>,
     ) -> Result<()> {
         let source = self
             .sources
@@ -5346,7 +5385,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 review_feedback,
                 existing_pr_branch,
                 None,
-                None,
+                admission,
             )
             .await;
         match run {
@@ -7719,6 +7758,69 @@ mod tests {
             1,
             "review runs refused by a stop must not give up on the fix request"
         );
+        assert_eq!(
+            review_cycles(&tracker),
+            0,
+            "review runs refused by a stop must not use up the PR's review cycles"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_run_stopped_before_admission_uses_no_review_cycle() {
+        let issue = fixed_issue(GATED_SOURCE);
+        let source = Arc::new(GatedSource {
+            issue: Some(issue.clone()),
+            ..GatedSource::default()
+        });
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let watcher = watcher_with_scm(
+            test_config(),
+            Arc::clone(&source) as Arc<dyn IssueSource>,
+            Arc::clone(&tracker),
+            crashing_agent(),
+            Arc::new(MockScm::reporting(PrStatus::Open)),
+        );
+        record_pr(&tracker, &issue);
+        watcher.set_running(true);
+        let attempt = attempt_for(&tracker, &issue);
+
+        let mut review = tokio::spawn({
+            let watcher = Arc::clone(&watcher);
+            async move {
+                watcher
+                    .process_review_action(&attempt, "Please handle an empty list")
+                    .await
+            }
+        });
+        source.gate.arrival_during(&mut review).await;
+        source.gate.open();
+        source.gate.arrival_during(&mut review).await;
+        watcher.stop();
+        source.gate.open();
+        let reviewed = review.await;
+
+        assert!(
+            matches!(reviewed, Ok(Err(_))),
+            "the stop should refuse the review run: {reviewed:?}"
+        );
+        assert_eq!(
+            attempt_for(&tracker, &issue).status,
+            FixAttemptStatus::Success,
+            "a review run refused by a stop must not start"
+        );
+        assert_eq!(
+            review_cycles(&tracker),
+            0,
+            "a review run refused before admission must not use up a review cycle"
+        );
+    }
+
+    /// The review reruns counted against [`PR_URL`].
+    fn review_cycles(tracker: &SqliteTracker) -> i32 {
+        tracker
+            .get_pr(PR_URL)
+            .unwrap()
+            .map_or(0, |record| record.review_cycles)
     }
 
     #[tokio::test]
