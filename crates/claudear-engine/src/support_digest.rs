@@ -88,6 +88,13 @@ pub enum DraftStatus {
     Failed,
 }
 
+/// Outcome of a conditional draft write.
+enum Write {
+    Saved,
+    Missing,
+    Conflict,
+}
+
 /// What became of a reviewer's decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewOutcome {
@@ -207,20 +214,15 @@ impl ThreadsStore {
 
     /// Write a pending answer for the thread over the draft it replaces.
     /// `revision` is that draft's `$updatedAt`, or `None` when there was none.
-    /// When the draft changed meanwhile, such as a reviewer acting on it, nothing
-    /// is written and this returns `false`. Appwrite has no conditional writes,
-    /// so the check runs right before the write.
+    /// Returns `false`, writing nothing, when the draft changed meanwhile, such
+    /// as a reviewer acting on it: Appwrite refuses the write itself, so there
+    /// is no gap between the check and the write.
     pub async fn save_draft(
         &self,
         thread: &SupportThread,
         answer: &str,
         revision: Option<&str>,
     ) -> Result<bool> {
-        let current = self.draft(&thread.id).await?;
-        if current.as_ref().map(|draft| draft.updated_at.as_str()) != revision {
-            return Ok(false);
-        }
-
         let answer: String = answer.chars().take(MAX_ANSWER_CHARS).collect();
         let data = json!({
             "threadId": thread.id,
@@ -232,14 +234,15 @@ impl ThreadsStore {
             "sentChunks": 0,
             "error": null,
         });
-        self.request(
-            Method::PUT,
-            &format!("drafts/rows/{}", thread.id),
-            Some(json!({ "data": data })),
-        )
-        .await?
-        .ok_or_else(|| Error::Other("drafts table not found".to_string()))?;
-        Ok(true)
+        match self.write_draft(&thread.id, data, revision).await? {
+            Write::Saved => Ok(true),
+            Write::Conflict => Ok(false),
+            // Creating fails this way only when the table is missing.
+            Write::Missing if revision.is_none() => {
+                Err(Error::Other("drafts table not found".to_string()))
+            }
+            Write::Missing => Ok(false),
+        }
     }
 
     /// Set a reviewer's decision, and their edited answer if given, on the
@@ -273,17 +276,46 @@ impl ThreadsStore {
             data["sentChunks"] = json!(0);
             data["sentMessageId"] = Value::Null;
         }
-        let updated = self
-            .request(
+        Ok(
+            match self.write_draft(thread_id, data, Some(revision)).await? {
+                Write::Saved => ReviewOutcome::Saved,
+                Write::Conflict => ReviewOutcome::Stale,
+                Write::Missing => ReviewOutcome::Missing,
+            },
+        )
+    }
+
+    /// Create a draft row when `revision` is `None`, or update it when it is
+    /// still at `revision`. Appwrite refuses both with a 409 when another
+    /// writer got there first: a create when the row exists, an update when
+    /// `X-Appwrite-Timestamp` is older than the row.
+    async fn write_draft(
+        &self,
+        thread_id: &str,
+        data: Value,
+        revision: Option<&str>,
+    ) -> Result<Write> {
+        let (method, path, body) = match revision {
+            Some(_) => (
                 Method::PATCH,
-                &format!("drafts/rows/{thread_id}"),
-                Some(json!({ "data": data })),
-            )
-            .await?;
-        Ok(match updated {
-            Some(_) => ReviewOutcome::Saved,
-            None => ReviewOutcome::Missing,
-        })
+                format!("drafts/rows/{thread_id}"),
+                json!({ "data": data }),
+            ),
+            None => (
+                Method::POST,
+                "drafts/rows".to_string(),
+                json!({ "rowId": thread_id, "data": data }),
+            ),
+        };
+        let (status, text) = self.call(method, &path, &[], Some(body), revision).await?;
+        match status {
+            status if status.is_success() => Ok(Write::Saved),
+            reqwest::StatusCode::CONFLICT => Ok(Write::Conflict),
+            reqwest::StatusCode::NOT_FOUND => Ok(Write::Missing),
+            status => Err(Error::network(format!(
+                "Threads project request to {path} failed ({status}): {text}"
+            ))),
+        }
     }
 
     /// How many drafts wait for a reviewer.
@@ -514,7 +546,8 @@ impl ThreadsStore {
         self.request_with(method, path, &[], body).await
     }
 
-    /// Call `{endpoint}/tablesdb/{database}/tables/{path}`. `None` on a 404.
+    /// [`call`](Self::call) that treats a 404 as `None` and any other failure as
+    /// an error.
     async fn request_with(
         &self,
         method: Method,
@@ -522,6 +555,29 @@ impl ThreadsStore {
         params: &[(&str, String)],
         body: Option<Value>,
     ) -> Result<Option<String>> {
+        let (status, text) = self.call(method, path, params, body, None).await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(Error::network(format!(
+                "Threads project request to {path} failed ({status}): {text}"
+            )));
+        }
+        Ok(Some(text))
+    }
+
+    /// Call `{endpoint}/tablesdb/{database}/tables/{path}`, returning the status
+    /// and body. With `revision`, Appwrite refuses to change a row updated after
+    /// it.
+    async fn call(
+        &self,
+        method: Method,
+        path: &str,
+        params: &[(&str, String)],
+        body: Option<Value>,
+        revision: Option<&str>,
+    ) -> Result<(reqwest::StatusCode, String)> {
         let url = format!(
             "{}/tablesdb/{}/tables/{}",
             self.config.endpoint.trim_end_matches('/'),
@@ -538,21 +594,16 @@ impl ThreadsStore {
         if let Some(key) = &self.config.api_key {
             request = request.header("X-Appwrite-Key", key.expose());
         }
+        if let Some(revision) = revision {
+            request = request.header("X-Appwrite-Timestamp", revision);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
         let response = request.send().await?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !status.is_success() {
-            return Err(Error::network(format!(
-                "Threads project request to {path} failed ({status}): {text}"
-            )));
-        }
-        Ok(Some(text))
+        Ok((status, text))
     }
 }
 
