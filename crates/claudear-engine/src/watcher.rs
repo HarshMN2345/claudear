@@ -7411,6 +7411,65 @@ mod tests {
             .collect()
     }
 
+    /// The review cycles `pr_url` has used, as stored.
+    fn review_cycles_used(tracker: &SqliteTracker, pr_url: &str) -> i32 {
+        tracker
+            .get_pr(pr_url)
+            .unwrap()
+            .map_or(0, |record| record.review_cycles)
+    }
+
+    /// A source holding one issue whose first fetch waits at `gate`, so
+    /// processes that each fetch the issue from their own copy all reach that
+    /// fetch before any of them goes past it.
+    struct GatedSource {
+        issue: Issue,
+        gate: Arc<tokio::sync::Barrier>,
+        gated: AtomicBool,
+    }
+
+    impl GatedSource {
+        fn new(issue: Issue, gate: Arc<tokio::sync::Barrier>) -> Self {
+            Self {
+                issue,
+                gate,
+                gated: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl IssueSource for GatedSource {
+        fn name(&self) -> &str {
+            &self.issue.source
+        }
+        fn display_name(&self) -> &str {
+            &self.issue.source
+        }
+        async fn fetch_issues(&self) -> Result<Vec<Issue>> {
+            Ok(vec![self.issue.clone()])
+        }
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::matched("Gated match", MatchPriority::Normal)
+        }
+        async fn build_issue_context(&self, issue: &Issue) -> Result<String> {
+            Ok(format!("Context for {}", issue.short_id))
+        }
+        async fn get_issue(&self, id: &str) -> Result<Issue> {
+            if self.gated.swap(false, AtomicOrdering::SeqCst) {
+                self.gate.wait().await;
+            }
+            if id == self.issue.id {
+                Ok(self.issue.clone())
+            } else {
+                Err(claudear_core::error::Error::source(
+                    &self.issue.source,
+                    "Issue not found",
+                ))
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_process_review_action_waits_for_inflight_issue_processing() {
         let notifier = Arc::new(MockNotifier::new(true));
@@ -7596,6 +7655,133 @@ mod tests {
             FixAttemptStatus::Failed,
             "feedback after reruns that never started must still start a rerun, which fails \
              fetching the repository in this setup"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refunding_a_review_cycle_keeps_the_cycle_another_process_charged() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_url = "https://github.com/org/repo/pull/1";
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let start_process = || {
+            let source = MockSource::with_issues(
+                "mock",
+                vec![Issue::new(
+                    "1",
+                    "MOCK-1",
+                    "Mock issue",
+                    "http://example.com/mock/1",
+                    "mock",
+                )],
+            );
+            let watcher = create_test_watcher_with_inferrer(
+                Arc::new(MockNotifier::new(true)),
+                tracker.clone(),
+                vec![Arc::new(source) as Arc<dyn IssueSource>],
+                inferrer_indexing(IndexedRepo::new("org/repo", checkout.path())),
+            );
+            watcher.is_running.store(true, Ordering::SeqCst);
+            watcher
+        };
+        let daemon = start_process();
+        let webhook = start_process();
+        daemon.lock_processing().insert("mock:1".to_string());
+
+        let daemon_review = daemon.process_review_action(&attempt, "Please add a test");
+        let webhook_review_while_daemon_waits = async {
+            while review_cycles_used(&tracker, pr_url) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let read_before_webhook_charge = tracker.get_pr(pr_url).unwrap().unwrap();
+            webhook
+                .process_review_action(&attempt, "Please add a test")
+                .await
+                .unwrap();
+            // A read-modify-write of the PR record that read it before the webhook
+            // process's charge writes it back now, as interleaved processes can
+            tracker.upsert_pr(&read_before_webhook_charge).unwrap();
+            daemon.is_running.store(false, Ordering::SeqCst);
+        };
+        let (daemon_outcome, ()) = tokio::time::timeout(
+            Duration::from_secs(30),
+            futures::future::join(daemon_review, webhook_review_while_daemon_waits),
+        )
+        .await
+        .expect("the daemon's waiting rerun must give up once its watcher stops");
+
+        assert!(
+            daemon_outcome.is_err(),
+            "the daemon's rerun never started, so it must fail for its feedback to be retried"
+        );
+        assert_eq!(
+            review_cycles_used(&tracker, pr_url),
+            1,
+            "the daemon's refund must give back only its own cycle, leaving the webhook \
+             process's rerun counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_processes_racing_for_a_prs_last_review_cycle_start_only_one_rerun() {
+        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let pr_url = "https://github.com/org/repo/pull/1";
+        tracker.record_attempt("mock", "1", "MOCK-1").unwrap();
+        tracker.mark_success("mock", "1", pr_url).unwrap();
+        let mut record = PrRecord::new(pr_url, "org/repo", 1);
+        record.review_cycles = MAX_REVIEW_CYCLES - 1;
+        tracker.upsert_pr(&record).unwrap();
+        let cycles_before = review_cycles_used(&tracker, pr_url);
+        let attempt = tracker.get_attempt("mock", "1").unwrap().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let both_checked_the_cap = Arc::new(tokio::sync::Barrier::new(2));
+        let start_process = || {
+            let source = GatedSource::new(
+                Issue::new(
+                    "1",
+                    "MOCK-1",
+                    "Mock issue",
+                    "http://example.com/mock/1",
+                    "mock",
+                ),
+                Arc::clone(&both_checked_the_cap),
+            );
+            let watcher = create_test_watcher_with_inferrer(
+                Arc::new(MockNotifier::new(true)),
+                tracker.clone(),
+                vec![Arc::new(source) as Arc<dyn IssueSource>],
+                inferrer_indexing(IndexedRepo::new("org/repo", checkout.path())),
+            );
+            watcher.is_running.store(true, Ordering::SeqCst);
+            watcher
+        };
+        let daemon = start_process();
+        let webhook = start_process();
+
+        let (daemon_outcome, webhook_outcome) = tokio::time::timeout(
+            Duration::from_secs(30),
+            futures::future::join(
+                daemon.process_review_action(&attempt, "Please add a test"),
+                webhook.process_review_action(&attempt, "Please add a test"),
+            ),
+        )
+        .await
+        .expect("both processes must finish handling the feedback");
+        daemon_outcome.unwrap();
+        webhook_outcome.unwrap();
+
+        assert_eq!(
+            resolved_repositories(&tracker, "mock", "1").len(),
+            1,
+            "processes that both found the PR's last review cycle free must start only one \
+             rerun between them"
+        );
+        assert_eq!(
+            review_cycles_used(&tracker, pr_url),
+            cycles_before + 1,
+            "only the rerun that started may be counted, so the PR never goes past its cap"
         );
     }
 
