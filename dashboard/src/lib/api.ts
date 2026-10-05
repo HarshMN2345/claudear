@@ -1217,3 +1217,55 @@ export async function updateUser(id: number, data: {
 export async function deleteUser(id: number): Promise<void> {
   return deleteRequest(`${API_BASE}/users/${id}`)
 }
+
+// --- Personal access tokens -------------------------------------------------
+
+/** A personal access token (never includes the secret after creation). */
+export interface ApiToken {
+  id: string
+  user_id: number
+  name: string
+  token_prefix: string
+  created_at: string
+  last_used_at: string | null
+  expires_at: string | null
+}
+
+/** Admin view: a token joined with its owner. */
+export interface ApiTokenWithOwner extends ApiToken {
+  user_email: string
+  user_name: string
+}
+
+/** Response when creating a token: the row plus the one-time plaintext secret. */
+export interface CreatedToken extends ApiToken {
+  secret: string
+}
+
+/** List the tokens belonging to a specific user (admin). */
+export async function fetchUserTokens(userId: number): Promise<ApiToken[]> {
+  return fetchJson(`${API_BASE}/users/${userId}/tokens`)
+}
+
+/** Mint a token for a specific user (admin). The secret is returned once. */
+export async function createUserToken(
+  userId: number,
+  data: { name: string; expires_at?: string },
+): Promise<CreatedToken> {
+  return postJson(`${API_BASE}/users/${userId}/tokens`, data)
+}
+
+/** Revoke a token by id. */
+export async function revokeToken(id: string): Promise<void> {
+  return deleteRequest(`${API_BASE}/tokens/${id}`)
+}
+
+/** Current user's own tokens (self-serve). */
+export async function fetchMyTokens(): Promise<ApiToken[]> {
+  return fetchJson(`${API_BASE}/tokens`)
+}
+
+/** Admin: every token with its owner. */
+export async function fetchAllTokens(): Promise<ApiTokenWithOwner[]> {
+  return fetchJson(`${API_BASE}/tokens/all`)
+}

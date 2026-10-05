@@ -1,9 +1,10 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
 use super::types::{
-    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
-    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
-    StoredIndexedRepo, StoredPrReviewComment, StoredRepository, UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
+    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
+    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredPrReviewComment,
+    StoredRepository, UserRow,
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
@@ -74,9 +75,31 @@ impl UserRow {
     }
 }
 
+impl ApiTokenRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            name: row.get(2)?,
+            token_hash: row.get(3)?,
+            token_prefix: row.get(4)?,
+            created_at: row.get(5)?,
+            last_used_at: row.get(6)?,
+            expires_at: row.get(7)?,
+        })
+    }
+}
+
 /// Generate a cryptographically random session token (64 hex chars = 32 bytes).
 fn generate_session_token() -> String {
     let mut bytes = [0u8; 32];
+    rand::rng().fill(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Generate a short random id (32 hex chars = 16 bytes) for an API token row.
+fn generate_token_id() -> String {
+    let mut bytes = [0u8; 16];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
@@ -125,6 +148,16 @@ impl SqliteTracker {
     /// Subscribe to real-time indexing progress updates.
     pub fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
         self.indexing_tx.subscribe()
+    }
+
+    /// Whether the vectorlite extension can be loaded for this tracker (and, as a
+    /// side effect, load it on the shared connection). Vector search returns no
+    /// results without it, so callers/tests can gate on this.
+    pub fn vectorlite_available(&self) -> bool {
+        match self.acquire_lock() {
+            Ok(conn) => try_load_vectorlite(&conn).unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
@@ -4145,6 +4178,26 @@ impl RepoStore for SqliteTracker {
         }
     }
 
+    fn get_repo_id_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.acquire_lock()?;
+        conn.query_row(
+            "SELECT id FROM repositories WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn list_repo_id_names(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare("SELECT id, name FROM repositories")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // --- Analytics ---
 
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
@@ -4375,6 +4428,95 @@ impl UserStore for SqliteTracker {
         let conn = self.acquire_lock()?;
         conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
         Ok(())
+    }
+
+    fn create_api_token(
+        &self,
+        user_id: i64,
+        name: &str,
+        token_hash: &str,
+        token_prefix: &str,
+        expires_at: Option<&str>,
+    ) -> Result<ApiTokenRow> {
+        let id = generate_token_id();
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, user_id, name, token_hash, token_prefix, expires_at],
+        )?;
+        conn.query_row(
+            "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
+             FROM api_tokens WHERE id = ?1",
+            params![id],
+            ApiTokenRow::from_row,
+        )
+        .map_err(Into::into)
+    }
+
+    fn get_user_by_api_token_hash(&self, token_hash: &str) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let user = conn
+            .query_row(
+                "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
+                 FROM api_tokens t
+                 JOIN users u ON t.user_id = u.id
+                 WHERE t.token_hash = ?1
+                   AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime('now'))",
+                params![token_hash],
+                UserRow::from_row,
+            )
+            .optional()?;
+        if user.is_some() {
+            conn.execute(
+                "UPDATE api_tokens SET last_used_at = datetime('now') WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+        }
+        Ok(user)
+    }
+
+    fn list_api_tokens(&self, user_id: i64) -> Result<Vec<ApiTokenRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
+             FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], ApiTokenRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn list_all_api_tokens(&self) -> Result<Vec<ApiTokenWithOwner>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.user_id, t.name, t.token_hash, t.token_prefix, t.created_at, t.last_used_at, t.expires_at, u.email, u.name
+             FROM api_tokens t JOIN users u ON t.user_id = u.id
+             ORDER BY t.last_used_at DESC NULLS LAST, t.created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ApiTokenWithOwner {
+                    token: ApiTokenRow::from_row(row)?,
+                    user_email: row.get(8)?,
+                    user_name: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn delete_api_token(&self, id: &str, user_id: Option<i64>) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let affected = match user_id {
+            Some(uid) => conn.execute(
+                "DELETE FROM api_tokens WHERE id = ?1 AND user_id = ?2",
+                params![id, uid],
+            )?,
+            None => conn.execute("DELETE FROM api_tokens WHERE id = ?1", params![id])?,
+        };
+        Ok(affected > 0)
     }
 }
 
@@ -13142,6 +13284,53 @@ mod tests {
             .unwrap();
         let user = tracker.get_session_user(&token).unwrap();
         assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_api_token_expiry_is_enforced_on_lookup() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("tok@test.com", "hash", "Tok", "viewer")
+            .unwrap();
+
+        // Past expiry → not resolvable.
+        tracker
+            .create_api_token(
+                user_id,
+                "past",
+                "hash_past",
+                "cldr_p",
+                Some("2000-01-01 00:00:00"),
+            )
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_past")
+            .unwrap()
+            .is_none());
+
+        // Future expiry → resolvable.
+        tracker
+            .create_api_token(
+                user_id,
+                "future",
+                "hash_future",
+                "cldr_f",
+                Some("2099-12-31 23:59:59"),
+            )
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_future")
+            .unwrap()
+            .is_some());
+
+        // No expiry → resolvable.
+        tracker
+            .create_api_token(user_id, "forever", "hash_forever", "cldr_x", None)
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_forever")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

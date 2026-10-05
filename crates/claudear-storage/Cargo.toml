@@ -3,6 +3,9 @@ name = "claudear-storage"
 version = "1.0.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 sqlite = ["dep:rusqlite", "claudear-core/sqlite"]

@@ -3,6 +3,9 @@ name = "claudear-e2e"
 version = "1.0.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "claudear-e2e"
 path = "src/main.rs"

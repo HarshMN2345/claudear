@@ -505,6 +505,8 @@ claudear activity 50         # Show last 50 entries
 claudear stop                # Stop the daemon
 ```
 
+`claudear stop` lets runs in progress finish for up to 30s, then interrupts the agent CLIs still running and kills any left 5s later. SIGTERM, as sent by `kill`, `systemctl stop` or `docker stop`, shuts down `start`, `webhook` and `poll` the same way, except that it interrupts the agent CLIs at once, as Ctrl-C does. Either way shutting down can take up to 35s, so give a service manager at least 40s before it kills Claudear.
+
 ### Polling Mode (Foreground)
 
 ```bash
@@ -1031,12 +1033,15 @@ Create `~/Library/LaunchAgents/com.claudear.plist`:
     <array>
         <string>/usr/local/bin/claudear</string>
         <string>start</string>
+        <string>--foreground</string>
         <string>--poll</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>40</integer>
     <key>StandardOutPath</key>
     <string>/tmp/claudear.log</string>
     <key>StandardErrorPath</key>
@@ -1061,7 +1066,7 @@ After=network.target
 [Service]
 Type=simple
 User=YOUR_USER
-ExecStart=/usr/local/bin/claudear start --poll
+ExecStart=/usr/local/bin/claudear start --foreground --poll
 Restart=on-failure
 RestartSec=10
 
@@ -1099,6 +1104,7 @@ docker build -t claudear .
 
 # Run with config file
 docker run -d \
+  --stop-timeout 40 \
   -p 3100:3100 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/workspace \
@@ -1107,6 +1113,7 @@ docker run -d \
 
 # Or with environment variable overrides
 docker run -d \
+  --stop-timeout 40 \
   -p 3100:3100 \
   -v $(pwd)/claudear.toml:/app/claudear.toml \
   -v $(pwd):/app/workspace \
@@ -1125,6 +1132,7 @@ The Docker image:
 - Persists embedding model cache between restarts
 - Supports both `ANTHROPIC_API_KEY` and OAuth login for Claude authentication
 - Health check on `/api/health` every 30 seconds
+- Runs `claudear start --foreground` under `tini`, so `docker stop` shuts it down gracefully; `docker-compose.yml` gives it the 40s this can take (pass `--stop-timeout 40` to `docker run`)
 
 > **Note**: SQLite WAL mode is incompatible with Docker Desktop's VirtioFS bind mounts. Use Docker named volumes (e.g., `claudear-data:/app/data`) instead of bind mounts for the database directory.
 

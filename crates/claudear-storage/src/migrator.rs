@@ -78,8 +78,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 13,
+        name: "api_tokens",
+        sql: include_str!("../../../migrations/V13__api_tokens.sql"),
+    },
+    Migration {
+        version: 14,
         name: "fix_attempt_heartbeat",
-        sql: include_str!("../../../migrations/V13__fix_attempt_heartbeat.sql"),
+        sql: include_str!("../../../migrations/V14__fix_attempt_heartbeat.sql"),
     },
 ];
 
