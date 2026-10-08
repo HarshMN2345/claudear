@@ -374,3 +374,126 @@ impl SupportThread {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> DateTime<Utc> {
+        "2026-10-01T12:00:00Z".parse().unwrap()
+    }
+
+    fn team() -> HashSet<String> {
+        HashSet::from(["team".to_string()])
+    }
+
+    /// A thread by `op` from `(author_id, hours_ago, content)` messages.
+    fn thread(messages: &[(&str, i64, &str)]) -> SupportThread {
+        SupportThread {
+            id: "1".to_string(),
+            title: "Function deploy fails".to_string(),
+            owner_id: "op".to_string(),
+            tags: Vec::new(),
+            url: String::new(),
+            messages: messages
+                .iter()
+                .enumerate()
+                .map(|(i, (author_id, hours_ago, content))| SupportMessage {
+                    id: i.to_string(),
+                    author_id: author_id.to_string(),
+                    author: author_id.to_string(),
+                    content: content.to_string(),
+                    timestamp: now() - Duration::hours(*hours_ago),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_is_solved() {
+        for (title, solved) in [
+            ("[SOLVED] Function deploy fails", true),
+            ("  [closed] Function deploy fails", true),
+            ("[Fixed] Function deploy fails", true),
+            ("[RESOLVED] Function deploy fails", true),
+            ("[SOLVE] Please help with an outage", false),
+            ("Function deploy fails", false),
+        ] {
+            assert_eq!(is_solved(title), solved, "{title}");
+        }
+    }
+
+    #[test]
+    fn test_triage_status() {
+        let asked = ("op", 30, "Deploy fails");
+        let answered = ("team", 5, "Set the runtime to node-22 and redeploy");
+        for (messages, status) in [
+            (vec![asked], SupportStatus::NeedsReply),
+            (vec![asked, answered], SupportStatus::WaitingOnUser),
+            (
+                vec![asked, ("team", 2, "Looking into it")],
+                SupportStatus::WaitingOnUser,
+            ),
+            (
+                vec![("op", 50, "Deploy fails"), ("team", 30, "Looking into it")],
+                SupportStatus::NeedsReply,
+            ),
+            (
+                vec![asked, answered, ("op", 2, "Thanks, that fixed it")],
+                SupportStatus::LikelyResolved,
+            ),
+            (
+                vec![
+                    asked,
+                    answered,
+                    ("op", 2, "It works now, I'll share the solution tomorrow"),
+                ],
+                SupportStatus::LikelyResolved,
+            ),
+            (
+                vec![asked, answered, ("op", 2, "Thanks, but it still fails")],
+                SupportStatus::NeedsReply,
+            ),
+            (
+                vec![asked, answered, ("op", 2, "I'll test it tomorrow")],
+                SupportStatus::WaitingOnUser,
+            ),
+            (
+                vec![asked, ("other", 2, "Same issue here")],
+                SupportStatus::NeedsReply,
+            ),
+        ] {
+            let entry = thread(&messages).triage(&team(), now()).unwrap();
+            assert_eq!(entry.status, status, "{:?}", messages.last());
+        }
+    }
+
+    #[test]
+    fn test_triage_counts_the_unanswered_streak() {
+        let entry = thread(&[
+            ("op", 100, "Deploy fails"),
+            ("op", 96, "Any update?"),
+            ("team", 72, "Try redeploying"),
+            ("op", 48, "Still failing"),
+            ("op", 24, "Any update?"),
+            ("op", 0, "Bump"),
+        ])
+        .triage(&team(), now())
+        .unwrap();
+
+        assert_eq!(entry.waiting_hours, 48);
+        assert!(entry.reasons.contains(&"poster bumped 2x".to_string()));
+    }
+
+    #[test]
+    fn test_triage_ranks_impact_higher() {
+        let quiet = thread(&[("op", 30, "Deploy fails with an error")])
+            .triage(&team(), now())
+            .unwrap();
+        let urgent = thread(&[("op", 30, "Production is down for our customers")])
+            .triage(&team(), now())
+            .unwrap();
+
+        assert!(urgent.score > quiet.score);
+    }
+}
