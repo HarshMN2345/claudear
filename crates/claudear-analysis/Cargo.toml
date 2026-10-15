@@ -15,6 +15,7 @@ test-support = []
 [dependencies]
 abnegate-http = { workspace = true }
 abnegate-index = { workspace = true }
+abnegate-vcs = { workspace = true }
 claudear-core = { workspace = true }
 claudear-config = { workspace = true }
 claudear-storage = { workspace = true }
