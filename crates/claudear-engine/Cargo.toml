@@ -3,6 +3,9 @@ name = "claudear-engine"
 version = "1.0.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite", "claudear-integrations/sqlite"]
@@ -57,6 +60,9 @@ tower-cookies = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 
+# Private per-run directories for deploy_qa live QA
+tempfile = { workspace = true }
+
 # Crypto
 hex = { workspace = true }
 rand = { workspace = true }
@@ -81,8 +87,8 @@ indicatif = { workspace = true }
 
 # Process checking and IPC on Unix
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 http-body-util = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

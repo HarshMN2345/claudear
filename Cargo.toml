@@ -2,6 +2,9 @@
 members = ["crates/*"]
 resolver = "2"
 
+[workspace.lints.clippy]
+double_must_use = "allow"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "process", "signal", "fs", "net", "io-util", "macros"] }
@@ -48,7 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
 # Error monitoring
-sentry = { version = "0.47", features = ["tower-axum-matched-path", "tracing", "rustls", "backtrace", "contexts", "debug-images", "panic", "anyhow", "reqwest"], default-features = false }
+sentry = { version = "0.47", features = ["tower-axum-matched-path", "tracing", "backtrace", "contexts", "debug-images", "panic", "anyhow", "reqwest"], default-features = false }
 
 # Error handling
 thiserror = "2"
@@ -74,6 +77,7 @@ graphql_client = { version = "0.16", features = ["reqwest-rustls"] }
 futures = "0.3"
 futures-util = "0.3"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 
 # Regex
@@ -104,6 +108,9 @@ encoding_rs = "0.8"
 
 # System info
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+# Unix process and signal APIs
+libc = "0.2"
 
 # Parallel iteration
 rayon = "1"
@@ -146,6 +153,9 @@ tempfile = "3"
 mockall = "0.14"
 http-body-util = "0.1"
 
+# Shared infrastructure
+abnegate-index = "0.1.0"
+
 # Internal crates
 claudear-core = { path = "crates/claudear-core" }
 claudear-config = { path = "crates/claudear-config" }
@@ -158,6 +168,9 @@ claudear-engine = { path = "crates/claudear-engine" }
 name = "claudear"
 version = "1.0.0"
 edition = "2021"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "claudear"
@@ -251,6 +264,7 @@ graphql_client = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 
 # Regex
@@ -323,19 +337,15 @@ tempfile = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
 
-# Process checking and IPC on Unix
+# Daemonizing, IPC and signal handling on Unix
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-# Process checking on Windows
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
-
+libc = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = { workspace = true }
+tempfile = { workspace = true }
 
 [profile.dev]
 debug = 1                  # Line tables only (not full debuginfo)

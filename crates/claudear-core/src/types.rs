@@ -346,6 +346,10 @@ pub enum FixAttemptStatus {
     /// Input was a question and was answered (no PR/fix attempted).
     #[serde(rename = "answered")]
     Answered,
+    /// A human refused approval to work on the issue, so it is neither
+    /// retried nor asked about again unless its attempt is reset.
+    #[serde(rename = "declined")]
+    Declined,
 }
 
 impl std::fmt::Display for FixAttemptStatus {
@@ -358,6 +362,7 @@ impl std::fmt::Display for FixAttemptStatus {
             Self::Closed => write!(f, "closed"),
             Self::CannotFix => write!(f, "cannot_fix"),
             Self::Answered => write!(f, "answered"),
+            Self::Declined => write!(f, "declined"),
         }
     }
 }
@@ -374,6 +379,7 @@ impl std::str::FromStr for FixAttemptStatus {
             "closed" => Ok(Self::Closed),
             "cannot_fix" => Ok(Self::CannotFix),
             "answered" => Ok(Self::Answered),
+            "declined" => Ok(Self::Declined),
             _ => Err(format!("Unknown status: {}", s)),
         }
     }
@@ -570,8 +576,53 @@ impl DiscordChannelKind {
     }
 }
 
+/// Triage call made during verify on whether an issue is worth a fix run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageVerdict {
+    /// A code defect this repo can fix.
+    Fix,
+    /// Log noise or a report of a handled condition; nothing to change.
+    Noise,
+    /// The code behaves as intended (e.g. rejecting invalid input).
+    Expected,
+    /// A dependency or infrastructure blip that no code change here removes.
+    InfraTransient,
+    /// The defect lives in another repository.
+    UpstreamOwned,
+    /// Needs a product or ops decision before anyone can fix it.
+    NeedsHuman,
+    /// No verdict given or not understood.
+    #[default]
+    #[serde(other)]
+    Unspecified,
+}
+
+impl TriageVerdict {
+    /// Verdicts that end the attempt without spending a fix run. `UpstreamOwned`
+    /// is decided by the caller, since it can redirect the fix to the owning repo.
+    pub fn skips_fix(self) -> bool {
+        matches!(
+            self,
+            Self::Noise | Self::Expected | Self::InfraTransient | Self::NeedsHuman
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fix => "fix",
+            Self::Noise => "noise",
+            Self::Expected => "expected",
+            Self::InfraTransient => "infra_transient",
+            Self::UpstreamOwned => "upstream_owned",
+            Self::NeedsHuman => "needs_human",
+            Self::Unspecified => "unspecified",
+        }
+    }
+}
+
 /// Outcome of a `Verify` action: whether the agent reproduced the reported issue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerifyResult {
     /// Whether the issue was reproduced as described.
     pub reproduced: bool,
@@ -590,6 +641,12 @@ pub struct VerifyResult {
     /// Evidence supporting the verdict (repro steps, failing output, etc.).
     #[serde(default)]
     pub evidence: String,
+    /// Whether the issue deserves a fix run at all (telemetry sources only).
+    #[serde(default)]
+    pub triage: TriageVerdict,
+    /// `org/repo` that owns the defect when `triage` is `upstream_owned`.
+    #[serde(default)]
+    pub owner_repo: String,
 }
 
 /// Statistics about fix attempts.
@@ -1830,6 +1887,152 @@ impl ReleaseTracking {
             release_commit: release_commit.into(),
             released_at: Some(Utc::now()),
             created_at: Utc::now(),
+        }
+    }
+}
+
+/// Status of a `[deploy_qa]` release-tip attempt.
+///
+/// Separate from [`RegressionWatchStatus`] — deploy QA tracks live verification
+/// of a new tip, not post-fix regression watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DeployQaTipStatus {
+    /// Tip detected; waiting to be enqueued.
+    #[default]
+    Pending,
+    /// A live-QA agent attempt is in flight.
+    Running,
+    /// All LIVE-TESTABLE PRs verified (no live failures).
+    Verified,
+    /// Nothing failed, but at least one LIVE-TESTABLE PR was blocked or the
+    /// report lacked an all-verified verdict.
+    Unverified,
+    /// At least one LIVE-TESTABLE PR failed.
+    Failed,
+    /// The live-QA attempt ended without reaching a verdict.
+    Errored,
+}
+
+impl DeployQaTipStatus {
+    /// Whether a QA run may start: the tip has no verdict and no run holds it.
+    ///
+    /// `Errored` qualifies because it is the retryable state of a run that
+    /// ended without a verdict.
+    pub fn is_runnable(self) -> bool {
+        matches!(self, Self::Pending | Self::Errored)
+    }
+}
+
+impl std::fmt::Display for DeployQaTipStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Running => write!(f, "running"),
+            Self::Verified => write!(f, "verified"),
+            Self::Unverified => write!(f, "unverified"),
+            Self::Failed => write!(f, "failed"),
+            Self::Errored => write!(f, "errored"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeployQaTipStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "verified" => Ok(Self::Verified),
+            "unverified" => Ok(Self::Unverified),
+            "failed" => Ok(Self::Failed),
+            "errored" => Ok(Self::Errored),
+            other => Err(format!("unknown deploy_qa tip status: {other}")),
+        }
+    }
+}
+
+/// One persisted GitHub release tip watched by `[deploy_qa]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployQaTip {
+    /// Database ID.
+    pub id: i64,
+    /// Track name from `[[deploy_qa.tracks]]`.
+    pub track: String,
+    /// GitHub `owner/repo`.
+    pub repo: String,
+    /// Release tag.
+    pub tag: String,
+    /// Synthetic issue id (`track:repo:tag`, see [`DeployQaTip::issue_id_for`])
+    /// used when enqueueing the agent. Unique per `(track, tag)`.
+    pub issue_id: String,
+    /// GitHub `published_at` (RFC3339) when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    /// HTML URL of the GitHub release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_url: Option<String>,
+    /// GitHub login of the release author (for FAIL `@releaser` mapping).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_login: Option<String>,
+    /// Attempt status.
+    pub status: DeployQaTipStatus,
+    /// Linked `fix_attempts.id` when an agent run was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<i64>,
+    /// Discord `#releases` message this tip replies under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discord_message_id: Option<String>,
+    /// Discord thread under the release message that the FAIL report was posted in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discord_thread_id: Option<String>,
+    /// Cached release body for agent context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_body: Option<String>,
+    /// When the row was created.
+    pub created_at: String,
+    /// When the row was last updated.
+    pub updated_at: String,
+}
+
+impl DeployQaTip {
+    /// Separator between the parts of a synthetic issue id.
+    ///
+    /// Track names must never contain it, so a `track:repo:tag` id maps back to
+    /// exactly one `(track, tag)` row.
+    pub const ISSUE_ID_SEPARATOR: &str = ":";
+
+    /// Synthetic issue id for a tip: `track:repo:tag`.
+    ///
+    /// Scoped to the track so overlapping tracks on the same repo and tag each
+    /// get their own id, matching the `(track, tag)` uniqueness of stored tips.
+    pub fn issue_id_for(track: &str, repo: &str, tag: &str) -> String {
+        [track, repo, tag].join(Self::ISSUE_ID_SEPARATOR)
+    }
+
+    /// Build a pending tip for `track` / `repo` / `tag`.
+    pub fn new(track: impl Into<String>, repo: impl Into<String>, tag: impl Into<String>) -> Self {
+        let track = track.into();
+        let repo = repo.into();
+        let tag = tag.into();
+        let issue_id = Self::issue_id_for(&track, &repo, &tag);
+        Self {
+            id: 0,
+            track,
+            repo,
+            tag,
+            issue_id,
+            published_at: None,
+            html_url: None,
+            author_login: None,
+            status: DeployQaTipStatus::Pending,
+            attempt_id: None,
+            discord_message_id: None,
+            discord_thread_id: None,
+            release_body: None,
+            created_at: String::new(),
+            updated_at: String::new(),
         }
     }
 }
@@ -3799,17 +4002,19 @@ mod tests {
             FixAttemptStatus::Merged,
             FixAttemptStatus::Closed,
             FixAttemptStatus::CannotFix,
+            FixAttemptStatus::Answered,
+            FixAttemptStatus::Declined,
         ] {
             let json = serde_json::to_string(&status).unwrap();
-            // Verify serde serialization matches Display
-            assert_eq!(json, format!("\"{}\"", status));
-            // Verify round-trip through serde
+            assert_eq!(
+                json,
+                format!("\"{}\"", status),
+                "{status} must serialize as its Display form"
+            );
             let parsed: FixAttemptStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, status);
-            // Verify round-trip through FromStr
-            let display_str = status.to_string();
-            let from_str: FixAttemptStatus = display_str.parse().unwrap();
-            assert_eq!(from_str, status);
+            assert_eq!(parsed, status, "{status} must round-trip through serde");
+            let from_str: FixAttemptStatus = status.to_string().parse().unwrap();
+            assert_eq!(from_str, status, "{status} must round-trip through FromStr");
         }
     }
 
@@ -4180,6 +4385,29 @@ mod tests {
             let parsed: RegressionWatchStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, status);
         }
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_status_round_trips() {
+        let statuses = [
+            DeployQaTipStatus::Pending,
+            DeployQaTipStatus::Running,
+            DeployQaTipStatus::Verified,
+            DeployQaTipStatus::Unverified,
+            DeployQaTipStatus::Failed,
+            DeployQaTipStatus::Errored,
+        ];
+
+        for status in statuses {
+            let stored = status.to_string();
+            assert_eq!(stored.parse::<DeployQaTipStatus>(), Ok(status));
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{stored}\""),
+                "Display (persisted) and serde (API) spellings must not drift"
+            );
+        }
+        assert!("skipped".parse::<DeployQaTipStatus>().is_err());
     }
 
     #[test]

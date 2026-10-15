@@ -3,6 +3,9 @@ name = "claudear-integrations"
 version = "1.0.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite"]
@@ -97,6 +100,10 @@ semver = { workspace = true }
 # Vendor OpenSSL for Linux cross-compilation
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
+
+# Killing agent process groups
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

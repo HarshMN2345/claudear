@@ -4,10 +4,14 @@ use clap::{Parser, Subcommand};
 use claudear::{
     api::ApiServer,
     config::Config,
+    deploy_qa::{DeployQaPollAction, DeployQaTracker},
     feedback::{EmbeddingClient, IssueEmbeddingService},
     github::GitHubClient,
     housekeeping::HousekeepingWorker,
-    ipc::{default_socket_path, is_daemon_running, print_response, IpcClient, IpcServer},
+    ipc::{
+        default_lock_path, default_socket_path, is_daemon_running, print_response, IpcClient,
+        IpcServer, Lock,
+    },
     notifier::{
         CompositeNotifier, ConsoleNotifier, DiscordNotifier, EmailNotifier, Notifier, PushNotifier,
         SlackNotifier, SmsNotifier, TelegramNotifier, WhatsAppNotifier,
@@ -21,8 +25,9 @@ use claudear::{
     repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
-    runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
+    runner::{process_group, AgentRunner},
     scm::{PrMonitor, PrStatus, ReviewWatcher, ScmProvider},
+    shutdown::{self, Outcome, Reason, Service, Signals, Summary},
     source::{
         DiscordSource, HelpScoutSource, IssueSource, JiraSource, LinearSource, SentrySource,
         SlackSource, TelegramSource, WhatsAppSource,
@@ -30,10 +35,10 @@ use claudear::{
     storage::{
         ActivityStore, EmbeddingStore, FixAttemptTracker, RepoStore, SqliteTracker, UserStore,
     },
-    telemetry::{InstrumentedNotifier, InstrumentedRunner, InstrumentedScm, InstrumentedSource},
+    telemetry::{InstrumentedNotifier, InstrumentedScm, InstrumentedSource},
     types::{ActionKind, ActivityLogEntry, FixAttemptStatus, Issue},
     users::UserRegistry,
-    watcher::{Watcher, WatcherOptions},
+    watcher::{RetryOutcome, Watcher, WatcherOptions, MANUAL_TRIGGER},
     webhook::{
         print_setup_result, GitHubWebhookHandler, GitLabIssueWebhookHandler,
         HelpScoutWebhookHandler, JiraWebhookHandler, LinearWebhookHandler, SentryWebhookHandler,
@@ -41,9 +46,13 @@ use claudear::{
         WebhookServer, WhatsAppWebhookHandler,
     },
 };
+use futures::{Stream, StreamExt};
 use serde_json::json;
+use std::future::{pending, Future};
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use thiserror::Error;
+use tokio::time::{interval, Duration, Instant};
+use tokio_util::task::TaskTracker;
 use tracing_subscriber::{
     filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
@@ -718,7 +727,7 @@ async fn build_watcher_deps(
     config: &Config,
     tracker: &Arc<dyn FixAttemptTracker>,
 ) -> anyhow::Result<WatcherDeps> {
-    let sources = create_sources(config);
+    let sources = create_sources(config, tracker);
 
     // GitHub client for API-based repo discovery
     let github_client = GitHubClient::new(config.github().clone());
@@ -1042,7 +1051,10 @@ fn create_review_watcher(
     Some(Arc::new(review_watcher))
 }
 
-fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
+fn create_sources(
+    config: &Config,
+    tracker: &Arc<dyn FixAttemptTracker>,
+) -> Vec<Arc<dyn IssueSource>> {
     let mut sources: Vec<Arc<dyn IssueSource>> = Vec::new();
 
     if let Some(linear_config) = config.linear() {
@@ -1132,7 +1144,51 @@ fn create_sources(config: &Config) -> Vec<Arc<dyn IssueSource>> {
         }
     }
 
+    if let Some(source) = claudear::build_deploy_qa_source(config, tracker.clone()) {
+        sources.push(source);
+    }
+
     sources.into_iter().map(InstrumentedSource::wrap).collect()
+}
+
+/// Build the live backends for the MCP list tools: a HelpScout source (for
+/// `helpscout_list_conversations`) and a Discord bot client + guild id (for
+/// `discord_list_messages`). Returns `None` for each when not configured.
+#[allow(clippy::type_complexity)]
+fn build_mcp_list_backends(
+    config: &Config,
+) -> (
+    Option<Arc<dyn IssueSource>>,
+    Option<Arc<claudear::discord::DiscordClient>>,
+    Option<String>,
+) {
+    let helpscout = config
+        .helpscout()
+        .filter(|c| {
+            c.enabled
+                && !c.app_id.expose().is_empty()
+                && !c.app_secret.expose().is_empty()
+                && !c.mailbox_ids.is_empty()
+        })
+        .map(|c| Arc::new(HelpScoutSource::new(c.clone())) as Arc<dyn IssueSource>);
+
+    let discord = config.discord_merged();
+    let bot_token = discord
+        .bot_token
+        .as_ref()
+        .map(|t| t.expose().to_string())
+        .filter(|t| !t.trim().is_empty());
+    let (discord_client, guild_id) = match bot_token {
+        Some(token) => (
+            claudear::discord::DiscordClient::new(token)
+                .ok()
+                .map(Arc::new),
+            discord.guild_id.clone().filter(|g| !g.trim().is_empty()),
+        ),
+        None => (None, None),
+    };
+
+    (helpscout, discord_client, guild_id)
 }
 
 fn create_webhook_handlers(config: &Config) -> WebhookHandlerRegistry {
@@ -1547,6 +1603,408 @@ fn start_regression_monitoring(
     Some(handle)
 }
 
+/// Start the `[deploy_qa]` background poller.
+///
+/// Distinct from [`start_regression_monitoring`]: this watches **new GitHub
+/// release tips** and enqueues live QA runs that report without fixing. It
+/// does not use `ReleaseTracker` or `[regression]` watches.
+///
+/// After every poll it dispatches pending tips through `watcher`, including
+/// tips a previous process left pending. That dispatch is the only path that
+/// runs tips in every daemon mode, since the watcher's source polls skip
+/// `deploy_qa`. Dispatch waits for the watcher to finish warm start, so tips
+/// seen before then run after the next poll.
+///
+/// Every tick, starting with the first, begins by marking tips left `running`
+/// longer than [`claudear::config::DeployQaConfig::stale_run_after`] as
+/// `errored`, so a run orphaned by a crash, restart or shutdown stops blocking
+/// its track under `skip_if_previous_running` without waiting for a restart. A
+/// run still live in this or another process sharing the database is younger
+/// than that and is left alone.
+fn start_deploy_qa_monitoring(
+    config: &Config,
+    tracker: Arc<dyn FixAttemptTracker>,
+    watcher: Arc<Watcher>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.deploy_qa.enabled {
+        tracing::info!("Deploy QA disabled in configuration");
+        return None;
+    }
+    if config.deploy_qa.tracks.is_empty() {
+        tracing::warn!("[deploy_qa] enabled but no [[deploy_qa.tracks]] configured");
+        return None;
+    }
+
+    let github_token = config
+        .github()
+        .token
+        .as_ref()
+        .map(|token| token.expose().to_string())
+        .filter(|token| !token.is_empty());
+    let github_token = match github_token {
+        Some(token) => token,
+        None => {
+            tracing::warn!("No GitHub token configured, deploy QA disabled");
+            return None;
+        }
+    };
+
+    let poller =
+        match DeployQaTracker::new(github_token, Arc::clone(&tracker), config.deploy_qa.clone()) {
+            Ok(poller) => poller,
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to start deploy QA poller");
+                return None;
+            }
+        };
+
+    let stale_after = config.deploy_qa.stale_run_after();
+    let interval_ms = config.deploy_qa.effective_poll_interval_ms();
+    let handle = tokio::spawn(async move {
+        let mut tick = interval(Duration::from_millis(interval_ms));
+        tracing::info!(
+            component = "deploy_qa",
+            poll_interval_ms = interval_ms,
+            stale_after_secs = stale_after.as_secs(),
+            "Deploy QA poller started"
+        );
+        loop {
+            tick.tick().await;
+            release_stale_deploy_qa_tips(tracker.as_ref(), stale_after);
+            for result in poller.poll_once().await {
+                match result.action {
+                    DeployQaPollAction::Enqueued => {
+                        tracing::info!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            tag = result.tip.as_ref().map(|tip| tip.tag.as_str()).unwrap_or("?"),
+                            "Enqueued live QA attempt for new release tip"
+                        );
+                    }
+                    DeployQaPollAction::SkippedDuplicate => {
+                        tracing::debug!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            "Tip unchanged; not re-fired"
+                        );
+                    }
+                    DeployQaPollAction::SkippedPreviousRunning => {
+                        tracing::info!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            "Skipping new tip; previous attempt still running"
+                        );
+                    }
+                    DeployQaPollAction::NoMatchingTip => {}
+                    DeployQaPollAction::Errored(ref error) => {
+                        tracing::warn!(
+                            component = "deploy_qa",
+                            track = %result.track,
+                            error = %error,
+                            "Failed to poll release tips for track"
+                        );
+                    }
+                }
+            }
+            match watcher.dispatch_pending_deploy_qa_tips().await {
+                Ok(runs) if runs.is_empty() => {}
+                Ok(runs) => tracing::info!(
+                    component = "deploy_qa",
+                    dispatched = runs.len(),
+                    "Dispatched pending release tips for live QA"
+                ),
+                Err(error) => tracing::warn!(
+                    component = "deploy_qa",
+                    error = %error,
+                    "Failed to dispatch pending release tips"
+                ),
+            }
+        }
+    });
+    Some(handle)
+}
+
+/// Mark `[deploy_qa]` tips left `running` longer than `stale_after` as
+/// `errored`, so the tracks their orphaned runs held can take new tips.
+fn release_stale_deploy_qa_tips(tracker: &dyn FixAttemptTracker, stale_after: Duration) {
+    match tracker.release_stale_running_deploy_qa_tips(stale_after) {
+        Ok(0) => {}
+        Ok(released) => tracing::info!(
+            component = "deploy_qa",
+            released,
+            stale_after_secs = stale_after.as_secs(),
+            "Marked stale running deploy QA tips as errored"
+        ),
+        Err(error) => tracing::warn!(
+            component = "deploy_qa",
+            error = %error,
+            "Failed to release stale running deploy QA tips"
+        ),
+    }
+}
+
+/// How long an interrupted one-shot command gets to record how its runs ended.
+const WRAP_UP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolves on Ctrl-C, a terminal hangup or a termination request such as
+/// `kill`, `systemctl stop` or `docker stop`. Agent CLIs lead their own
+/// process groups, so none of these reaches them unless claudear passes it on.
+async fn interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut hangup = signal(SignalKind::hangup()).expect("Failed to install signal handler");
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("Failed to install signal handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.expect("Failed to install signal handler"),
+            _ = hangup.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to install signal handler");
+}
+
+/// Kill every agent CLI, then die of SIGINT as if it had not been caught, so a
+/// calling shell stops too rather than running its next command.
+fn force_quit() -> ! {
+    process_group::Registry::global().kill_all();
+    #[cfg(unix)]
+    // SAFETY: neither call takes pointers.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(libc::SIGINT);
+    }
+    std::process::exit(FORCED_EXIT_CODE);
+}
+
+/// Run a one-shot command that may start agent runs. On interrupt, pass it on
+/// to the agent CLIs, kill whatever is left after [`shutdown::INTERRUPT_GRACE`], and give
+/// the command up to [`WRAP_UP_TIMEOUT`] to record how its runs ended before
+/// force-quitting. The command must not start new runs once
+/// [`process_group::Registry::is_interrupted`].
+async fn interruptible<F: std::future::Future>(command: F) -> F::Output {
+    tokio::pin!(command);
+    tokio::select! {
+        output = &mut command => return output,
+        () = interrupted() => {}
+    }
+    tracing::warn!("\nInterrupted, stopping agent runs");
+    let wrap_up = async {
+        tokio::join!(
+            &mut command,
+            process_group::Registry::global().shutdown(shutdown::INTERRUPT_GRACE)
+        )
+    };
+    tokio::select! {
+        _ = tokio::time::timeout(WRAP_UP_TIMEOUT, wrap_up) => {}
+        () = interrupted() => {}
+    }
+    force_quit();
+}
+
+/// Exit code of a [`force_quit`] that raising SIGINT did not end, the status a shell reports
+/// for a process SIGINT killed.
+const FORCED_EXIT_CODE: i32 = 130;
+
+/// A second signal cut the shutdown short. `async_main` returns it instead of exiting in place,
+/// so its logging guard flushes the file log before `main` force-quits.
+#[derive(Debug, Error)]
+#[error("shutdown forced by a second signal")]
+struct ForcedShutdown;
+
+/// How often `claudear stop` reports that it is still waiting for the daemon to exit.
+const STOP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The HTTP server a `start` daemon runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpMode {
+    /// The webhook server, serving the dashboard API on the same port when `dashboard` is set.
+    Webhooks { dashboard: bool },
+    /// The dashboard API alone.
+    Dashboard,
+}
+
+/// The HTTP server for the enabled webhooks and dashboard, or none when both are disabled.
+fn http_mode(webhooks: bool, dashboard: bool) -> Option<HttpMode> {
+    match (webhooks, dashboard) {
+        (true, dashboard) => Some(HttpMode::Webhooks { dashboard }),
+        (false, true) => Some(HttpMode::Dashboard),
+        (false, false) => None,
+    }
+}
+
+const IPC_SERVICE: &str = "ipc";
+const HTTP_SERVICE: &str = "http";
+const POLL_SERVICE: &str = "poll";
+const HOUSEKEEPING_SERVICE: &str = "housekeeping";
+
+/// What a daemon mode stops and waits for when it shuts down.
+struct Daemon<'a> {
+    watcher: &'a Watcher,
+    ipc: Option<&'a IpcServer>,
+    runs: Option<&'a TaskTracker>,
+    monitors: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Daemon<'_> {
+    /// Run `services` until a signal, `request` or a service ending starts the shutdown, then
+    /// stop taking new work, drain the runs in flight and [wrap up](Self::wrap_up). A signal also
+    /// interrupts the agent CLIs as the shutdown begins.
+    ///
+    /// Fails with [`ForcedShutdown`] when another signal forces the shutdown.
+    async fn serve<'s>(
+        &self,
+        services: impl IntoIterator<Item = Service<'s>>,
+        request: impl Future<Output = ()>,
+    ) -> anyhow::Result<Summary> {
+        let mut signals = Signals::listen()?;
+        self.serve_with(
+            &mut signals,
+            process_group::Registry::global(),
+            services,
+            request,
+        )
+        .await
+    }
+
+    /// [`Self::serve`], reading the stop signals from `signals` and wrapping up the agent CLIs
+    /// registered in `registry`.
+    async fn serve_with<'s>(
+        &self,
+        signals: &mut (impl Stream<Item = Reason> + Unpin),
+        registry: &process_group::Registry,
+        services: impl IntoIterator<Item = Service<'s>>,
+        request: impl Future<Output = ()>,
+    ) -> anyhow::Result<Summary> {
+        let summary = shutdown::run(
+            services,
+            request,
+            signals,
+            |reason| self.stop(reason, registry),
+            self.drain(),
+        )
+        .await;
+        match summary.outcome {
+            Outcome::Forced => {
+                tracing::warn!("Shutdown forced, exiting immediately");
+                return Err(ForcedShutdown.into());
+            }
+            Outcome::TimedOut => tracing::warn!(
+                watcher_runs = self.watcher_runs(),
+                webhook_runs = self.webhook_runs(),
+                "Interrupting the agent CLIs of the runs still in flight after {}s",
+                shutdown::DRAIN_TIMEOUT.as_secs()
+            ),
+            Outcome::Drained => {}
+        }
+        tokio::select! {
+            biased;
+            Some(_) = signals.next() => {
+                tracing::warn!("Shutdown forced, exiting immediately");
+                return Err(ForcedShutdown.into());
+            }
+            () = self.wrap_up(registry) => {}
+        }
+        let (watcher_runs, webhook_runs) = (self.watcher_runs(), self.webhook_runs());
+        if watcher_runs > 0 || webhook_runs > 0 {
+            tracing::warn!(
+                watcher_runs,
+                webhook_runs,
+                "Exiting with runs still in flight"
+            );
+        }
+        Ok(summary)
+    }
+
+    /// Interrupt the agent CLIs still running in `registry`, give their runs up to
+    /// [`shutdown::INTERRUPT_GRACE`] to record how they ended, and kill whatever is left. After
+    /// a drain that finished, nothing is left and this returns at once.
+    async fn wrap_up(&self, registry: &process_group::Registry) {
+        let runs_ended = async {
+            tokio::join!(self.watcher.wait_until_idle(), self.webhook_runs_ended());
+        };
+        let _ = tokio::join!(
+            registry.shutdown(shutdown::INTERRUPT_GRACE),
+            tokio::time::timeout(shutdown::INTERRUPT_GRACE, runs_ended),
+        );
+    }
+
+    /// Stop taking new work. A signal also interrupts the agent CLIs in `registry` at once, while
+    /// `claudear stop` or a service ending lets their runs finish first.
+    fn stop(&self, reason: Reason, registry: &process_group::Registry) {
+        if let Some(ipc) = self.ipc {
+            ipc.set_stopping();
+        }
+        if let Some(runs) = self.runs {
+            runs.close();
+        }
+        self.watcher.stop();
+        for monitor in &self.monitors {
+            monitor.abort();
+        }
+        if matches!(reason, Reason::Interrupted | Reason::Terminated) {
+            tracing::warn!("Interrupting the agent CLIs of the runs in flight");
+            registry.interrupt_all();
+        }
+        tracing::warn!(
+            watcher_runs = self.watcher_runs(),
+            webhook_runs = self.webhook_runs(),
+            "Stopped taking new work, waiting for the runs in flight"
+        );
+    }
+
+    async fn drain(&self) -> bool {
+        let (watcher_drained, ()) =
+            tokio::join!(self.watcher.stop_and_drain(), self.webhook_runs_ended());
+        watcher_drained
+    }
+
+    async fn webhook_runs_ended(&self) {
+        if let Some(runs) = self.runs {
+            runs.wait().await;
+        }
+    }
+
+    /// The watcher runs the drain waits for, including retries and follow-ups that hold no
+    /// processing slot and so are left out of [`Watcher::active_count`].
+    fn watcher_runs(&self) -> usize {
+        self.watcher.in_flight()
+    }
+
+    fn webhook_runs(&self) -> usize {
+        self.runs.map_or(0, TaskTracker::len)
+    }
+}
+
+/// Wait up to [`shutdown::EXIT_TIMEOUT`] for the daemon to exit, reporting progress every
+/// [`STOP_PROGRESS_INTERVAL`].
+async fn wait_for_exit(client: &IpcClient) -> anyhow::Result<()> {
+    let started = Instant::now();
+    loop {
+        let remaining = shutdown::EXIT_TIMEOUT.saturating_sub(started.elapsed());
+        if client
+            .wait_until_stopped(STOP_PROGRESS_INTERVAL.min(remaining))
+            .await
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= shutdown::EXIT_TIMEOUT {
+            anyhow::bail!(
+                "The daemon did not exit within {}s; it may still be finishing in-flight runs",
+                shutdown::EXIT_TIMEOUT.as_secs()
+            );
+        }
+        println!(
+            "Still waiting for the daemon to exit ({}s)...",
+            started.elapsed().as_secs()
+        );
+    }
+}
+
 /// Enrich the process PATH with entries from the user's login shell.
 ///
 /// When started via systemd or cron, the PATH is minimal and won't include
@@ -1678,7 +2136,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
-    let _sentry_guard = sentry::init((
+    let sentry_guard = sentry::init((
         std::env::var("CLAUDEAR_SENTRY_DSN").unwrap_or_default(),
         sentry::ClientOptions {
             release: std::env::var("CLAUDEAR_SENTRY_RELEASE")
@@ -1698,17 +2156,25 @@ fn main() -> anyhow::Result<()> {
         scope.set_tag("app.component", "claudear-backend");
     });
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main(cli))
+        .build()?;
+    let result = runtime.block_on(async_main(cli));
+    let forced = result
+        .as_ref()
+        .is_err_and(|error| error.is::<ForcedShutdown>());
+    if forced {
+        runtime.shutdown_background();
+        drop(sentry_guard);
+        force_quit();
+    }
+    runtime.shutdown_timeout(shutdown::RUNTIME_GRACE);
+    result
 }
 
 async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let verbose = cli.verbose;
 
-    // Initialize logging (must keep _guard alive for file logging to work)
-    // Empty path disables file logging
     let log_dir = if cli.log_dir.as_os_str().is_empty() {
         None
     } else {
@@ -1719,11 +2185,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &cli.command,
             Commands::Start { .. } | Commands::Webhook { .. } | Commands::Poll { .. }
         );
+    // Dropping the guard flushes the file log: exiting the process before async_main returns
+    // can lose its last lines.
     let _log_guard = init_logging(log_dir, verbose, suppress_console_info);
 
     let config_path = cli.config.clone();
 
-    // Load and validate config from YAML file
     let config = Config::load(&config_path)?;
 
     // Handle daemon control commands early (don't need full config validation)
@@ -1744,6 +2211,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+            println!(
+                "Waiting up to {}s for in-flight runs to finish and the daemon to exit...",
+                shutdown::EXIT_TIMEOUT.as_secs()
+            );
+            wait_for_exit(&client).await?;
+            println!("Daemon stopped.");
             return Ok(());
         }
 
@@ -3192,13 +3665,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     config.validate()?;
 
-    // Initialize components
     tracing::info!("Initializing...");
     let user_registry = UserRegistry::new(config.users.clone());
     let notifier = create_notifier(&config, user_registry.clone());
     let tracker = create_tracker(&config);
 
-    // Handle Start command (daemon mode with IPC - runs all services concurrently)
     if let Commands::Start {
         port,
         poll,
@@ -3208,11 +3679,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         foreground: _,
     } = &cli.command
     {
+        // Leaked so that only the kernel frees it, as this process exits: no other daemon can
+        // start before then, even while this one is still shutting down.
+        let lock: &'static Lock = Box::leak(Box::new(Lock::acquire(&default_lock_path())?));
         if is_daemon_running() {
             anyhow::bail!("A daemon is already running. Stop it first with 'claudear stop'");
         }
 
-        // Determine what services to run
         let enable_webhooks = !no_webhooks;
         let enable_dashboard = !no_dashboard;
         let enable_polling = *poll;
@@ -3221,7 +3694,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             anyhow::bail!("No services enabled. Remove --no-webhooks/--no-dashboard or add --poll");
         }
 
-        // Build mode string for status
         let mut modes = Vec::new();
         if enable_dashboard {
             modes.push("dashboard");
@@ -3234,7 +3706,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         let mode_str = modes.join("+");
 
-        // Build shared watcher dependencies
         let deps = build_watcher_deps(&config, &tracker).await?;
         let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
         let sources = deps.sources;
@@ -3245,7 +3716,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let github_webhook_handler =
             create_github_webhook_handler(&config, deps.review_watcher.clone());
 
-        // Always create watcher (used for both polling and housekeeping-only)
         let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: config.clone(),
             sources: sources.clone(),
@@ -3270,7 +3740,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             llm_engine: deps.llm_engine.clone(),
         }));
 
-        // Create IPC server
         let ipc_server = Arc::new(
             IpcServer::builder(tracker.clone(), sources.clone(), notifier.clone())
                 .max_retries(config.retry.max_retries)
@@ -3283,7 +3752,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             ipc_server.set_poll_interval(*poll_interval);
         }
 
-        // Log watcher_started activity
         let activity = ActivityLogEntry::new(
             "watcher_started",
             format!("Watcher daemon started in {} mode", mode_str),
@@ -3296,7 +3764,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }));
         tracker.record_activity(&activity).ok();
 
-        // Log startup info
         tracing::info!("Starting watcher daemon...");
         tracing::info!("  Mode: {}", mode_str);
         tracing::info!("  Port: {}", port);
@@ -3313,7 +3780,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!("  Poll interval: {}ms", poll_interval);
         }
 
-        // Start regression monitoring background task
         let regression_handle = start_regression_monitoring(
             &config,
             tracker.clone(),
@@ -3322,6 +3788,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         );
         if regression_handle.is_some() {
             tracing::info!("  Regression monitoring: enabled");
+        }
+
+        let deploy_qa_handle =
+            start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
+        if deploy_qa_handle.is_some() {
+            tracing::info!("  Deploy QA: enabled");
         }
 
         print_startup_banner_and_status(
@@ -3336,140 +3808,103 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &user_registry,
         );
 
-        // Shutdown signal handler with graceful drain
-        let watcher_for_shutdown = watcher.clone();
-        let tracker_for_shutdown = tracker.clone();
-        let mut shutdown_rx = ipc_server.shutdown_receiver();
-        let shutdown = async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
-                }
-                _ = shutdown_rx.recv() => {
-                    tracing::info!("\nReceived IPC shutdown command, initiating graceful shutdown...");
-                }
-            }
-
-            // Race graceful drain against a second Ctrl+C for force quit
-            tokio::select! {
-                _ = watcher_for_shutdown.stop_and_drain() => {}
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::warn!("\nForce shutdown requested, exiting immediately");
-                    std::process::exit(130);
-                }
-            }
-
-            // Log watcher_stopped activity
-            let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
-                .with_source("system".to_string());
-            tracker_for_shutdown.record_activity(&activity).ok();
-        };
-
-        // Abort regression monitoring on shutdown
-        let regression_shutdown = {
-            let handle = regression_handle;
-            async move {
-                if let Some(h) = handle {
-                    h.abort();
-                }
-            }
-        };
-
-        // Build the unified HTTP server with dashboard API + webhooks
+        let runs = TaskTracker::new();
         let mut config = config.clone();
         config.webhook_port = *port;
+        let http = http_mode(enable_webhooks, enable_dashboard).map(|mode| {
+            let notifier = notifier.clone();
+            let tracker = tracker.clone();
+            let runs = runs.clone();
+            let config_path = std::path::PathBuf::from(&config_path);
+            Service::new(HTTP_SERVICE, async move {
+                match mode {
+                    HttpMode::Webhooks { dashboard } => {
+                        let handlers = create_webhook_handlers(&config);
+                        if handlers.get_all().is_empty()
+                            && github_webhook_handler.is_none()
+                            && !dashboard
+                        {
+                            anyhow::bail!("No webhook handlers configured");
+                        }
 
-        // Start all services concurrently
-        let ipc_future = ipc_server.start();
-
-        let inferrer_clone = deps.inferrer.clone();
-        let embedding_client_clone = deps.embedding_client.clone();
-        let github_webhook_handler_for_http = github_webhook_handler;
-        let review_watcher_clone = deps.review_watcher.clone();
-        let issue_embedding_service_clone = deps.issue_embedding_service.clone();
-        let code_search_service_clone = deps.code_search_service.clone();
-        let discord_search_service_clone = deps.discord_search_service.clone();
-        let agent_clone = deps.agent.clone();
-        let qa_agent_clone = deps.qa_agent.clone();
-        let http_future = async move {
-            if enable_webhooks {
-                let handlers = create_webhook_handlers(&config);
-                if handlers.get_all().is_empty()
-                    && github_webhook_handler_for_http.is_none()
-                    && !enable_dashboard
-                {
-                    return Err(anyhow::anyhow!("No webhook handlers configured"));
+                        let (helpscout_source, discord_client, discord_guild) =
+                            build_mcp_list_backends(&config);
+                        let mut server = WebhookServer::new_with_github(
+                            config,
+                            handlers,
+                            notifier,
+                            tracker.clone(),
+                            Some(tracker),
+                            deps.inferrer,
+                            github_webhook_handler,
+                            deps.agent,
+                        );
+                        server.set_qa_agent(deps.qa_agent);
+                        server.set_embedding_client(deps.embedding_client);
+                        server.set_issue_embedding_service(deps.issue_embedding_service);
+                        server.set_code_search_service(deps.code_search_service);
+                        server.set_discord_search_service(deps.discord_search_service);
+                        server.set_helpscout_source(helpscout_source);
+                        server.set_discord_client(discord_client, discord_guild);
+                        server.set_review_watcher(deps.review_watcher);
+                        server.set_runs(runs);
+                        if dashboard {
+                            server.set_dashboard(config_path);
+                        }
+                        server.start().await?;
+                    }
+                    HttpMode::Dashboard => {
+                        ApiServer::with_port(config, tracker, *port, config_path)
+                            .start()
+                            .await?;
+                    }
                 }
-
-                let mut server = WebhookServer::new_with_github(
-                    config.clone(),
-                    handlers,
-                    notifier.clone(),
-                    tracker.clone(),
-                    Some(tracker.clone()),
-                    inferrer_clone,
-                    github_webhook_handler_for_http,
-                    agent_clone,
-                );
-                server.set_qa_agent(qa_agent_clone);
-                server.set_embedding_client(embedding_client_clone);
-                server.set_issue_embedding_service(issue_embedding_service_clone);
-                server.set_code_search_service(code_search_service_clone);
-                server.set_discord_search_service(discord_search_service_clone);
-                server.set_review_watcher(review_watcher_clone);
-                if enable_dashboard {
-                    server.set_dashboard(std::path::PathBuf::from(config_path.clone()));
-                }
-                server.start().await?;
-            } else if enable_dashboard {
-                // Dashboard only (no webhooks)
-                let server = ApiServer::with_port(
-                    config.clone(),
-                    tracker.clone(),
-                    *port,
-                    std::path::PathBuf::from(config_path.clone()),
-                );
-                server.start().await?;
-            }
-            Ok::<(), anyhow::Error>(())
+                Ok(())
+            })
+        });
+        let poll = if enable_polling {
+            Service::new(POLL_SERVICE, async {
+                watcher
+                    .start(Some(*poll_interval))
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        } else {
+            let worker = HousekeepingWorker::new(watcher.clone(), *poll_interval);
+            Service::new(HOUSEKEEPING_SERVICE, async move { worker.start().await })
         };
+        let ipc = Service::new(IPC_SERVICE, async {
+            ipc_server.start(lock).await.map_err(anyhow::Error::from)
+        });
 
-        let watcher_for_poll = watcher.clone();
-        let poll_future = async move {
-            if enable_polling {
-                watcher_for_poll.start(Some(*poll_interval)).await?;
-            } else {
-                // Run housekeeping without source polling
-                let worker = HousekeepingWorker::new(watcher_for_poll, *poll_interval);
-                worker.start().await?;
-            }
-            Ok::<(), anyhow::Error>(())
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: Some(&ipc_server),
+            runs: Some(&runs),
+            monitors: [regression_handle, deploy_qa_handle]
+                .into_iter()
+                .flatten()
+                .collect(),
         };
+        let mut requests = ipc_server.shutdown_receiver();
+        let summary = daemon
+            .serve([Some(ipc), http, Some(poll)].into_iter().flatten(), async {
+                let _ = requests.recv().await;
+            })
+            .await?;
 
-        // Run everything concurrently
-        tokio::select! {
-            result = ipc_future => {
-                if let Err(e) = result {
-                    tracing::error!("IPC server error: {}", e);
-                }
-            }
-            result = http_future => {
-                if let Err(e) = result {
-                    tracing::error!("HTTP server error: {}", e);
-                }
-            }
-            result = poll_future => {
-                if let Err(e) = result {
-                    tracing::error!("Polling error: {}", e);
-                }
-            }
-            _ = shutdown => {
-                // Stop regression monitoring
-                regression_shutdown.await;
-            }
-        }
+        let activity = ActivityLogEntry::new(
+            "watcher_stopped",
+            format!("Watcher daemon stopped ({})", summary.reason),
+        )
+        .with_source("system".to_string())
+        .with_metadata(json!({
+            "reason": summary.reason.label(),
+            "outcome": summary.outcome.label(),
+        }));
+        tracker.record_activity(&activity).ok();
 
-        return Ok(());
+        return summary.error.map_or(Ok(()), Err);
     }
 
     // Handle PR commands early since they don't need sources
@@ -3480,7 +3915,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         let github_client = GitHubClient::new(config.github().clone());
         let provider: Arc<dyn ScmProvider> = Arc::new(github_client);
-        let sources = create_sources(&config);
+        let sources = create_sources(&config, &tracker);
         let pr_monitor = if config.regression.enabled {
             PrMonitor::with_regression_tracking(
                 provider,
@@ -3732,16 +4167,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
         println!("\nProcessing {} retries...", ready.len());
 
-        // Need sources and watcher for processing
-        let sources = create_sources(&config);
+        let sources = create_sources(&config, &tracker);
         if sources.is_empty() {
             anyhow::bail!("No sources were initialized");
         }
 
-        // Create GitHub client for API-based repo discovery
         let github_client = GitHubClient::new(config.github().clone());
-
-        // Build inferrer for retry processing (with embeddings for semantic matching)
         let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
             &config,
             Some(&github_client),
@@ -3749,17 +4180,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         )
         .await?;
 
-        // Create ReviewWatcher for PR review tracking
         let review_watcher = create_review_watcher(&config, tracker.clone());
 
         let issue_embedding_service =
             build_issue_embedding_service(&tracker, embedding_client.as_ref());
 
         let code_search_service = if config.code_index.enabled {
-            embedding_client.as_ref().map(|emb| {
+            embedding_client.as_ref().map(|client| {
                 Arc::new(claudear::repo::code_index::CodeSearchService::new(
                     tracker.clone(),
-                    emb.clone(),
+                    client.clone(),
                 ))
             })
         } else {
@@ -3767,51 +4197,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         };
 
         let agent: Arc<dyn AgentRunner> =
-            InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.agent.timeout_secs,
-                    model: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.model.clone()),
-                    instructions: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.instructions.clone()),
-                    permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.permissions.clone())
-                        .unwrap_or_default(),
-                    readonly_tools: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.readonly_tools.clone())
-                        .unwrap_or_default(),
-                    skip_permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.skip_permissions)
-                        .unwrap_or(false),
-                    binary: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.binary.clone())
-                        .unwrap_or_else(|| "claude".to_string()),
-                    env: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.env.clone())
-                        .unwrap_or_default(),
-                    mcp: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.mcp.clone())
-                        .unwrap_or_default(),
-                    debug_logging: config.debug_logging,
-                },
-                tracker.clone(),
-            )));
+            claudear::build_provider_runner(&config, tracker.clone(), None);
 
         let watcher = Watcher::new(WatcherOptions {
             config: config.clone(),
@@ -3837,20 +4223,29 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             llm_engine: None,
         });
 
-        for attempt in ready {
-            println!("\n  Retrying [{}] {}...", attempt.source, attempt.short_id);
-
-            // Prepare for retry
-            retry_manager.prepare_retry(&attempt.source, &attempt.issue_id)?;
-
-            // Trigger the fix
-            if let Err(e) = watcher
-                .trigger_issue(&attempt.source, &attempt.issue_id)
-                .await
-            {
-                tracing::error!("Failed to retry {}: {}", attempt.short_id, e);
+        interruptible(async {
+            for attempt in ready {
+                if process_group::Registry::global().is_interrupted() {
+                    break;
+                }
+                println!("\n  Retrying [{}] {}...", attempt.source, attempt.short_id);
+                match watcher.retry(&attempt, MANUAL_TRIGGER).await {
+                    RetryOutcome::Ran => {}
+                    RetryOutcome::Busy => println!(
+                        "  Skipped {}: it is already being processed, so its retry was not spent",
+                        attempt.short_id
+                    ),
+                    RetryOutcome::Stopping => println!(
+                        "  Skipped {}: the watcher is stopping, so its retry was not spent",
+                        attempt.short_id
+                    ),
+                    RetryOutcome::Failed(error) => {
+                        tracing::error!("Failed to retry {}: {}", attempt.short_id, error);
+                    }
+                }
             }
-        }
+        })
+        .await;
 
         println!("\nRetry processing complete.");
         return Ok(());
@@ -3962,7 +4357,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let mut config = config;
             config.webhook_port = port;
 
-            // Auto-configure webhooks if requested
             if setup {
                 let base_url = base_url.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -3978,8 +4372,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     Ok(result) => {
                         print_setup_result(&result);
 
-                        // Reload config to get the new secrets from env vars
-                        // (webhook secrets are stored in env file, which overrides YAML config)
+                        // The configurator writes the new secrets to the env file, which
+                        // overrides the config file.
                         tracing::info!("Reloading configuration with new secrets...");
                         config = Config::load(&config_path)?;
                         config.webhook_port = port;
@@ -3999,7 +4393,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             let handlers = create_webhook_handlers(&config);
 
-            // Build shared watcher dependencies (needed for housekeeping)
             let deps = build_watcher_deps(&config, &tracker).await?;
             let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
             let github_webhook_handler =
@@ -4021,7 +4414,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 &user_registry,
             );
 
-            // Create a Watcher for housekeeping (retries, cascades, auto-close, etc.)
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources: deps.sources,
@@ -4047,6 +4439,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }));
 
             let worker = HousekeepingWorker::new(watcher.clone(), config.poll_interval_ms);
+            let runs = TaskTracker::new();
 
             let mut server = WebhookServer::new_with_github(
                 config.clone(),
@@ -4063,37 +4456,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_issue_embedding_service(deps.issue_embedding_service);
             server.set_code_search_service(deps.code_search_service);
             server.set_discord_search_service(deps.discord_search_service);
+            let (helpscout_source, discord_client, discord_guild) =
+                build_mcp_list_backends(&config);
+            server.set_helpscout_source(helpscout_source);
+            server.set_discord_client(discord_client, discord_guild);
             server.set_review_watcher(deps.review_watcher);
+            server.set_runs(runs.clone());
 
-            // Start regression monitoring background task
             let regression_handle = start_regression_monitoring(
                 &config,
                 tracker.clone(),
-                create_sources(&config),
+                create_sources(&config, &tracker),
                 notifier.clone(),
             );
             if regression_handle.is_some() {
                 tracing::info!("Regression monitoring: enabled");
             }
-
-            // Handle shutdown signals
-            let watcher_for_shutdown = watcher.clone();
-            let shutdown = async move {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to install signal handler");
-                tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
-                tokio::select! {
-                    _ = watcher_for_shutdown.stop_and_drain() => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::warn!("\nForce shutdown requested, exiting immediately");
-                        std::process::exit(130);
-                    }
-                }
-                if let Some(h) = regression_handle {
-                    h.abort();
-                }
-            };
+            let deploy_qa_handle =
+                start_deploy_qa_monitoring(&config, tracker.clone(), watcher.clone());
 
             if self_test {
                 let port_for_test = port;
@@ -4113,21 +4493,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 });
             }
 
-            tokio::select! {
-                result = server.start() => result?,
-                result = worker.start() => {
-                    if let Err(e) = result {
-                        tracing::error!("Housekeeping worker error: {}", e);
-                    }
-                }
-                _ = shutdown => {}
+            let daemon = Daemon {
+                watcher: &watcher,
+                ipc: None,
+                runs: Some(&runs),
+                monitors: [regression_handle, deploy_qa_handle]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            };
+            let services = [
+                Service::new(HTTP_SERVICE, async move {
+                    server.start().await.map_err(anyhow::Error::from)
+                }),
+                Service::new(HOUSEKEEPING_SERVICE, worker.start()),
+            ];
+            let summary = daemon.serve(services, pending()).await?;
+            if let Some(error) = summary.error {
+                return Err(error);
             }
         }
 
         _ => {
-            // Initialize sources for polling/seed/dry-run modes
             tracing::info!("Initializing sources...");
-            let sources = create_sources(&config);
+            let sources = create_sources(&config, &tracker);
 
             if sources.is_empty() {
                 anyhow::bail!("No sources were initialized");
@@ -4137,10 +4526,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let sources_for_regression = sources.clone();
             let notifier_for_regression = notifier.clone();
 
-            // Create GitHub client for API-based repo discovery
             let github_client = GitHubClient::new(config.github().clone());
 
-            // Build inferrer for repo inference (with embeddings for semantic matching)
             let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
                 &config,
                 Some(&github_client),
@@ -4148,7 +4535,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             )
             .await?;
 
-            // Create ReviewWatcher for PR review tracking
             let review_watcher = create_review_watcher(&config, tracker.clone());
 
             let issue_embedding_service =
@@ -4168,7 +4554,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let agent: Arc<dyn AgentRunner> =
                 claudear::build_provider_runner(&config, tracker.clone(), None);
 
-            // Eagerly load LLM engine — download model if not present on disk
             let llm_engine = if config.llm.enabled {
                 let model_path = claudear::chat::service::expand_tilde(&config.llm.model_path);
                 let model_ready = if model_path.exists() && model_path.is_file() {
@@ -4239,7 +4624,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 None
             };
 
-            // Build a separate agent runner for classification if configured
             let provider = config.agent.default_provider_config();
             let classification_agent = claudear::build_purpose_runner(
                 &config,
@@ -4287,26 +4671,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 llm_engine,
             }));
 
-            // Handle shutdown signals
-            let watcher_ref = &watcher;
-
             match cli.command {
                 Commands::Seed => {
                     watcher.seed().await?;
                 }
 
                 Commands::DryRun => {
-                    let shutdown = async {
-                        tokio::signal::ctrl_c()
-                            .await
-                            .expect("Failed to install signal handler");
-                        tracing::info!("\nReceived shutdown signal...");
-                        watcher_ref.stop();
+                    let daemon = Daemon {
+                        watcher: &watcher,
+                        ipc: None,
+                        runs: None,
+                        monitors: Vec::new(),
                     };
-
-                    tokio::select! {
-                        result = watcher.start(None) => result?,
-                        _ = shutdown => {}
+                    let poll = Service::new(POLL_SERVICE, async {
+                        watcher.start(None).await.map_err(anyhow::Error::from)
+                    });
+                    let summary = daemon.serve([poll], pending()).await?;
+                    if let Some(error) = summary.error {
+                        return Err(error);
                     }
                 }
 
@@ -4329,43 +4711,54 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                     // Keep regression monitoring active in foreground poll mode so merged bug
                     // fixes complete the regression-final-check -> resolve flow.
-                    let _regression_handle = start_regression_monitoring(
+                    let regression_handle = start_regression_monitoring(
                         &config,
                         tracker_for_api.clone(),
                         sources_for_regression.clone(),
                         notifier_for_regression.clone(),
                     );
+                    let deploy_qa_handle = start_deploy_qa_monitoring(
+                        &config,
+                        tracker_for_api.clone(),
+                        watcher.clone(),
+                    );
 
-                    let shutdown = async {
-                        tokio::signal::ctrl_c()
-                            .await
-                            .expect("Failed to install signal handler");
-                        tracing::info!("\nReceived shutdown signal...");
-                        watcher_ref.stop();
+                    let daemon = Daemon {
+                        watcher: &watcher,
+                        ipc: None,
+                        runs: None,
+                        monitors: [regression_handle, deploy_qa_handle]
+                            .into_iter()
+                            .flatten()
+                            .collect(),
                     };
-
-                    if no_dashboard {
-                        tokio::select! {
-                            result = watcher.start(Some(interval)) => result?,
-                            _ = shutdown => {}
-                        }
-                    } else {
-                        let api_server = ApiServer::with_port(
+                    let poll = Service::new(POLL_SERVICE, async {
+                        watcher
+                            .start(Some(interval))
+                            .await
+                            .map_err(anyhow::Error::from)
+                    });
+                    let http = (!no_dashboard).then(|| {
+                        let server = ApiServer::with_port(
                             config.clone(),
                             tracker_for_api.clone(),
                             port,
-                            std::path::PathBuf::from(config_path.clone()),
+                            std::path::PathBuf::from(&config_path),
                         );
-                        tokio::select! {
-                            result = watcher.start(Some(interval)) => result?,
-                            result = api_server.start() => result?,
-                            _ = shutdown => {}
-                        }
+                        Service::new(HTTP_SERVICE, async move {
+                            server.start().await.map_err(anyhow::Error::from)
+                        })
+                    });
+                    let summary = daemon
+                        .serve([Some(poll), http].into_iter().flatten(), pending())
+                        .await?;
+                    if let Some(error) = summary.error {
+                        return Err(error);
                     }
                 }
 
                 Commands::Trigger { source, issue_id } => {
-                    watcher.trigger_issue(&source, &issue_id).await?;
+                    interruptible(watcher.trigger_issue(&source, &issue_id)).await?;
                 }
 
                 Commands::Action {
@@ -4373,9 +4766,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     source,
                     issue_id,
                 } => {
-                    let kind: ActionKind =
-                        action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                    let outcome = watcher.run_action(kind, &source, &issue_id).await?;
+                    let kind: ActionKind = action
+                        .parse()
+                        .map_err(|error: String| anyhow::anyhow!(error))?;
+                    let outcome =
+                        interruptible(watcher.run_action(kind, &source, &issue_id)).await?;
                     use claudear::processing::ProcessingOutcome;
                     match outcome {
                         ProcessingOutcome::Success { pr_url } => {
@@ -4411,7 +4806,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     println!("  Failed:     {}", stats.failed);
                     println!("  Cannot Fix: {} (max retries reached)", stats.cannot_fix);
 
-                    // Calculate success rate
                     let completed = stats.merged + stats.closed + stats.failed + stats.cannot_fix;
                     if completed > 0 {
                         let merge_rate = (stats.merged as f64 / completed as f64) * 100.0;
@@ -4454,4 +4848,472 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use claudear::runner::{ClaudeAgentRunner, ClaudeRunnerConfig};
+    use claudear::types::MatchResult;
+    use futures::channel::mpsc::unbounded;
+    use std::collections::HashMap;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+    use tokio::process::{Child, ChildStdout, Command};
+    #[cfg(unix)]
+    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::sync::Notify;
+
+    const PARKED_SOURCE: &str = "parked";
+    const PARKED_ISSUE: &str = "parked-1";
+
+    /// An agent CLI that exits with [`INTERRUPTED_CLI_STATUS`] on SIGINT. Perl, because a shell
+    /// cannot trap a signal it inherited as ignored, as a test runner a script backgrounds does.
+    const INTERRUPTIBLE_CLI: &str =
+        r#"$| = 1; $SIG{INT} = sub { exit 7 }; print "ready\n"; sleep 1 while 1"#;
+    const INTERRUPTED_CLI_STATUS: i32 = 7;
+
+    /// An agent CLI that reports SIGINT with [`CLI_INTERRUPTED`] and keeps running.
+    const STUBBORN_CLI: &str =
+        r#"$| = 1; $SIG{INT} = sub { print "interrupted\n" }; print "ready\n"; sleep 1 while 1"#;
+    const CLI_READY: &str = "ready";
+    const CLI_INTERRUPTED: &str = "interrupted";
+
+    /// How long an interrupted run takes to record how it ended.
+    const RECORDING_TIME: Duration = Duration::from_millis(200);
+
+    /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
+    const WRAP_UP_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// A source whose `get_issue` signals its arrival and then never returns.
+    #[derive(Default)]
+    struct ParkedSource {
+        arrived: Notify,
+    }
+
+    #[async_trait]
+    impl IssueSource for ParkedSource {
+        fn name(&self) -> &str {
+            PARKED_SOURCE
+        }
+
+        fn display_name(&self) -> &str {
+            PARKED_SOURCE
+        }
+
+        async fn fetch_issues(&self) -> claudear::Result<Vec<Issue>> {
+            Ok(Vec::new())
+        }
+
+        fn matches_criteria(&self, _issue: &Issue) -> MatchResult {
+            MatchResult::not_matched("A parked source matches nothing")
+        }
+
+        async fn build_issue_context(&self, _issue: &Issue) -> claudear::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn get_issue(&self, _issue_id: &str) -> claudear::Result<Issue> {
+            self.arrived.notify_one();
+            pending().await
+        }
+    }
+
+    fn in_memory_tracker() -> Arc<dyn FixAttemptTracker> {
+        Arc::new(SqliteTracker::in_memory().expect("open an in-memory tracker"))
+    }
+
+    fn idle_watcher() -> Watcher {
+        watcher_with(in_memory_tracker(), Vec::new())
+    }
+
+    fn watcher_with(
+        tracker: Arc<dyn FixAttemptTracker>,
+        sources: Vec<Arc<dyn IssueSource>>,
+    ) -> Watcher {
+        Watcher::new(WatcherOptions {
+            config: Config::default(),
+            sources,
+            notifier: Arc::new(ConsoleNotifier::new()),
+            tracker: tracker.clone(),
+            inferrer: None,
+            embedding_client: None,
+            review_watcher: None,
+            issue_embedding_service: None,
+            code_search_service: None,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
+            relationships: None,
+            github_client: None,
+            scm_provider: None,
+            user_registry: UserRegistry::new(HashMap::new()),
+            agent: Arc::new(ClaudeAgentRunner::new(
+                ClaudeRunnerConfig::default(),
+                tracker,
+            )),
+            classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
+            dry_run: false,
+            llm_engine: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_fails_serve_instead_of_exiting_the_process() {
+        let watcher = idle_watcher();
+        let runs = TaskTracker::new();
+        let _run = runs.token();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: Some(&runs),
+            monitors: Vec::new(),
+        };
+        let (sender, mut signals) = unbounded();
+        sender.unbounded_send(Reason::Terminated).unwrap();
+        sender.unbounded_send(Reason::Interrupted).unwrap();
+
+        let result = daemon
+            .serve_with(
+                &mut signals,
+                &process_group::Registry::new(),
+                [Service::new("idle", pending())],
+                pending(),
+            )
+            .await;
+
+        let error = result.expect_err("a forced shutdown must fail serve");
+        assert!(error.is::<ForcedShutdown>(), "unexpected error {error:#}");
+    }
+
+    /// Spawn `script` as an agent CLI leading a process group registered in `registry`,
+    /// returning once it is ready, with the rest of its output.
+    async fn spawn_cli<'r>(
+        script: &str,
+        registry: &'r process_group::Registry,
+    ) -> (
+        Child,
+        process_group::Guard<'r>,
+        Lines<BufReader<ChildStdout>>,
+    ) {
+        let mut command = Command::new("perl");
+        command
+            .args(["-e", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let (mut cli, guard) =
+            process_group::Guard::spawn(&mut command, registry).expect("spawn the agent CLI");
+        let mut output = BufReader::new(cli.stdout.take().expect("the CLI's stdout")).lines();
+        let ready = output.next_line().await.expect("read the CLI's output");
+        assert_eq!(ready.as_deref(), Some(CLI_READY));
+        (cli, guard, output)
+    }
+
+    #[tokio::test]
+    async fn wrap_up_interrupts_agent_clis_and_waits_for_their_runs_to_end() {
+        let tracker = in_memory_tracker();
+        tracker
+            .record_attempt(PARKED_SOURCE, PARKED_ISSUE, PARKED_ISSUE)
+            .expect("record the attempt");
+        tracker
+            .mark_failed(PARKED_SOURCE, PARKED_ISSUE, "the first run failed")
+            .expect("mark the attempt failed");
+        let attempt = tracker
+            .get_attempt(PARKED_SOURCE, PARKED_ISSUE)
+            .expect("read the attempt")
+            .expect("the attempt is recorded");
+        let source = Arc::new(ParkedSource::default());
+        let watcher = watcher_with(tracker, vec![source.clone()]);
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: None,
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (mut cli, mut guard, _output) = spawn_cli(INTERRUPTIBLE_CLI, &registry).await;
+        let run = async {
+            let mut retry = std::pin::pin!(watcher.retry(&attempt, MANUAL_TRIGGER));
+            let status = tokio::select! {
+                outcome = &mut retry => panic!("the run ended before its agent CLI: {outcome:?}"),
+                status = guard.wait(&mut cli) => status.expect("wait for the agent CLI"),
+            };
+            tokio::time::sleep(RECORDING_TIME).await;
+            status
+        };
+        let wrap_up = async {
+            source.arrived.notified().await;
+            daemon.wrap_up(&registry).await;
+            watcher.in_flight()
+        };
+
+        let (status, in_flight) =
+            tokio::time::timeout(WRAP_UP_DEADLINE, async { tokio::join!(run, wrap_up) })
+                .await
+                .expect("the wrap-up must interrupt the agent CLI so its run can end");
+
+        assert_eq!(
+            status.code(),
+            Some(INTERRUPTED_CLI_STATUS),
+            "the agent CLI must be interrupted rather than killed, but exited with {status}"
+        );
+        assert_eq!(
+            in_flight, 0,
+            "the wrap-up must wait for the interrupted run to record how it ended"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_signal_during_the_wrap_up_forces_the_shutdown() {
+        let watcher = idle_watcher();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: None,
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (_cli, _guard, mut output) = spawn_cli(STUBBORN_CLI, &registry).await;
+        let (sender, mut signals) = unbounded();
+        sender.unbounded_send(Reason::Terminated).unwrap();
+        let started = Instant::now();
+
+        let (result, ()) = tokio::join!(
+            daemon.serve_with(
+                &mut signals,
+                &registry,
+                [Service::new("idle", pending())],
+                pending(),
+            ),
+            async {
+                let line = output.next_line().await.expect("read the CLI's output");
+                assert_eq!(line.as_deref(), Some(CLI_INTERRUPTED));
+                sender.unbounded_send(Reason::Interrupted).unwrap();
+            },
+        );
+
+        let error = result.expect_err("a signal during the wrap-up must force the shutdown");
+        assert!(error.is::<ForcedShutdown>(), "unexpected error {error:#}");
+        assert!(
+            started.elapsed() < shutdown::INTERRUPT_GRACE,
+            "the second signal must cut the wrap-up short instead of waiting out the grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn signals_interrupt_the_agent_clis_as_the_shutdown_begins() {
+        for reason in [Reason::Terminated, Reason::Interrupted] {
+            let watcher = idle_watcher();
+            let runs = TaskTracker::new();
+            let _run = runs.token();
+            let daemon = Daemon {
+                watcher: &watcher,
+                ipc: None,
+                runs: Some(&runs),
+                monitors: Vec::new(),
+            };
+            let registry = process_group::Registry::new();
+            let (_cli, _guard, mut output) = spawn_cli(STUBBORN_CLI, &registry).await;
+            let (sender, mut signals) = unbounded();
+            sender.unbounded_send(reason).unwrap();
+
+            let serve = daemon.serve_with(
+                &mut signals,
+                &registry,
+                [Service::new("idle", pending())],
+                pending(),
+            );
+            tokio::pin!(serve);
+            assert!(
+                futures::poll!(&mut serve).is_pending(),
+                "the drain must wait for the run in flight"
+            );
+
+            assert!(
+                registry.is_interrupted(),
+                "{reason} must interrupt the agent CLIs as the shutdown begins"
+            );
+            let line = tokio::time::timeout(WRAP_UP_DEADLINE, output.next_line())
+                .await
+                .expect("the agent CLI must be interrupted while the drain still waits")
+                .expect("read the CLI's output");
+            assert_eq!(line.as_deref(), Some(CLI_INTERRUPTED));
+        }
+    }
+
+    #[tokio::test]
+    async fn claudear_stop_lets_the_agent_clis_run_through_the_drain() {
+        let watcher = idle_watcher();
+        let runs = TaskTracker::new();
+        let _run = runs.token();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: Some(&runs),
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (_cli, _guard, _output) = spawn_cli(STUBBORN_CLI, &registry).await;
+        let (_sender, mut signals) = unbounded::<Reason>();
+
+        let serve = daemon.serve_with(
+            &mut signals,
+            &registry,
+            [Service::new("idle", pending())],
+            std::future::ready(()),
+        );
+        tokio::pin!(serve);
+        assert!(
+            futures::poll!(&mut serve).is_pending(),
+            "the drain must wait for the run in flight"
+        );
+
+        assert!(runs.is_closed(), "claudear stop must begin the shutdown");
+        assert!(
+            !registry.is_interrupted(),
+            "claudear stop must let the agent CLIs run while the drain waits for their runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_ending_lets_the_agent_clis_run_through_the_drain() {
+        let watcher = idle_watcher();
+        let runs = TaskTracker::new();
+        let _run = runs.token();
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: Some(&runs),
+            monitors: Vec::new(),
+        };
+        let registry = process_group::Registry::new();
+        let (_cli, _guard, _output) = spawn_cli(STUBBORN_CLI, &registry).await;
+        let (_sender, mut signals) = unbounded::<Reason>();
+
+        let serve = daemon.serve_with(
+            &mut signals,
+            &registry,
+            [Service::new("ended", async { Ok::<(), anyhow::Error>(()) })],
+            pending(),
+        );
+        tokio::pin!(serve);
+        assert!(
+            futures::poll!(&mut serve).is_pending(),
+            "the drain must wait for the run in flight"
+        );
+
+        assert!(runs.is_closed(), "a service ending must begin the shutdown");
+        assert!(
+            !registry.is_interrupted(),
+            "a service ending must let the agent CLIs run while the drain waits for their runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_runs_count_a_retry_that_holds_no_processing_slot() {
+        let tracker = in_memory_tracker();
+        tracker
+            .record_attempt(PARKED_SOURCE, PARKED_ISSUE, PARKED_ISSUE)
+            .expect("record the attempt");
+        tracker
+            .mark_failed(PARKED_SOURCE, PARKED_ISSUE, "the first run failed")
+            .expect("mark the attempt failed");
+        let attempt = tracker
+            .get_attempt(PARKED_SOURCE, PARKED_ISSUE)
+            .expect("read the attempt")
+            .expect("the attempt is recorded");
+        let source = Arc::new(ParkedSource::default());
+        let watcher = watcher_with(tracker, vec![source.clone()]);
+        let daemon = Daemon {
+            watcher: &watcher,
+            ipc: None,
+            runs: None,
+            monitors: Vec::new(),
+        };
+
+        let mut retry = std::pin::pin!(watcher.retry(&attempt, MANUAL_TRIGGER));
+        tokio::select! {
+            outcome = &mut retry => panic!("the retry ended before loading its issue: {outcome:?}"),
+            () = source.arrived.notified() => {}
+        }
+
+        assert_eq!(
+            watcher.active_count(),
+            0,
+            "a retry loading its issue must hold no processing slot"
+        );
+        assert_eq!(
+            daemon.watcher_runs(),
+            1,
+            "the shutdown must report the retry its drain is waiting for"
+        );
+    }
+
+    #[test]
+    fn http_mode_runs_a_server_only_for_what_is_enabled() {
+        assert_eq!(
+            http_mode(true, true),
+            Some(HttpMode::Webhooks { dashboard: true })
+        );
+        assert_eq!(
+            http_mode(true, false),
+            Some(HttpMode::Webhooks { dashboard: false })
+        );
+        assert_eq!(http_mode(false, true), Some(HttpMode::Dashboard));
+        assert_eq!(
+            http_mode(false, false),
+            None,
+            "with webhooks and the dashboard disabled there is no HTTP service to run"
+        );
+    }
+
+    #[cfg(unix)]
+    const SIGNAL_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Signals reach every test in the process, so one test's signal could
+    /// resolve another's wait.
+    #[cfg(unix)]
+    static SIGNALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(unix)]
+    async fn assert_interrupted_by(kind: SignalKind) {
+        let _signals = SIGNALS.lock().await;
+        // Handling the signal here too keeps its default action from killing
+        // the test process if `interrupted` ignores it.
+        let _handled = signal(kind).unwrap();
+        let interrupted = interrupted();
+        tokio::pin!(interrupted);
+        assert!(
+            futures::poll!(&mut interrupted).is_pending(),
+            "interrupted resolved before any signal"
+        );
+
+        // SAFETY: kill takes no pointers and only sends a signal.
+        unsafe { libc::kill(libc::getpid(), kind.as_raw_value()) };
+
+        tokio::time::timeout(SIGNAL_DEADLINE, interrupted)
+            .await
+            .unwrap_or_else(|_| panic!("interrupted ignored signal {}", kind.as_raw_value()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_terminate() {
+        assert_interrupted_by(SignalKind::terminate()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_hangup() {
+        assert_interrupted_by(SignalKind::hangup()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_interrupted_resolves_on_interrupt() {
+        assert_interrupted_by(SignalKind::interrupt()).await;
+    }
 }

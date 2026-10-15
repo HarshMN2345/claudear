@@ -5,16 +5,18 @@
 //! rest of the crate uses for daemon lifecycle management.
 
 mod client;
+mod lock;
 mod protocol;
 mod server;
 pub(crate) mod transport;
 
 pub use client::{print_response, IpcClient};
+pub use lock::Lock;
 pub use protocol::{IpcCommand, IpcData, IpcResponse, WatcherState};
 pub use server::IpcServer;
 
 use claudear_core::platform;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Returns a private runtime directory for IPC files, scoped to the current user.
 ///
@@ -110,57 +112,42 @@ pub fn default_pid_path() -> PathBuf {
     ipc_runtime_dir().join("claudear.pid")
 }
 
+/// Default path of the file the running `claudear start` daemon holds its [`Lock`] on.
+pub fn default_lock_path() -> PathBuf {
+    ipc_runtime_dir().join("claudear.lock")
+}
+
 /// Check if a watcher daemon is running.
 pub fn is_daemon_running() -> bool {
-    transport::check_connection(&default_socket_path())
+    is_accepting(&default_socket_path())
 }
 
-/// Get the PID of the running daemon, if any.
-pub fn get_daemon_pid() -> Option<u32> {
-    let pid_path = default_pid_path();
-    if pid_path.exists() {
-        std::fs::read_to_string(&pid_path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-    } else {
-        None
-    }
+/// Whether a listener is accepting connections on the socket at `socket_path`.
+fn is_accepting(socket_path: &Path) -> bool {
+    transport::check_connection(socket_path)
 }
 
-/// Write the current process PID to the pid file.
-pub fn write_pid_file() -> std::io::Result<()> {
-    let pid_path = default_pid_path();
-    std::fs::write(&pid_path, std::process::id().to_string())
+/// Read the PID stored in `pid_path`, if it holds one.
+fn read_pid_file(pid_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_path).ok()?.trim().parse().ok()
 }
 
-/// Remove the PID file.
-pub fn remove_pid_file() {
-    let pid_path = default_pid_path();
-    let _ = std::fs::remove_file(&pid_path);
+/// Write the current process PID to `pid_path`.
+fn write_pid_file(pid_path: &Path) -> std::io::Result<()> {
+    std::fs::write(pid_path, std::process::id().to_string())
 }
 
-/// Remove the socket file (Unix) or port file (Windows).
-pub fn remove_socket_file() {
-    let socket_path = default_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
-}
-
-/// Clean up stale socket/pid files from a previous crash.
-pub fn cleanup_stale_files() {
-    if let Some(pid) = get_daemon_pid() {
-        if !platform::is_process_running(pid) {
-            tracing::info!("Cleaning up stale files from previous run (PID {})", pid);
-            remove_pid_file();
-            remove_socket_file();
-        }
-    } else {
-        // No PID file but socket/port file exists — check if stale
-        let socket_path = default_socket_path();
-        if transport::is_stale(&socket_path) {
-            tracing::info!("Cleaning up stale socket file");
-            remove_socket_file();
-        }
-    }
+/// A temporary directory for IPC endpoints in tests. On Unix it lives under `/tmp`, so socket
+/// paths inside it stay within the Unix socket path limit however long `TMPDIR` is.
+#[cfg(test)]
+fn short_temporary_directory() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("claudear-ipc");
+    #[cfg(unix)]
+    let directory = builder.tempdir_in("/tmp");
+    #[cfg(not(unix))]
+    let directory = builder.tempdir();
+    directory.expect("create a temporary directory for IPC endpoints")
 }
 
 #[cfg(test)]
@@ -171,7 +158,7 @@ mod tests {
     async fn an_endpoint_round_trips_a_message_on_this_platform() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = short_temporary_directory();
         let endpoint = dir.path().join("round-trip");
 
         let listener = transport::bind(&endpoint).expect("bind");
@@ -199,16 +186,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_endpoint_reports_whether_anyone_is_listening() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = short_temporary_directory();
         let endpoint = dir.path().join("liveness");
 
         assert!(
             !transport::check_connection(&endpoint),
             "nothing exists yet"
-        );
-        assert!(
-            !transport::is_stale(&endpoint),
-            "a missing file is not stale"
         );
 
         let listener = transport::bind(&endpoint).expect("bind");
@@ -217,7 +200,6 @@ mod tests {
             transport::check_connection(&endpoint),
             "a bound endpoint answers"
         );
-        assert!(!transport::is_stale(&endpoint));
 
         drop(listener);
 
@@ -250,59 +232,39 @@ mod tests {
     }
 
     #[test]
-    fn test_get_daemon_pid_returns_option() {
-        let result = get_daemon_pid();
-        if let Some(pid) = result {
-            assert!(pid > 0, "PID should be positive, got: {}", pid);
-        }
+    fn test_read_pid_file_ignores_missing_and_malformed_files() {
+        let directory = short_temporary_directory();
+        let pid_path = directory.path().join("claudear.pid");
+        assert_eq!(read_pid_file(&pid_path), None);
+
+        std::fs::write(&pid_path, "not a pid").unwrap();
+        assert_eq!(read_pid_file(&pid_path), None);
+
+        std::fs::write(&pid_path, "42\n").unwrap();
+        assert_eq!(read_pid_file(&pid_path), Some(42));
     }
 
     #[test]
-    fn test_write_and_remove_pid_file_does_not_panic() {
-        if is_daemon_running() {
-            return;
-        }
+    fn test_write_pid_file_stores_own_pid() {
+        let directory = short_temporary_directory();
+        let pid_path = directory.path().join("claudear.pid");
 
-        let pid_path = default_pid_path();
-        let existing_content = std::fs::read_to_string(&pid_path).ok();
+        write_pid_file(&pid_path).expect("write_pid_file should succeed");
 
-        let write_result = write_pid_file();
-        assert!(write_result.is_ok(), "write_pid_file should succeed");
-
-        let read_pid = get_daemon_pid();
-        assert_eq!(
-            read_pid,
-            Some(std::process::id()),
-            "get_daemon_pid should return our process PID after write_pid_file"
-        );
-
-        remove_pid_file();
-
-        if let Some(content) = existing_content {
-            let _ = std::fs::write(&pid_path, content);
-        } else {
-            assert!(
-                !pid_path.exists(),
-                "PID file should be removed after remove_pid_file"
-            );
-        }
+        assert_eq!(read_pid_file(&pid_path), Some(std::process::id()));
     }
 
-    #[test]
-    fn test_remove_socket_file_does_not_panic_when_no_socket() {
-        if !is_daemon_running() {
-            remove_socket_file();
-        }
-    }
+    #[tokio::test]
+    async fn test_is_accepting_only_while_a_listener_is_bound() {
+        let directory = short_temporary_directory();
+        let socket_path = directory.path().join("claudear.sock");
+        assert!(!is_accepting(&socket_path));
 
-    #[test]
-    fn test_is_daemon_running_returns_bool() {
-        let result = is_daemon_running();
-        let _: bool = result;
-    }
+        let listener = transport::bind(&socket_path).unwrap();
+        assert!(is_accepting(&socket_path));
 
-    #[test]
-    fn test_cleanup_stale_files_does_not_panic() {
-        cleanup_stale_files();
+        drop(listener);
+        assert!(socket_path.exists(), "dropping a listener leaves its file");
+        assert!(!is_accepting(&socket_path));
     }
 }

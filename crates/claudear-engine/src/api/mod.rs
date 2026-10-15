@@ -6,6 +6,7 @@ pub mod auth;
 pub(crate) mod embedded;
 mod routes;
 mod security;
+mod tokens;
 
 pub use routes::{create_api_router, create_api_router_full, create_api_router_with_dashboard};
 

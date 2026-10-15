@@ -5,10 +5,12 @@
 
 use claudear_core::error::{Error, Result};
 use claudear_core::secret::SecretValue;
+use claudear_core::types::DeployQaTip;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Deserialize a value that can be either a single string or a list of strings.
 /// Accepts `"value"` or `["a", "b"]` in TOML/JSON and always returns `Vec<String>`.
@@ -108,6 +110,18 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// How long an agent run keeps waiting for its CLI's output after the
+    /// CLI's process group is killed. The CLI's own output is already buffered
+    /// by then, so this only bounds the wait on processes that escaped the
+    /// group while holding the pipes.
+    pub const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// When an agent run stops reading its CLI's output after the CLI's
+    /// process group is killed, even while a process that escaped the group
+    /// keeps writing to the pipes: the longest a run reads output once its
+    /// CLI is gone.
+    pub const OUTPUT_DRAIN_CUTOFF: Duration = Duration::from_secs(10);
+
     /// Get the default provider's config.
     pub fn default_provider_config(&self) -> Option<&ProviderConfig> {
         self.providers.get(&self.default_provider)
@@ -142,16 +156,19 @@ pub struct ProviderConfig {
     /// Path to a file containing custom instructions.
     /// Resolved relative to the config file directory.
     pub instructions_file: Option<String>,
-    /// Tool permissions granted without prompting (--allowedTools).
+    /// Tool permissions granted without prompting (--allowedTools) to fix and
+    /// `[deploy_qa]` live-QA runs.
     #[serde(default)]
     pub permissions: Vec<String>,
     /// Tools allowed for read-only Q&A (question) runs, which never skip
-    /// permission prompts. Empty means use the built-in default read-only set
-    /// (Read, Grep, Glob, WebFetch, WebSearch). Set this to add/remove tools
-    /// the agent may use when answering questions without mutating the repo.
+    /// permission prompts, and added to `[deploy_qa]` live-QA runs. Empty means
+    /// use the built-in default read-only set (Read, Grep, Glob, WebFetch,
+    /// WebSearch). Set this to add/remove tools the agent may use when
+    /// answering questions without mutating the repo.
     #[serde(default)]
     pub readonly_tools: Vec<String>,
-    /// Skip all permission prompts (default: false).
+    /// Skip all permission prompts on fix and `[deploy_qa]` live-QA runs
+    /// (default: false). Read-only runs never skip them.
     pub skip_permissions: bool,
     /// CLI binary name/path (e.g., "claude", "codex").
     pub binary: Option<String>,
@@ -163,6 +180,8 @@ pub struct ProviderConfig {
     pub sandbox: Option<String>,
     /// Extra environment variables to set when spawning the agent process.
     /// Useful when the agent binary needs PATH or other vars not in the daemon env.
+    /// Passed verbatim, with no `${VAR}` expansion, to every agent run of every
+    /// source.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
     /// Provider-specific extra configuration.
@@ -182,7 +201,8 @@ pub struct McpServerConfig {
     pub command: Option<String>,
     /// Arguments passed to `command`.
     pub args: Vec<String>,
-    /// Environment for the server process. Values may contain `${VAR}` references.
+    /// Environment for the server process. Values may contain `${VAR}`
+    /// references, which the agent CLI expands from its own environment.
     pub env: std::collections::HashMap<String, String>,
     /// URL for an HTTP/SSE transport server (alternative to `command`).
     pub url: Option<String>,
@@ -461,6 +481,9 @@ pub struct Config {
     /// Regression monitoring configuration.
     #[serde(default)]
     pub regression: RegressionConfig,
+    /// Live deploy QA for GitHub release tips (separate from `[regression]`).
+    #[serde(default)]
+    pub deploy_qa: DeployQaConfig,
     /// Cascade configuration for multi-repo chaining.
     #[serde(default)]
     pub cascade: CascadeConfig,
@@ -509,10 +532,104 @@ pub struct Config {
     /// Scheduled reports / digests configuration group.
     #[serde(default)]
     pub reports: ReportsConfig,
+    /// Built-in MCP search server (exposes code/Discord knowledge search over
+    /// the existing HTTP port). Distinct from the `mcp` field above, which is
+    /// client-side config for MCP servers attached to Claude runs.
+    #[serde(default)]
+    pub mcp_server: McpSearchServerConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
     PathBuf::from("./storage")
+}
+
+/// Built-in MCP search server configuration.
+///
+/// When enabled, a `POST /mcp` endpoint is mounted on the same HTTP server as
+/// the webhooks/dashboard, exposing the existing semantic search services
+/// (code + Discord knowledge) as MCP tools over the Streamable HTTP transport.
+///
+/// Enabled by default. The endpoint is unauthenticated and shares the webhook
+/// port, so browser `Origin` values are rejected unless allow-listed (see
+/// `allowed_origins`) to guard against DNS-rebinding; set `enabled = false` to
+/// turn it off entirely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSearchServerConfig {
+    /// Enable the built-in MCP search server.
+    pub enabled: bool,
+    /// Expose the `code_search` / `find_symbol` tools (requires code indexing).
+    pub expose_code: bool,
+    /// Expose the `discord_search` and `discord_list_messages` tools (require the
+    /// Discord knowledgebase / bot token respectively).
+    pub expose_discord: bool,
+    /// Expose the `helpscout_list_conversations` tool (requires HelpScout).
+    pub expose_helpscout: bool,
+    /// Default number of results returned by search tools when the caller
+    /// omits `limit`.
+    pub default_limit: usize,
+    /// Hard cap on the number of results a single search tool call may return.
+    pub max_limit: usize,
+    /// Browser `Origin` values allowed to call the endpoint. Requests with no
+    /// `Origin` header (CLI/server-to-server MCP clients) are always allowed;
+    /// requests carrying an `Origin` not in this list are rejected with 403 to
+    /// defend against DNS-rebinding attacks, per the MCP Streamable HTTP spec.
+    /// Empty (the default) blocks all browser origins.
+    pub allowed_origins: Vec<String>,
+    /// Require a per-user personal access token (`Authorization: Bearer <token>`)
+    /// on every `/mcp` request. Tokens are minted by portal users. Enabled by
+    /// default so the endpoint is never unauthenticated.
+    pub require_auth: bool,
+    /// Require a valid Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`) on every
+    /// `/mcp` request, so traffic that did not transit the Cloudflare tunnel /
+    /// Access (e.g. WARP) is rejected. Verified against `cf_access`.
+    pub require_cloudflare_access: bool,
+    /// Cloudflare Access verification settings, used when
+    /// `require_cloudflare_access` is set.
+    pub cf_access: CloudflareAccessConfig,
+}
+
+/// Cloudflare Access JWT verification settings.
+///
+/// When `[mcp_server].require_cloudflare_access` is true, each request must
+/// carry a `Cf-Access-Jwt-Assertion` header holding a JWT that Cloudflare Access
+/// signs after the user authenticates (including via WARP). The token is
+/// verified against the team's public keys (JWKS) at
+/// `https://<team_domain>/cdn-cgi/access/certs` and must list `audience` in its
+/// `aud` claim.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudflareAccessConfig {
+    /// Team domain, e.g. "yourteam.cloudflareaccess.com" (no scheme).
+    pub team_domain: String,
+    /// The Access application audience (AUD) tag the token must contain.
+    pub audience: String,
+}
+
+impl Default for McpSearchServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            expose_code: true,
+            expose_discord: true,
+            expose_helpscout: true,
+            default_limit: 10,
+            max_limit: 50,
+            allowed_origins: Vec::new(),
+            require_auth: true,
+            require_cloudflare_access: false,
+            cf_access: CloudflareAccessConfig::default(),
+        }
+    }
+}
+
+impl McpSearchServerConfig {
+    /// Clamp a caller-supplied limit into `[1, max_limit]`, falling back to
+    /// `default_limit` when none was supplied.
+    pub fn resolve_limit(&self, requested: Option<usize>) -> usize {
+        let max = self.max_limit.max(1);
+        requested.unwrap_or(self.default_limit).clamp(1, max)
+    }
 }
 
 /// Dashboard display & estimation configuration.
@@ -687,6 +804,7 @@ impl Default for Config {
             ask: AskConfig::default(),
             retry: RetryConfig::default(),
             regression: RegressionConfig::default(),
+            deploy_qa: DeployQaConfig::default(),
             cascade: CascadeConfig::default(),
             users: std::collections::HashMap::new(),
             learning: LearningConfig::default(),
@@ -703,6 +821,7 @@ impl Default for Config {
             qa: QaConfig::default(),
             knowledgebase: KnowledgebasesConfig::default(),
             reports: ReportsConfig::default(),
+            mcp_server: McpSearchServerConfig::default(),
         }
     }
 }
@@ -2066,6 +2185,236 @@ impl Default for RegressionConfig {
     }
 }
 
+/// Tag filter for a `[deploy_qa]` track.
+///
+/// TOML values: `"any"`, `"suffix:-db"`, `"not_suffix:-db"`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DeployQaTagFilter {
+    /// Match every release tag.
+    #[default]
+    Any,
+    /// Match tags that end with the given suffix (e.g. `-db`).
+    Suffix(String),
+    /// Match tags that do **not** end with the given suffix.
+    NotSuffix(String),
+}
+
+impl DeployQaTagFilter {
+    /// Parse a tag filter from its TOML string form.
+    pub fn parse(raw: &str) -> std::result::Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("any") {
+            return Ok(Self::Any);
+        }
+        if let Some(suffix) = raw.strip_prefix("suffix:") {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                return Err("tag_filter 'suffix:' requires a non-empty suffix".to_string());
+            }
+            return Ok(Self::Suffix(suffix.to_string()));
+        }
+        if let Some(suffix) = raw.strip_prefix("not_suffix:") {
+            let suffix = suffix.trim();
+            if suffix.is_empty() {
+                return Err("tag_filter 'not_suffix:' requires a non-empty suffix".to_string());
+            }
+            return Ok(Self::NotSuffix(suffix.to_string()));
+        }
+        Err(format!(
+            "unknown tag_filter '{raw}' (expected any | suffix:<text> | not_suffix:<text>)"
+        ))
+    }
+
+    /// Whether `tag` matches this filter.
+    pub fn matches(&self, tag: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Suffix(suffix) => tag.ends_with(suffix),
+            Self::NotSuffix(suffix) => !tag.ends_with(suffix),
+        }
+    }
+
+    /// Canonical TOML string for this filter.
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::Any => "any".to_string(),
+            Self::Suffix(suffix) => format!("suffix:{suffix}"),
+            Self::NotSuffix(suffix) => format!("not_suffix:{suffix}"),
+        }
+    }
+}
+
+impl Serialize for DeployQaTagFilter {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeployQaTagFilter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One GitHub repo + tag-filter track watched by `[deploy_qa]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployQaTrackConfig {
+    /// Stable track name (e.g. `cloud`, `edge-db`).
+    pub name: String,
+    /// GitHub `owner/repo`.
+    pub repo: String,
+    /// Which release tags this track consumes.
+    #[serde(default)]
+    pub tag_filter: DeployQaTagFilter,
+}
+
+/// Longest grace [`DeployQaConfig::backstop_timeout`] gives the agent runner,
+/// past the live-QA limit it enforces itself, to kill the agent CLI and record
+/// the timed-out run before processing abandons the run.
+const DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE: Duration = Duration::from_secs(60);
+
+/// Time [`DeployQaConfig::backstop_timeout`] allows the agent runner, beyond a
+/// live-QA run's limit and its wait for the CLI's output, to start the CLI and
+/// to kill it or record its run.
+const DEPLOY_QA_BACKSTOP_SLACK: Duration = Duration::from_secs(5);
+
+/// Least grace [`DeployQaConfig::backstop_timeout`] gives the agent runner past
+/// the live-QA limit: long enough to read a finished CLI's output until
+/// [`AgentConfig::OUTPUT_DRAIN_CUTOFF`] and record the run, so a run that
+/// finished within even a one-second limit is never abandoned.
+const DEPLOY_QA_BACKSTOP_MINIMUM_GRACE: Duration =
+    AgentConfig::OUTPUT_DRAIN_CUTOFF.saturating_add(DEPLOY_QA_BACKSTOP_SLACK);
+
+/// Smallest margin [`DeployQaConfig::stale_run_after`] leaves past the live-QA
+/// timeout, covering the backstop grace plus setup and delivery around the
+/// agent run, so a tip with a small timeout is never swept while it runs.
+const DEPLOY_QA_STALE_RUN_MINIMUM_MARGIN: Duration = Duration::from_secs(10 * 60);
+
+/// Live deploy QA for new GitHub release tips.
+///
+/// Distinct from `[regression]`, which watches **bug-fix inclusion** after a
+/// merge. `[deploy_qa]` durable-watches **new tips** and runs live QA against
+/// them, reporting the outcome without opening fix PRs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeployQaConfig {
+    /// Whether the deploy-QA poller is enabled (default: false).
+    pub enabled: bool,
+    /// How often to poll GitHub for new tips (milliseconds, default: 300000).
+    pub poll_interval_ms: u64,
+    /// Skip enqueueing a new tip on a track while a previous attempt is running.
+    pub skip_if_previous_running: bool,
+    /// Discord `#releases` channel to reply under.
+    pub discord_channel_id: Option<String>,
+    /// Path to a GitHub login → Discord user id map (FAIL `@releaser`).
+    pub github_discord_map_path: Option<String>,
+    /// Optional path to the live-QA playbook. When unset, the bundled playbook
+    /// shipped with Claudear is used.
+    pub instructions_path: Option<String>,
+    /// How long one live-QA run may take, in seconds (default: 1800). The agent
+    /// runner kills a run that outlasts the smaller of this and
+    /// `[agent] timeout_secs`, and its tip is marked `errored`. Separate from
+    /// `[qa] answer_timeout_secs` because live QA runs real checks.
+    pub timeout_secs: u64,
+    /// Tracks to poll. Each track is a repo + tag filter.
+    pub tracks: Vec<DeployQaTrackConfig>,
+}
+
+impl DeployQaConfig {
+    /// Poll interval, clamped to at least 1 ms so timers never panic.
+    pub fn effective_poll_interval_ms(&self) -> u64 {
+        self.poll_interval_ms.max(1)
+    }
+
+    /// Live-QA run timeout, clamped to at least 1 second.
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.max(1)
+    }
+
+    /// How long processing waits on a live-QA run before abandoning it.
+    ///
+    /// The agent runner enforces [`Self::effective_timeout_secs`] itself, so
+    /// this only fires when the runner fails to. Past that limit it allows the
+    /// timeout again, capped at a minute, for the runner to kill the agent CLI
+    /// and record the timed-out run first, and never less than the runner may
+    /// take to return a run that finished within the limit, after reading
+    /// output a process that escaped the CLI's process group held open until
+    /// [`AgentConfig::OUTPUT_DRAIN_CUTOFF`].
+    pub fn backstop_timeout(&self) -> Duration {
+        let timeout = Duration::from_secs(self.effective_timeout_secs());
+        let grace = timeout
+            .min(DEPLOY_QA_BACKSTOP_MAXIMUM_GRACE)
+            .max(DEPLOY_QA_BACKSTOP_MINIMUM_GRACE);
+        timeout.saturating_add(grace)
+    }
+
+    /// How long a tip may stay `running` before the poller treats its run as
+    /// orphaned and marks it `errored`: the timeout plus a margin of the
+    /// timeout again, at least ten minutes, so it always outlasts
+    /// [`Self::backstop_timeout`] with setup and delivery.
+    pub fn stale_run_after(&self) -> Duration {
+        let timeout = Duration::from_secs(self.effective_timeout_secs());
+        timeout.saturating_add(timeout.max(DEPLOY_QA_STALE_RUN_MINIMUM_MARGIN))
+    }
+
+    /// Validate `[[deploy_qa.tracks]]`.
+    ///
+    /// Track names must be non-empty, unique, and free of
+    /// [`DeployQaTip::ISSUE_ID_SEPARATOR`] so every synthetic `track:repo:tag`
+    /// issue id maps back to exactly one `(track, tag)`. Repos must be in
+    /// `owner/name` form.
+    pub fn validate(&self) -> Result<()> {
+        let separator = DeployQaTip::ISSUE_ID_SEPARATOR;
+        let mut names = std::collections::HashSet::with_capacity(self.tracks.len());
+        for (index, track) in self.tracks.iter().enumerate() {
+            let name = track.name.as_str();
+            if name.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "deploy_qa.tracks[{index}] (repo '{}') must have a non-empty name",
+                    track.repo
+                )));
+            }
+            if name.contains(separator) {
+                return Err(Error::config(format!(
+                    "deploy_qa track '{name}' must not contain '{separator}' in its name"
+                )));
+            }
+            if !names.insert(name) {
+                return Err(Error::config(format!(
+                    "deploy_qa track name '{name}' is used by more than one track"
+                )));
+            }
+            let (owner, repository) = track.repo.split_once('/').unwrap_or_default();
+            if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+                return Err(Error::config(format!(
+                    "deploy_qa track '{name}' repo '{}' must be in owner/name form",
+                    track.repo
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for DeployQaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 300_000,
+            skip_if_previous_running: true,
+            discord_channel_id: None,
+            github_discord_map_path: None,
+            instructions_path: None,
+            timeout_secs: 1800,
+            tracks: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KnowledgebasesConfig {
@@ -3150,10 +3499,18 @@ impl Config {
             .discord
             .as_ref()
             .is_some_and(|s| s.bot_token.is_some());
+        let has_deploy_qa = self.deploy_qa.enabled && !self.deploy_qa.tracks.is_empty();
 
-        if !has_linear && !has_sentry && !has_jira && !has_gitlab && !has_slack && !has_discord {
+        if !has_linear
+            && !has_sentry
+            && !has_jira
+            && !has_gitlab
+            && !has_slack
+            && !has_discord
+            && !has_deploy_qa
+        {
             return Err(Error::config(
-                "No sources configured. Configure linear, sentry, jira, gitlab, slack, or discord in config file with valid API credentials.",
+                "No sources configured. Configure linear, sentry, jira, gitlab, slack, discord, or deploy_qa tracks in config file with valid API credentials.",
             ));
         }
 
@@ -3193,6 +3550,22 @@ impl Config {
         // Validate prioritisation config only when engine is enabled
         if self.prioritisation.enabled {
             self.prioritisation.validate()?;
+        }
+
+        if self.deploy_qa.enabled {
+            self.deploy_qa.validate()?;
+        }
+
+        let has_github_token = self
+            .github()
+            .token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty());
+        if has_deploy_qa && !has_github_token {
+            return Err(Error::config(
+                "deploy_qa requires a GitHub token to poll release tips. \
+                 Set scm.github.token or CLAUDEAR_GITHUB_TOKEN, or disable deploy_qa.",
+            ));
         }
 
         // Validate TLS config when enabled
@@ -4988,6 +5361,193 @@ monitoring_duration_hours = 12
             assert_eq!(config.regression.monitoring_duration_hours, 12);
             // Defaults should apply for unspecified fields
             assert_eq!(config.regression.sentry_event_threshold, 1);
+        });
+    }
+
+    #[test]
+    fn test_deploy_qa_config_default() {
+        let config = DeployQaConfig::default();
+        assert!(!config.enabled);
+        assert!(config.tracks.is_empty());
+        assert!(config.effective_poll_interval_ms() > 0);
+
+        let zero_interval = DeployQaConfig {
+            poll_interval_ms: 0,
+            ..Default::default()
+        };
+        assert!(zero_interval.effective_poll_interval_ms() >= 1);
+
+        assert!(
+            config.effective_timeout_secs() > QaConfig::default().answer_timeout_secs,
+            "live QA runs real checks, so it must get longer than a Q&A answer by default"
+        );
+
+        let root = Config::default();
+        assert!(!root.deploy_qa.enabled);
+        assert!(root.deploy_qa.tracks.is_empty());
+    }
+
+    /// `[deploy_qa] timeout_secs` values, ascending from zero up to a day.
+    const DEPLOY_QA_TIMEOUTS_SECS: &[u64] = &[0, 1, 30, 1800, 86_400];
+
+    fn deploy_qa_with_timeout(timeout_secs: u64) -> DeployQaConfig {
+        DeployQaConfig {
+            timeout_secs,
+            ..Default::default()
+        }
+    }
+
+    /// The limit the agent runner enforces on a live-QA run under `config`
+    /// when `[agent] timeout_secs` is no shorter.
+    fn runner_limit(config: &DeployQaConfig) -> Duration {
+        Duration::from_secs(config.effective_timeout_secs())
+    }
+
+    #[test]
+    fn test_deploy_qa_backstop_outlasts_a_run_that_finished_within_its_limit() {
+        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
+            let config = deploy_qa_with_timeout(timeout_secs);
+            let longest_finished_run = runner_limit(&config) + AgentConfig::OUTPUT_DRAIN_CUTOFF;
+
+            assert!(
+                config.backstop_timeout() > longest_finished_run,
+                "processing must not abandon a {timeout_secs}s run whose CLI finished within its \
+                 limit while the runner still waits on output a command the CLI started held open"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_stale_sweep_never_catches_a_run_processing_still_waits_on() {
+        for &timeout_secs in DEPLOY_QA_TIMEOUTS_SECS {
+            let config = deploy_qa_with_timeout(timeout_secs);
+            assert!(
+                config.stale_run_after() > config.backstop_timeout(),
+                "a {timeout_secs}s run must be abandoned before its tip can be swept as stale"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_backstop_and_stale_sweep_grow_with_the_limit() {
+        for pair in DEPLOY_QA_TIMEOUTS_SECS.windows(2) {
+            let (shorter_secs, longer_secs) = (pair[0], pair[1]);
+            let shorter = deploy_qa_with_timeout(shorter_secs);
+            let longer = deploy_qa_with_timeout(longer_secs);
+            let extra_limit = runner_limit(&longer) - runner_limit(&shorter);
+
+            assert!(
+                longer.backstop_timeout() >= shorter.backstop_timeout() + extra_limit,
+                "processing must wait on a {longer_secs}s run at least as much longer than on a \
+                 {shorter_secs}s one as its limit is longer"
+            );
+            assert!(
+                longer.stale_run_after() >= shorter.stale_run_after() + extra_limit,
+                "a {longer_secs}s run's tip must be left running at least as much longer than a \
+                 {shorter_secs}s one's as its limit is longer"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_timeouts_saturate_instead_of_overflowing() {
+        let unbounded = deploy_qa_with_timeout(u64::MAX);
+        assert!(unbounded.backstop_timeout() >= Duration::from_secs(u64::MAX));
+        assert!(unbounded.stale_run_after() >= Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn test_deploy_qa_timeout_from_toml() {
+        let config: Config = toml::from_str("[deploy_qa]\ntimeout_secs = 42\n").expect("parse");
+        assert_eq!(config.deploy_qa.timeout_secs, 42);
+        assert_eq!(config.deploy_qa.effective_timeout_secs(), 42);
+    }
+
+    #[test]
+    fn test_deploy_qa_tag_filter_parse_and_match() {
+        assert_eq!(
+            DeployQaTagFilter::parse("any").unwrap(),
+            DeployQaTagFilter::Any
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("suffix:-db").unwrap(),
+            DeployQaTagFilter::Suffix("-db".into())
+        );
+        assert_eq!(
+            DeployQaTagFilter::parse("not_suffix:-db").unwrap(),
+            DeployQaTagFilter::NotSuffix("-db".into())
+        );
+        assert!(DeployQaTagFilter::parse("suffix:").is_err());
+        assert!(DeployQaTagFilter::parse("glob:*").is_err());
+
+        assert!(DeployQaTagFilter::Any.matches("v1.0.0"));
+        assert!(DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3-db"));
+        assert!(!DeployQaTagFilter::Suffix("-db".into()).matches("1.2.3"));
+        assert!(DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3"));
+        assert!(!DeployQaTagFilter::NotSuffix("-db".into()).matches("1.2.3-db"));
+    }
+
+    #[test]
+    fn test_config_deploy_qa_from_toml() {
+        with_env(&[], || {
+            let toml_str = r#"
+workspace = "/tmp/test"
+
+[deploy_qa]
+enabled = true
+poll_interval_ms = 120000
+skip_if_previous_running = false
+discord_channel_id = "990878183580651571"
+github_discord_map_path = "github-discord-map.json"
+instructions_path = "playbooks/deploy_qa.md"
+
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+tag_filter = "any"
+
+[[deploy_qa.tracks]]
+name = "edge-db"
+repo = "appwrite-labs/edge"
+tag_filter = "suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "edge-network"
+repo = "appwrite-labs/edge"
+tag_filter = "not_suffix:-db"
+
+[[deploy_qa.tracks]]
+name = "vibes"
+repo = "appwrite/vibes"
+tag_filter = "any"
+"#;
+            let config = Config::from_toml(toml_str).unwrap();
+            assert!(config.deploy_qa.enabled);
+            assert_eq!(config.deploy_qa.poll_interval_ms, 120_000);
+            assert!(!config.deploy_qa.skip_if_previous_running);
+            assert_eq!(
+                config.deploy_qa.discord_channel_id.as_deref(),
+                Some("990878183580651571")
+            );
+            assert_eq!(config.deploy_qa.tracks.len(), 4);
+            assert_eq!(config.deploy_qa.tracks[0].name, "cloud");
+            assert_eq!(
+                config.deploy_qa.tracks[0].tag_filter,
+                DeployQaTagFilter::Any
+            );
+            assert_eq!(
+                config.deploy_qa.tracks[1].tag_filter,
+                DeployQaTagFilter::Suffix("-db".into())
+            );
+            assert_eq!(
+                config.deploy_qa.tracks[2].tag_filter,
+                DeployQaTagFilter::NotSuffix("-db".into())
+            );
+            assert_eq!(config.deploy_qa.tracks[3].repo, "appwrite/vibes");
+            assert_eq!(
+                config.regression.enabled,
+                RegressionConfig::default().enabled
+            );
         });
     }
 
@@ -7781,6 +8341,184 @@ sms_number = "+1111111111"
         assert!(config.validate().is_err());
     }
 
+    fn deploy_qa_with_tracks(enabled: bool, tracks: &[(&str, &str)]) -> DeployQaConfig {
+        DeployQaConfig {
+            enabled,
+            tracks: tracks
+                .iter()
+                .map(|(name, repo)| DeployQaTrackConfig {
+                    name: name.to_string(),
+                    repo: repo.to_string(),
+                    tag_filter: DeployQaTagFilter::Any,
+                })
+                .collect(),
+            ..DeployQaConfig::default()
+        }
+    }
+
+    fn config_with_linear() -> Config {
+        let mut config = Config::default();
+        config.issues.linear = Some(LinearConfig {
+            enabled: true,
+            api_key: SecretValue::new("key"),
+            ..Default::default()
+        });
+        config
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_accepts_distinct_tracks() {
+        let config = deploy_qa_with_tracks(
+            true,
+            &[
+                ("edge-db", "appwrite-labs/edge"),
+                ("edge-network", "appwrite-labs/edge"),
+                ("vibes", "appwrite/vibes"),
+            ],
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_duplicate_names() {
+        let config = deploy_qa_with_tracks(
+            true,
+            &[
+                ("cloud", "appwrite-labs/cloud"),
+                ("cloud", "appwrite/vibes"),
+            ],
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("'cloud'"), "{error}");
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_empty_names() {
+        for name in ["", "   "] {
+            let config = deploy_qa_with_tracks(true, &[(name, "appwrite-labs/cloud")]);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("appwrite-labs/cloud"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_separator_in_name() {
+        let name = format!("cloud{}prod", DeployQaTip::ISSUE_ID_SEPARATOR);
+        let config = deploy_qa_with_tracks(true, &[(&name, "appwrite-labs/cloud")]);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(&name), "{error}");
+    }
+
+    #[test]
+    fn test_deploy_qa_validate_rejects_malformed_repos() {
+        for repo in ["appwrite", "a/", "/b", "a/b/c", ""] {
+            let config = deploy_qa_with_tracks(true, &[("cloud", repo)]);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("'cloud'"), "{repo}: {error}");
+        }
+    }
+
+    fn scm_with_github_token(token: Option<&str>) -> ScmConfig {
+        ScmConfig {
+            github: GitHubConfig {
+                token: token.map(SecretValue::new),
+                ..GitHubConfig::default()
+            },
+            ..ScmConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_checked_when_enabled() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite")]),
+            ..config_with_linear()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("deploy_qa"), "{error}");
+        assert!(error.contains("'appwrite'"), "{error}");
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_skipped_when_disabled() {
+        let mut config = config_with_linear();
+        config.deploy_qa = deploy_qa_with_tracks(false, &[("", "appwrite")]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_counts_as_source() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]),
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_without_tracks_is_not_a_source() {
+        let config = Config {
+            scm: scm_with_github_token(Some("ghp_token")),
+            deploy_qa: deploy_qa_with_tracks(true, &[]),
+            ..Config::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("No sources configured"), "{error}");
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_requires_github_token() {
+        for base in [Config::default(), config_with_linear()] {
+            for token in [None, Some("")] {
+                let config = Config {
+                    scm: scm_with_github_token(token),
+                    deploy_qa: deploy_qa_with_tracks(true, &[("cloud", "appwrite-labs/cloud")]),
+                    ..base.clone()
+                };
+                let error = config.validate().unwrap_err().to_string();
+                assert!(error.contains("deploy_qa"), "{token:?}: {error}");
+                assert!(error.contains("GitHub token"), "{token:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_accepts_github_token_from_env() {
+        let toml_str = r#"
+workspace = "/tmp/repos"
+
+[deploy_qa]
+enabled = true
+
+[[deploy_qa.tracks]]
+name = "cloud"
+repo = "appwrite-labs/cloud"
+"#;
+        let file = create_temp_toml(toml_str);
+
+        with_env(&[], || {
+            let config = Config::load(file.path()).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("GitHub token"), "{error}");
+        });
+        with_env(&[("CLAUDEAR_GITHUB_TOKEN", "env_token")], || {
+            let config = Config::load(file.path()).unwrap();
+            assert!(config.validate().is_ok());
+        });
+    }
+
+    #[test]
+    fn test_validation_deploy_qa_without_tracks_needs_no_github_token() {
+        let config = Config {
+            scm: scm_with_github_token(None),
+            deploy_qa: deploy_qa_with_tracks(true, &[]),
+            ..config_with_linear()
+        };
+        assert!(config.validate().is_ok());
+    }
+
     #[test]
     fn test_per_source_max_issues_for_jira_and_gitlab() {
         let config = Config {
@@ -8640,8 +9378,6 @@ custom_value = "hello"
             );
         });
     }
-
-    // --- Additional AgentConfig tests ---
 
     #[test]
     fn test_agent_config_default_has_claude_provider() {

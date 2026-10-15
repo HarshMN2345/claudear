@@ -16,10 +16,6 @@
 use std::io;
 use std::path::Path;
 
-// ---------------------------------------------------------------------------
-// Type aliases — one concrete type per platform, transparent to callers
-// ---------------------------------------------------------------------------
-
 #[cfg(not(windows))]
 pub type IpcListener = tokio::net::UnixListener;
 #[cfg(windows)]
@@ -32,10 +28,6 @@ pub type IpcStream = tokio::net::TcpStream;
 
 #[cfg(windows)]
 static SECRET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-// ---------------------------------------------------------------------------
-// Connection helpers
-// ---------------------------------------------------------------------------
 
 /// Connect to an IPC endpoint at `path`.
 ///
@@ -120,6 +112,29 @@ pub fn secret_matches(presented: &str, expected: &str) -> bool {
     difference == 0
 }
 
+/// What tells the endpoint file at a path apart from one another listener later created there.
+///
+/// * **Unix** — the socket file's inode.
+/// * **Windows** — the port file's contents, whose port no other listener can hold while this
+///   one is bound.
+#[cfg(not(windows))]
+pub type Identity = u64;
+#[cfg(windows)]
+pub type Identity = String;
+
+/// The [`Identity`] of the endpoint file at `path`.
+pub fn identity(path: &Path) -> io::Result<Identity> {
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::symlink_metadata(path)?.ino())
+    }
+    #[cfg(windows)]
+    {
+        std::fs::read_to_string(path)
+    }
+}
+
 /// Synchronously check whether a daemon is reachable at `path`.
 ///
 /// Returns `true` if a connection can be established.
@@ -138,28 +153,6 @@ pub fn check_connection(path: &Path) -> bool {
             .unwrap_or(false)
     }
 }
-
-/// Check whether the IPC endpoint at `path` is stale (file exists but nobody
-/// is listening).
-pub fn is_stale(path: &Path) -> bool {
-    if !path.exists() {
-        return false;
-    }
-    #[cfg(not(windows))]
-    {
-        std::os::unix::net::UnixStream::connect(path).is_err()
-    }
-    #[cfg(windows)]
-    {
-        read_endpoint(path)
-            .map(|(port, _)| std::net::TcpStream::connect(("127.0.0.1", port)).is_err())
-            .unwrap_or(true)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Port file helpers (Windows only)
-// ---------------------------------------------------------------------------
 
 #[cfg(windows)]
 fn generate_secret() -> String {

@@ -16,9 +16,10 @@ pub use analytics::{
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteTracker;
 pub use types::{
-    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
-    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
-    StoredIndexedRepo, StoredRepository, UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
+    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
+    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredRepository,
+    UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
@@ -26,14 +27,15 @@ pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AgentExecution, AnalyticsSummary, ErrorPattern, FixAttempt, FixAttemptStats,
-    FixAttemptStatus, IssueEmbedding, IssueTimeline, PrAnalytics, PrRecord, PrReviewRecord,
-    ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck,
-    RegressionWatch, RegressionWatchStatus, SimilarIssue,
+    ActivityLogEntry, AgentExecution, AnalyticsSummary, DeployQaTip, DeployQaTipStatus,
+    ErrorPattern, FixAttempt, FixAttemptStats, FixAttemptStatus, IssueEmbedding, IssueTimeline,
+    PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
+    QaMatch, RegressionCheck, RegressionWatch, RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 /// Maximum allowed length for PR URLs to prevent ReDoS and excessive memory usage.
 const MAX_PR_URL_LENGTH: usize = 2048;
@@ -161,6 +163,13 @@ pub trait AttemptTracker: Send + Sync {
     /// Mark a fix attempt as closed (PR was closed without merging).
     fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()>;
 
+    /// Record a cascade attempt's PR as merged or closed. `mark_merged` and
+    /// `mark_closed` only touch the original attempt, so cascade rows need their id.
+    fn mark_cascade_pr_outcome(&self, attempt_id: i64, merged: bool) -> Result<()> {
+        let _ = (attempt_id, merged);
+        Ok(())
+    }
+
     /// Mark the issue as resolved on the remote source.
     fn mark_resolved(&self, source: &str, issue_id: &str) -> Result<()>;
 
@@ -203,6 +212,18 @@ pub trait AttemptTracker: Send + Sync {
         Ok(())
     }
 
+    /// Mark an issue's attempt as declined because a human refused approval
+    /// to work on it, unless the attempt already has an outcome of its own,
+    /// such as an open or merged PR, an answer or `cannot_fix`.
+    ///
+    /// Default no-op; persistent trackers should set the attempt status to
+    /// `declined` so neither the orphan sweep nor the retry manager runs the
+    /// issue again and asks for approval once more.
+    fn mark_declined(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        let _ = (source, issue_id, reason);
+        Ok(())
+    }
+
     /// Read the routing intent classified for an attempt, if one was stored.
     fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
         let _ = (source, issue_id);
@@ -238,6 +259,40 @@ pub trait AttemptTracker: Send + Sync {
 
     /// Prepare an issue for retry (reset status to pending, clear PR info).
     fn prepare_for_retry(&self, source: &str, issue_id: &str) -> Result<()>;
+
+    /// Mark an attempt failed without spending a retry, for failures that say
+    /// nothing about the issue (rate limits, API outages, restarts).
+    fn mark_failed_uncharged(
+        &self,
+        source: &str,
+        issue_id: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        self.mark_failed(source, issue_id, error_message)
+    }
+
+    /// Record that the run holding `issue_id`'s `pending` attempt is still
+    /// alive, so [`Self::release_orphaned_pending_attempts`] leaves the attempt
+    /// to it however long the run takes.
+    fn record_attempt_heartbeat(&self, source: &str, issue_id: &str) -> Result<()> {
+        let _ = (source, issue_id);
+        Ok(())
+    }
+
+    /// Release `pending` attempts whose runs have shown no sign of life for
+    /// longer than `stale_after`, returning how many were released.
+    ///
+    /// A live run, in whichever process shares the database, refreshes its
+    /// attempt's [heartbeat](Self::record_attempt_heartbeat) well within
+    /// `stale_after`, so an attempt silent for longer was orphaned by a crash,
+    /// restart or shutdown mid-run and would otherwise block its issue for
+    /// good. A run's last sign of life is its latest heartbeat, or when its
+    /// attempt was recorded if that is later, as it is for a retry whose run
+    /// has not sent one yet. A released attempt is failed without spending a
+    /// retry, or closed as `cannot_fix` once it is more than three days old.
+    fn release_orphaned_pending_attempts(&self, _stale_after: Duration) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Activity logging, execution tracking, metrics, analytics, PR review,
@@ -440,6 +495,11 @@ pub trait ActivityStore: Send + Sync {
     }
 
     /// Upsert a PR record. Returns the row ID.
+    ///
+    /// An existing record keeps its review cycle count, which only
+    /// [`Self::charge_pr_review_cycle`] and [`Self::refund_pr_review_cycle`]
+    /// change, so a writer holding a stale copy of the record cannot undo
+    /// cycles another process counted.
     fn upsert_pr(&self, _pr: &PrRecord) -> Result<i64> {
         Ok(0)
     }
@@ -447,6 +507,26 @@ pub trait ActivityStore: Send + Sync {
     /// Get a PR record by URL.
     fn get_pr(&self, _pr_url: &str) -> Result<Option<PrRecord>> {
         Ok(None)
+    }
+
+    /// Count one review-driven rerun of `pr` toward `cap`, returning `false`
+    /// without counting it once `pr` has used all `cap`. A PR with no record
+    /// yet gets one from `pr`'s URL, repository, number, status, creation
+    /// time and links to its attempt and issue. The cap is checked and the
+    /// rerun counted in one step, so processes sharing the store never count
+    /// more than `cap` reruns between them.
+    ///
+    /// Default returns `true` without counting anything: a store that keeps
+    /// no PR records enforces no cap.
+    fn charge_pr_review_cycle(&self, _pr: &PrRecord, _cap: i32) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Give back one review-driven rerun of `pr_url` counted by
+    /// [`Self::charge_pr_review_cycle`], never going below zero, so reruns
+    /// other processes counted meanwhile stay counted.
+    fn refund_pr_review_cycle(&self, _pr_url: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Update a PR's status.
@@ -1414,6 +1494,20 @@ pub trait RepoStore: Send + Sync {
         Ok(None)
     }
 
+    /// Look up a repository id by name, reading only the id. Unlike
+    /// [`Self::get_indexed_repo`] this does not require discovery-index metadata
+    /// (e.g. `last_indexed_at`), so it resolves repos populated purely by code
+    /// indexing (`get_or_create_repo_id`).
+    fn get_repo_id_by_name(&self, _name: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// List every repository's (id, name), reading only those two columns so it
+    /// works for repos lacking discovery-index metadata. For labelling results.
+    fn list_repo_id_names(&self) -> Result<Vec<(i64, String)>> {
+        Ok(Vec::new())
+    }
+
     /// Get or create a repository ID by name.
     fn get_or_create_repo_id(&self, _name: &str) -> Result<i64> {
         Ok(0)
@@ -1728,6 +1822,131 @@ pub trait UserStore: Send + Sync {
     fn delete_user_sessions(&self, _user_id: i64) -> Result<()> {
         Ok(())
     }
+
+    /// Create a personal access token for a user. The caller supplies the hash
+    /// and display prefix; the plaintext is never passed in. Returns the stored
+    /// row (without the secret).
+    fn create_api_token(
+        &self,
+        _user_id: i64,
+        _name: &str,
+        _token_hash: &str,
+        _token_prefix: &str,
+        _expires_at: Option<&str>,
+    ) -> Result<ApiTokenRow> {
+        Err(claudear_core::error::Error::Other(
+            "create_api_token not supported".to_string(),
+        ))
+    }
+
+    /// Resolve the user behind a token hash, if the token exists and has not
+    /// expired. Also bumps the token's `last_used_at`.
+    fn get_user_by_api_token_hash(&self, _token_hash: &str) -> Result<Option<UserRow>> {
+        Ok(None)
+    }
+
+    /// List a user's own tokens (secrets excluded).
+    fn list_api_tokens(&self, _user_id: i64) -> Result<Vec<ApiTokenRow>> {
+        Ok(Vec::new())
+    }
+
+    /// List every token with its owner, for the admin usage view.
+    fn list_all_api_tokens(&self) -> Result<Vec<ApiTokenWithOwner>> {
+        Ok(Vec::new())
+    }
+
+    /// Revoke a token by id. When `user_id` is `Some`, the delete is scoped to
+    /// that owner (self-service); `None` allows an admin to revoke any token.
+    /// Returns whether a row was removed.
+    fn delete_api_token(&self, _id: &str, _user_id: Option<i64>) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+/// Persist last-seen `[deploy_qa]` tips and attempt status (all defaulted).
+///
+/// Separate from [`RegressionStore`] — deploy QA does not share regression
+/// watch rows or status machines.
+pub trait DeployQaStore: Send + Sync {
+    /// Insert or return the existing tip for `(track, tag)`.
+    fn upsert_deploy_qa_tip(&self, _tip: &DeployQaTip) -> Result<DeployQaTip> {
+        Ok(DeployQaTip::new(
+            _tip.track.clone(),
+            _tip.repo.clone(),
+            _tip.tag.clone(),
+        ))
+    }
+
+    /// Fetch a tip by track + tag.
+    fn get_deploy_qa_tip(&self, _track: &str, _tag: &str) -> Result<Option<DeployQaTip>> {
+        Ok(None)
+    }
+
+    /// Fetch a tip by its unique synthetic issue id (`track:repo:tag`).
+    fn get_deploy_qa_tip_by_issue_id(&self, _issue_id: &str) -> Result<Option<DeployQaTip>> {
+        Ok(None)
+    }
+
+    /// Most recently recorded tip for a track (last-seen).
+    fn get_last_seen_deploy_qa_tip(&self, _track: &str) -> Result<Option<DeployQaTip>> {
+        Ok(None)
+    }
+
+    /// Pending tips waiting to be enqueued / picked up by the `deploy_qa` source.
+    fn list_pending_deploy_qa_tips(&self) -> Result<Vec<DeployQaTip>> {
+        Ok(Vec::new())
+    }
+
+    /// Whether the track has a pending or running attempt.
+    fn track_has_in_flight_deploy_qa(&self, _track: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Update tip status (and optional attempt id).
+    fn update_deploy_qa_tip_status(
+        &self,
+        _id: i64,
+        _status: DeployQaTipStatus,
+        _attempt_id: Option<i64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Set tip status (and optional attempt id) only while it is still
+    /// `expected`, returning whether it changed, so a verdict another process
+    /// wrote concurrently is never overwritten and only one process can claim
+    /// a tip.
+    fn update_deploy_qa_tip_status_if(
+        &self,
+        _id: i64,
+        _expected: DeployQaTipStatus,
+        _status: DeployQaTipStatus,
+        _attempt_id: Option<i64>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Mark every tip left `running` for longer than `stale_after` as
+    /// `errored`, returning how many were released.
+    ///
+    /// A live run cannot outlast its agent timeout, so a tip `running` past a
+    /// `stale_after` above that timeout was orphaned by a crash, restart or
+    /// shutdown mid-attempt and would otherwise block its track under
+    /// `skip_if_previous_running`. Fresher tips may still be running in
+    /// another process sharing the database, so they are left alone.
+    fn release_stale_running_deploy_qa_tips(&self, _stale_after: Duration) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Store the Discord release-message / FAIL-thread ids for a tip.
+    fn update_deploy_qa_discord_ids(
+        &self,
+        _id: i64,
+        _message_id: Option<&str>,
+        _thread_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Regression watches and checks (all defaulted).
@@ -1837,6 +2056,7 @@ pub trait FixAttemptTracker:
     + RepoStore
     + UserStore
     + RegressionStore
+    + DeployQaStore
     + ChatStore
     + DiscordStore
 {
@@ -1854,6 +2074,7 @@ impl<T> FixAttemptTracker for T where
         + RepoStore
         + UserStore
         + RegressionStore
+        + DeployQaStore
         + ChatStore
         + DiscordStore
 {
@@ -1944,6 +2165,7 @@ impl SimilarityStore for NoopTracker {}
 impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
+impl DeployQaStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
 impl DiscordStore for NoopTracker {}
 
@@ -2128,6 +2350,7 @@ mod tests {
         impl RepoStore for FullTracker {}
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
+        impl DeployQaStore for FullTracker {}
         impl ChatStore for FullTracker {}
         impl DiscordStore for FullTracker {}
 
@@ -3293,6 +3516,21 @@ mod tests {
                 .get_pr("https://github.com/org/repo/pull/1")
                 .unwrap()
                 .is_none());
+        }
+
+        #[test]
+        fn test_default_charge_pr_review_cycle_enforces_no_cap() {
+            let store = MockActivityExt;
+            let pr = PrRecord::new("https://github.com/org/repo/pull/1", "org/repo", 1);
+            assert!(store.charge_pr_review_cycle(&pr, 0).unwrap());
+        }
+
+        #[test]
+        fn test_default_refund_pr_review_cycle_succeeds() {
+            let store = MockActivityExt;
+            assert!(store
+                .refund_pr_review_cycle("https://github.com/org/repo/pull/1")
+                .is_ok());
         }
 
         #[test]

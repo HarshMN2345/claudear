@@ -1,13 +1,14 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
 use super::types::{
-    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
-    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
-    StoredIndexedRepo, StoredPrReviewComment, StoredRepository, UserRow,
+    ApiTokenRow, ApiTokenWithOwner, ConfidenceBreakdown, DiagnosticCounts,
+    DiscordKnowledgebaseStats, IndexStats, IndexingProgress, InferenceHistoryEntry, InferenceStats,
+    PurgeResult, StoredDependency, StoredDiscordChannel, StoredIndexedRepo, StoredPrReviewComment,
+    StoredRepository, UserRow,
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
+    DeployQaStore, DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
     RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
 use chrono::{DateTime, Utc};
@@ -24,6 +25,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
 const AUDIT_LOG_SUBDIR: &str = "audit";
@@ -73,9 +75,31 @@ impl UserRow {
     }
 }
 
+impl ApiTokenRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            user_id: row.get(1)?,
+            name: row.get(2)?,
+            token_hash: row.get(3)?,
+            token_prefix: row.get(4)?,
+            created_at: row.get(5)?,
+            last_used_at: row.get(6)?,
+            expires_at: row.get(7)?,
+        })
+    }
+}
+
 /// Generate a cryptographically random session token (64 hex chars = 32 bytes).
 fn generate_session_token() -> String {
     let mut bytes = [0u8; 32];
+    rand::rng().fill(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Generate a short random id (32 hex chars = 16 bytes) for an API token row.
+fn generate_token_id() -> String {
+    let mut bytes = [0u8; 16];
     rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
@@ -124,6 +148,16 @@ impl SqliteTracker {
     /// Subscribe to real-time indexing progress updates.
     pub fn subscribe_indexing_progress(&self) -> tokio::sync::watch::Receiver<IndexingProgress> {
         self.indexing_tx.subscribe()
+    }
+
+    /// Whether the vectorlite extension can be loaded for this tracker (and, as a
+    /// side effect, load it on the shared connection). Vector search returns no
+    /// results without it, so callers/tests can gate on this.
+    pub fn vectorlite_available(&self) -> bool {
+        match self.acquire_lock() {
+            Ok(conn) => try_load_vectorlite(&conn).unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     /// Acquire a lock on the database connection, handling poisoned mutex gracefully.
@@ -217,8 +251,7 @@ impl SqliteTracker {
                     .as_chunks::<4>()
                     .0
                     .iter()
-                    .copied()
-                    .map(f32::from_le_bytes)
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect();
                 Ok(Some(embedding))
             }
@@ -361,8 +394,7 @@ impl SqliteTracker {
             blob.as_chunks::<4>()
                 .0
                 .iter()
-                .copied()
-                .map(f32::from_le_bytes)
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect(),
         )
     }
@@ -1101,6 +1133,26 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn mark_cascade_pr_outcome(&self, attempt_id: i64, merged: bool) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        let rows_affected = conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = CASE WHEN ?1 THEN 'merged' ELSE 'closed' END,
+                merged_at = CASE WHEN ?1 THEN datetime('now') ELSE merged_at END
+            WHERE id = ?2 AND cascade_repo IS NOT NULL
+            "#,
+            params![merged, attempt_id],
+        )?;
+        tracing::info!(
+            attempt_id,
+            merged,
+            rows_affected,
+            "Cascade attempt PR outcome recorded"
+        );
+        Ok(())
+    }
+
     fn mark_closed(&self, source: &str, issue_id: &str) -> Result<()> {
         tracing::info!(
             source = source,
@@ -1348,6 +1400,33 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn mark_declined(&self, source: &str, issue_id: &str, reason: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking fix attempt as declined"
+        );
+        let conn = self.acquire_lock()?;
+        // An outcome a run already reached outlives a declined rerun, so a
+        // review rerun refused at approval leaves its open PR watched
+        let rows_affected = conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'declined', error_message = ?
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
+              AND status IN ('pending', 'failed', 'closed')
+            "#,
+            params![reason, source, issue_id],
+        )?;
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            rows_affected = rows_affected,
+            "Fix attempt marked as declined"
+        );
+        Ok(())
+    }
+
     /// Read the routing intent classified for an attempt, if one was stored.
     fn get_routing_intent(&self, source: &str, issue_id: &str) -> Result<Option<String>> {
         let conn = self.acquire_lock()?;
@@ -1438,7 +1517,7 @@ impl AttemptTracker for SqliteTracker {
                    scm_pr_number, status, error_message, merged_at, resolved_at,
                    retry_count, last_retry_at, issue_labels, parent_attempt_id, cascade_repo
             FROM fix_attempts
-            WHERE (status = 'failed' OR status = 'closed')
+            WHERE status = 'failed'
               AND COALESCE(retry_count, 0) < ?
             ORDER BY attempted_at ASC
             "#,
@@ -1485,6 +1564,74 @@ impl AttemptTracker for SqliteTracker {
             )));
         }
         Ok(())
+    }
+
+    fn mark_failed_uncharged(
+        &self,
+        source: &str,
+        issue_id: &str,
+        error_message: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        // A retry run was charged by prepare_for_retry; give that charge back
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'failed',
+                error_message = ?,
+                retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL
+            "#,
+            params![error_message, source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn record_attempt_heartbeat(&self, source: &str, issue_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET heartbeat_at = datetime('now')
+            WHERE source = ? AND issue_id = ? AND cascade_repo IS NULL AND status = 'pending'
+            "#,
+            params![source, issue_id],
+        )?;
+        Ok(())
+    }
+
+    fn release_orphaned_pending_attempts(&self, stale_after: Duration) -> Result<usize> {
+        let stale_before = format!("-{} seconds", stale_after.as_secs());
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction()?;
+        // Cascade rows are resumed by record_cascade_attempt, so they stay pending
+        let released = tx.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'failed',
+                error_message = 'Interrupted before completion (daemon restarted)',
+                retry_count = MAX(COALESCE(retry_count, 0) - 1, 0)
+            WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
+              AND MAX(attempted_at, COALESCE(heartbeat_at, attempted_at)) <= datetime('now', ?1)
+              AND attempted_at > datetime('now', '-3 days')
+            "#,
+            params![stale_before],
+        )?;
+        // Older orphans are stale; retrying them would spend runs on dead issues,
+        // so give them a terminal state that a manual reset can still undo
+        let closed = tx.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'cannot_fix',
+                error_message = 'Interrupted before completion; too old to retry automatically'
+            WHERE status = 'pending' AND reset_at IS NULL AND cascade_repo IS NULL
+              AND MAX(attempted_at, COALESCE(heartbeat_at, attempted_at)) <= datetime('now', ?1)
+              AND attempted_at <= datetime('now', '-3 days')
+            "#,
+            params![stale_before],
+        )?;
+        tx.commit()?;
+        Ok(released + closed)
     }
 
     fn get_stats(&self) -> Result<FixAttemptStats> {
@@ -2519,7 +2666,8 @@ impl ActivityStore for SqliteTracker {
 
     /// Upsert a PR record.
     ///
-    /// Creates a new record or updates an existing one based on pr_url.
+    /// Creates a new record or updates an existing one based on pr_url,
+    /// leaving an existing record's review cycle count as it is.
     fn upsert_pr(&self, pr: &claudear_core::types::PrRecord) -> Result<i64> {
         let conn = self.acquire_lock()?;
 
@@ -2557,7 +2705,6 @@ impl ActivityStore for SqliteTracker {
                 last_review_at = COALESCE(excluded.last_review_at, prs.last_review_at),
                 time_to_first_review_mins = COALESCE(excluded.time_to_first_review_mins, prs.time_to_first_review_mins),
                 time_to_merge_mins = COALESCE(excluded.time_to_merge_mins, prs.time_to_merge_mins),
-                review_cycles = excluded.review_cycles,
                 files_changed = COALESCE(excluded.files_changed, prs.files_changed),
                 lines_added = COALESCE(excluded.lines_added, prs.lines_added),
                 lines_removed = COALESCE(excluded.lines_removed, prs.lines_removed)
@@ -2626,6 +2773,64 @@ impl ActivityStore for SqliteTracker {
 
         let result = stmt.query_row(params![pr_url], Self::row_to_pr_record).ok();
         Ok(result)
+    }
+
+    /// Count one review-driven rerun of a PR below `cap`, creating the PR's
+    /// record in the same transaction when it has none.
+    fn charge_pr_review_cycle(
+        &self,
+        pr: &claudear_core::types::PrRecord,
+        cap: i32,
+    ) -> Result<bool> {
+        let mut connection = self.acquire_lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            r#"
+            INSERT INTO prs (
+                pr_url, scm_repo, pr_number, attempt_id, issue_id, issue_source,
+                status, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(pr_url) DO NOTHING
+            "#,
+            params![
+                pr.pr_url,
+                pr.scm_repo,
+                pr.pr_number,
+                pr.attempt_id,
+                pr.issue_id,
+                pr.issue_source,
+                pr.status,
+                pr.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ],
+        )?;
+        let charged = transaction.execute(
+            r#"
+            UPDATE prs SET
+                review_cycles = COALESCE(review_cycles, 0) + 1,
+                last_review_at = datetime('now'),
+                updated_at = datetime('now')
+            WHERE pr_url = ?1 AND COALESCE(review_cycles, 0) < ?2
+            "#,
+            params![pr.pr_url, cap],
+        )?;
+        transaction.commit()?;
+        Ok(charged > 0)
+    }
+
+    /// Give back one counted review-driven rerun of a PR, never going below
+    /// zero.
+    fn refund_pr_review_cycle(&self, pr_url: &str) -> Result<()> {
+        let connection = self.acquire_lock()?;
+        connection.execute(
+            r#"
+            UPDATE prs SET
+                review_cycles = review_cycles - 1,
+                updated_at = datetime('now')
+            WHERE pr_url = ?1 AND review_cycles > 0
+            "#,
+            params![pr_url],
+        )?;
+        Ok(())
     }
 
     /// Update PR status.
@@ -3716,8 +3921,7 @@ impl EmbeddingStore for SqliteTracker {
                         blob.as_chunks::<4>()
                             .0
                             .iter()
-                            .copied()
-                            .map(f32::from_le_bytes)
+                            .map(|chunk| f32::from_le_bytes(*chunk))
                             .collect(),
                     )
                 });
@@ -4059,6 +4263,26 @@ impl RepoStore for SqliteTracker {
         }
     }
 
+    fn get_repo_id_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.acquire_lock()?;
+        conn.query_row(
+            "SELECT id FROM repositories WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn list_repo_id_names(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare("SELECT id, name FROM repositories")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // --- Analytics ---
 
     fn get_or_create_repo_id(&self, name: &str) -> Result<i64> {
@@ -4290,6 +4514,95 @@ impl UserStore for SqliteTracker {
         conn.execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])?;
         Ok(())
     }
+
+    fn create_api_token(
+        &self,
+        user_id: i64,
+        name: &str,
+        token_hash: &str,
+        token_prefix: &str,
+        expires_at: Option<&str>,
+    ) -> Result<ApiTokenRow> {
+        let id = generate_token_id();
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO api_tokens (id, user_id, name, token_hash, token_prefix, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, user_id, name, token_hash, token_prefix, expires_at],
+        )?;
+        conn.query_row(
+            "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
+             FROM api_tokens WHERE id = ?1",
+            params![id],
+            ApiTokenRow::from_row,
+        )
+        .map_err(Into::into)
+    }
+
+    fn get_user_by_api_token_hash(&self, token_hash: &str) -> Result<Option<UserRow>> {
+        let conn = self.acquire_lock()?;
+        let user = conn
+            .query_row(
+                "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
+                 FROM api_tokens t
+                 JOIN users u ON t.user_id = u.id
+                 WHERE t.token_hash = ?1
+                   AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime('now'))",
+                params![token_hash],
+                UserRow::from_row,
+            )
+            .optional()?;
+        if user.is_some() {
+            conn.execute(
+                "UPDATE api_tokens SET last_used_at = datetime('now') WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+        }
+        Ok(user)
+    }
+
+    fn list_api_tokens(&self, user_id: i64) -> Result<Vec<ApiTokenRow>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, user_id, name, token_hash, token_prefix, created_at, last_used_at, expires_at
+             FROM api_tokens WHERE user_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], ApiTokenRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn list_all_api_tokens(&self) -> Result<Vec<ApiTokenWithOwner>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.user_id, t.name, t.token_hash, t.token_prefix, t.created_at, t.last_used_at, t.expires_at, u.email, u.name
+             FROM api_tokens t JOIN users u ON t.user_id = u.id
+             ORDER BY t.last_used_at DESC NULLS LAST, t.created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ApiTokenWithOwner {
+                    token: ApiTokenRow::from_row(row)?,
+                    user_email: row.get(8)?,
+                    user_name: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn delete_api_token(&self, id: &str, user_id: Option<i64>) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let affected = match user_id {
+            Some(uid) => conn.execute(
+                "DELETE FROM api_tokens WHERE id = ?1 AND user_id = ?2",
+                params![id, uid],
+            )?,
+            None => conn.execute("DELETE FROM api_tokens WHERE id = ?1", params![id])?,
+        };
+        Ok(affected > 0)
+    }
 }
 
 impl RegressionStore for SqliteTracker {
@@ -4342,6 +4655,77 @@ impl RegressionStore for SqliteTracker {
         check: &claudear_core::types::RegressionCheck,
     ) -> Result<i64> {
         SqliteTracker::record_regression_check(self, check)
+    }
+}
+
+impl DeployQaStore for SqliteTracker {
+    fn upsert_deploy_qa_tip(
+        &self,
+        tip: &claudear_core::types::DeployQaTip,
+    ) -> Result<claudear_core::types::DeployQaTip> {
+        SqliteTracker::upsert_deploy_qa_tip(self, tip)
+    }
+
+    fn get_deploy_qa_tip(
+        &self,
+        track: &str,
+        tag: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::get_deploy_qa_tip(self, track, tag)
+    }
+
+    fn get_deploy_qa_tip_by_issue_id(
+        &self,
+        issue_id: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::get_deploy_qa_tip_by_issue_id(self, issue_id)
+    }
+
+    fn get_last_seen_deploy_qa_tip(
+        &self,
+        track: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::get_last_seen_deploy_qa_tip(self, track)
+    }
+
+    fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        SqliteTracker::list_pending_deploy_qa_tips(self)
+    }
+
+    fn track_has_in_flight_deploy_qa(&self, track: &str) -> Result<bool> {
+        SqliteTracker::track_has_in_flight_deploy_qa(self, track)
+    }
+
+    fn update_deploy_qa_tip_status(
+        &self,
+        id: i64,
+        status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
+    ) -> Result<()> {
+        SqliteTracker::update_deploy_qa_tip_status(self, id, status, attempt_id)
+    }
+
+    fn update_deploy_qa_tip_status_if(
+        &self,
+        id: i64,
+        expected: claudear_core::types::DeployQaTipStatus,
+        status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
+    ) -> Result<bool> {
+        SqliteTracker::update_deploy_qa_tip_status_if(self, id, expected, status, attempt_id)
+    }
+
+    fn release_stale_running_deploy_qa_tips(&self, stale_after: Duration) -> Result<usize> {
+        SqliteTracker::release_stale_running_deploy_qa_tips(self, stale_after)
+    }
+
+    fn update_deploy_qa_discord_ids(
+        &self,
+        id: i64,
+        message_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        SqliteTracker::update_deploy_qa_discord_ids(self, id, message_id, thread_id)
     }
 }
 
@@ -5812,8 +6196,7 @@ impl SqliteTracker {
                 blob.as_chunks::<4>()
                     .0
                     .iter()
-                    .copied()
-                    .map(f32::from_le_bytes)
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect(),
             )
         });
@@ -7684,6 +8067,277 @@ impl SqliteTracker {
             check_details: row.get(4)?,
             created_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
         })
+    }
+
+    fn row_to_deploy_qa_tip(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::DeployQaTip> {
+        const STATUS_COLUMN: usize = 8;
+        let status = row
+            .get::<_, String>(STATUS_COLUMN)?
+            .parse::<claudear_core::types::DeployQaTipStatus>()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    STATUS_COLUMN,
+                    rusqlite::types::Type::Text,
+                    error.into(),
+                )
+            })?;
+        Ok(claudear_core::types::DeployQaTip {
+            id: row.get(0)?,
+            track: row.get(1)?,
+            repo: row.get(2)?,
+            tag: row.get(3)?,
+            issue_id: row.get(4)?,
+            published_at: row.get(5)?,
+            html_url: row.get(6)?,
+            author_login: row.get(7)?,
+            status,
+            attempt_id: row.get(9)?,
+            discord_message_id: row.get(10)?,
+            discord_thread_id: row.get(11)?,
+            release_body: row.get(12)?,
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
+        })
+    }
+
+    /// Insert a deploy-QA tip, or return the existing row for `(track, tag)`.
+    pub fn upsert_deploy_qa_tip(
+        &self,
+        tip: &claudear_core::types::DeployQaTip,
+    ) -> Result<claudear_core::types::DeployQaTip> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO deploy_qa_tips (
+                track, repo, tag, issue_id, published_at, html_url, author_login,
+                status, attempt_id, discord_message_id, discord_thread_id, release_body
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(track, tag) DO NOTHING
+            "#,
+            params![
+                tip.track,
+                tip.repo,
+                tip.tag,
+                tip.issue_id,
+                tip.published_at,
+                tip.html_url,
+                tip.author_login,
+                tip.status.to_string(),
+                tip.attempt_id,
+                tip.discord_message_id,
+                tip.discord_thread_id,
+                tip.release_body,
+            ],
+        )?;
+
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE track = ?1 AND tag = ?2
+            "#,
+        )?;
+        stmt.query_row(params![tip.track, tip.tag], Self::row_to_deploy_qa_tip)
+            .map_err(|e| claudear_core::error::Error::storage(e.to_string()))
+    }
+
+    /// Fetch a deploy-QA tip by track + tag.
+    pub fn get_deploy_qa_tip(
+        &self,
+        track: &str,
+        tag: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE track = ?1 AND tag = ?2
+            "#,
+        )?;
+        Ok(stmt
+            .query_row(params![track, tag], Self::row_to_deploy_qa_tip)
+            .optional()?)
+    }
+
+    /// Fetch a deploy-QA tip by its unique synthetic issue id (`track:repo:tag`).
+    pub fn get_deploy_qa_tip_by_issue_id(
+        &self,
+        issue_id: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE issue_id = ?1
+            "#,
+        )?;
+        Ok(stmt
+            .query_row(params![issue_id], Self::row_to_deploy_qa_tip)
+            .optional()?)
+    }
+
+    /// Most recently recorded tip for a track.
+    pub fn get_last_seen_deploy_qa_tip(
+        &self,
+        track: &str,
+    ) -> Result<Option<claudear_core::types::DeployQaTip>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE track = ?1
+            ORDER BY COALESCE(published_at, created_at) DESC, id DESC
+            LIMIT 1
+            "#,
+        )?;
+        Ok(stmt
+            .query_row(params![track], Self::row_to_deploy_qa_tip)
+            .optional()?)
+    }
+
+    /// Tips waiting to be picked up by the `deploy_qa` source.
+    pub fn list_pending_deploy_qa_tips(&self) -> Result<Vec<claudear_core::types::DeployQaTip>> {
+        use claudear_core::types::DeployQaTipStatus;
+
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, track, repo, tag, issue_id, published_at, html_url, author_login,
+                   status, attempt_id, discord_message_id, discord_thread_id, release_body,
+                   created_at, updated_at
+            FROM deploy_qa_tips
+            WHERE status = ?1
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let tips = stmt
+            .query_map(
+                params![DeployQaTipStatus::Pending.to_string()],
+                Self::row_to_deploy_qa_tip,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tips)
+    }
+
+    /// Whether the track has a pending or running attempt.
+    pub fn track_has_in_flight_deploy_qa(&self, track: &str) -> Result<bool> {
+        use claudear_core::types::DeployQaTipStatus;
+
+        let conn = self.acquire_lock()?;
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM deploy_qa_tips
+            WHERE track = ?1 AND status IN (?2, ?3)
+            "#,
+            params![
+                track,
+                DeployQaTipStatus::Pending.to_string(),
+                DeployQaTipStatus::Running.to_string()
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Update tip status and optional attempt id.
+    pub fn update_deploy_qa_tip_status(
+        &self,
+        id: i64,
+        status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET status = ?1,
+                attempt_id = COALESCE(?2, attempt_id),
+                updated_at = datetime('now')
+            WHERE id = ?3
+            "#,
+            params![status.to_string(), attempt_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Set tip status (and optional attempt id) only while it is still
+    /// `expected`; returns whether a row changed.
+    pub fn update_deploy_qa_tip_status_if(
+        &self,
+        id: i64,
+        expected: claudear_core::types::DeployQaTipStatus,
+        status: claudear_core::types::DeployQaTipStatus,
+        attempt_id: Option<i64>,
+    ) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let changed = conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET status = ?1,
+                attempt_id = COALESCE(?2, attempt_id),
+                updated_at = datetime('now')
+            WHERE id = ?3 AND status = ?4
+            "#,
+            params![status.to_string(), attempt_id, id, expected.to_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Mark every tip left `running` for longer than `stale_after` as
+    /// `errored`; returns how many were released.
+    pub fn release_stale_running_deploy_qa_tips(&self, stale_after: Duration) -> Result<usize> {
+        use claudear_core::types::DeployQaTipStatus;
+
+        let conn = self.acquire_lock()?;
+        let released = conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET status = ?1,
+                updated_at = datetime('now')
+            WHERE status = ?2 AND updated_at < datetime('now', ?3)
+            "#,
+            params![
+                DeployQaTipStatus::Errored.to_string(),
+                DeployQaTipStatus::Running.to_string(),
+                format!("-{} seconds", stale_after.as_secs())
+            ],
+        )?;
+        Ok(released)
+    }
+
+    /// Store Discord release-message / FAIL-thread ids.
+    pub fn update_deploy_qa_discord_ids(
+        &self,
+        id: i64,
+        message_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE deploy_qa_tips
+            SET discord_message_id = COALESCE(?1, discord_message_id),
+                discord_thread_id = COALESCE(?2, discord_thread_id),
+                updated_at = datetime('now')
+            WHERE id = ?3
+            "#,
+            params![message_id, thread_id, id],
+        )?;
+        Ok(())
     }
 }
 
@@ -10395,6 +11049,95 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_declined_takes_attempts_out_of_the_sweep_and_the_retry_queue() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "new", "CLOUD-1").unwrap();
+        tracker
+            .record_attempt("sentry", "retrying", "CLOUD-2")
+            .unwrap();
+        tracker
+            .mark_failed("sentry", "retrying", "agent crashed")
+            .unwrap();
+        age_attempt(&tracker, "new", 2 * 60 * 60);
+
+        for issue_id in ["new", "retrying"] {
+            tracker
+                .mark_declined("sentry", issue_id, "Approval declined")
+                .unwrap();
+        }
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a declined attempt is no longer pending, so no sweep may release it"
+        );
+        assert!(
+            tracker.get_retryable_issues(2).unwrap().is_empty(),
+            "a declined attempt must never be queued for a retry"
+        );
+        for issue_id in ["new", "retrying"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Declined, "{issue_id}");
+            assert_eq!(
+                attempt.error_message.as_deref(),
+                Some("Approval declined"),
+                "{issue_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mark_declined_keeps_outcomes_a_run_already_reached() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("github", "open_pr", "GH-1").unwrap();
+        tracker
+            .mark_success("github", "open_pr", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        tracker.record_attempt("github", "merged", "GH-2").unwrap();
+        tracker
+            .mark_success("github", "merged", "https://github.com/org/repo/pull/2")
+            .unwrap();
+        tracker.mark_merged("github", "merged").unwrap();
+        tracker
+            .record_attempt("github", "answered", "GH-3")
+            .unwrap();
+        tracker
+            .mark_answered("github", "answered", "Use the v2 endpoint", None)
+            .unwrap();
+        tracker.record_attempt("github", "gave_up", "GH-4").unwrap();
+        tracker
+            .mark_cannot_fix("github", "gave_up", "Max retries (2) reached")
+            .unwrap();
+
+        for (issue_id, reached) in [
+            ("open_pr", FixAttemptStatus::Success),
+            ("merged", FixAttemptStatus::Merged),
+            ("answered", FixAttemptStatus::Answered),
+            ("gave_up", FixAttemptStatus::CannotFix),
+        ] {
+            tracker
+                .mark_declined("github", issue_id, "Approval declined")
+                .unwrap();
+            assert_eq!(
+                tracker
+                    .get_attempt("github", issue_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                reached,
+                "declining a rerun of {issue_id} must keep the outcome its attempt already reached"
+            );
+        }
+        assert_eq!(
+            tracker.get_pending_prs().unwrap().len(),
+            1,
+            "a review rerun declined at approval must leave its open PR watched"
+        );
+    }
+
+    #[test]
     fn test_get_retryable_issues() {
         let tracker = SqliteTracker::in_memory().unwrap();
 
@@ -10408,7 +11151,7 @@ mod tests {
         tracker.increment_retry("linear", "2").unwrap();
         tracker.increment_retry("linear", "2").unwrap();
 
-        // Closed - retryable
+        // Closed - a human rejected the PR, not retryable
         tracker.record_attempt("linear", "3", "PROJ-3").unwrap();
         tracker
             .mark_success("linear", "3", "https://github.com/org/repo/pull/1")
@@ -10422,34 +11165,300 @@ mod tests {
             .unwrap();
 
         let retryable = tracker.get_retryable_issues(3).unwrap();
-        assert_eq!(retryable.len(), 3);
+        assert_eq!(retryable.len(), 2);
+        assert!(retryable.iter().all(|a| a.issue_id != "3"));
 
         // With max 2 retries, issue 2 should be excluded
         let retryable = tracker.get_retryable_issues(2).unwrap();
-        assert_eq!(retryable.len(), 2);
+        assert_eq!(retryable.len(), 1);
     }
 
     #[test]
-    fn test_prepare_for_retry() {
+    fn test_mark_failed_uncharged_refunds_the_retry() {
         let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "1", "CLOUD-1").unwrap();
+        tracker.mark_failed("sentry", "1", "boom").unwrap();
+        tracker.prepare_for_retry("sentry", "1").unwrap();
 
-        tracker.record_attempt("linear", "123", "PROJ-123").unwrap();
         tracker
-            .mark_success("linear", "123", "https://github.com/org/repo/pull/42")
+            .mark_failed_uncharged("sentry", "1", "Claude rate limit hit")
             .unwrap();
-        tracker.mark_closed("linear", "123").unwrap();
 
-        // Prepare for retry should reset to pending and increment retry_count
-        tracker.prepare_for_retry("linear", "123").unwrap();
+        let attempt = tracker.get_attempt("sentry", "1").unwrap().unwrap();
+        assert_eq!(attempt.status, FixAttemptStatus::Failed);
+        assert_eq!(attempt.retry_count, 0);
+        assert_eq!(
+            attempt.error_message.as_deref(),
+            Some("Claude rate limit hit")
+        );
+    }
 
-        let attempt = tracker.get_attempt("linear", "123").unwrap().unwrap();
-        assert_eq!(attempt.status, FixAttemptStatus::Pending);
-        assert!(attempt.pr_url.is_none());
-        assert!(attempt.scm_repo.is_none());
-        assert!(attempt.scm_pr_number.is_none());
-        assert!(attempt.error_message.is_none());
-        assert_eq!(attempt.retry_count, 1);
-        assert!(attempt.last_retry_at.is_some());
+    #[test]
+    fn test_mark_failed_uncharged_never_goes_negative() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("sentry", "1", "CLOUD-1").unwrap();
+        tracker
+            .mark_failed_uncharged("sentry", "1", "rate limit")
+            .unwrap();
+
+        let attempt = tracker.get_attempt("sentry", "1").unwrap().unwrap();
+        assert_eq!(attempt.retry_count, 0);
+    }
+
+    /// How long the orphan-release tests treat a run as possibly live.
+    const ORPHANED_RUN_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+    /// Move the attempt rows of `issue_id` `seconds` into the past, as if
+    /// their runs started that long ago.
+    fn age_attempt(tracker: &SqliteTracker, issue_id: &str, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE fix_attempts SET attempted_at = datetime('now', ?1) WHERE issue_id = ?2",
+                params![format!("-{seconds} seconds"), issue_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_frees_stale_rows_only() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "orphaned", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "abandoned", "CLOUD-2")
+            .unwrap();
+        tracker.record_attempt("sentry", "done", "CLOUD-3").unwrap();
+        tracker
+            .mark_success("sentry", "done", "https://github.com/org/repo/pull/1")
+            .unwrap();
+        age_attempt(&tracker, "orphaned", 2 * 60 * 60);
+        age_attempt(&tracker, "abandoned", 30 * 24 * 60 * 60);
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            2,
+            "both orphans must be released"
+        );
+
+        let retryable: Vec<String> = tracker
+            .get_retryable_issues(2)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.issue_id)
+            .collect();
+        assert_eq!(
+            retryable,
+            vec!["orphaned".to_string()],
+            "an orphan from the last few days goes back into the retry queue"
+        );
+        let abandoned = tracker.get_attempt("sentry", "abandoned").unwrap().unwrap();
+        assert_eq!(
+            abandoned.status,
+            FixAttemptStatus::CannotFix,
+            "an older orphan is closed out instead of staying pending forever"
+        );
+        let done = tracker.get_attempt("sentry", "done").unwrap().unwrap();
+        assert_eq!(done.status, FixAttemptStatus::Success);
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_live_runs_alone() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "just_started", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "within_threshold", "CLOUD-2")
+            .unwrap();
+        age_attempt(&tracker, "within_threshold", 50 * 60);
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a run younger than the threshold may still be live in another process"
+        );
+        for issue_id in ["just_started", "within_threshold"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Pending, "{issue_id}");
+            assert!(attempt.error_message.is_none(), "{issue_id}");
+        }
+    }
+
+    /// Set the heartbeat of `issue_id`'s attempt `seconds` into the past, as if
+    /// its run last showed it was alive then.
+    fn beat_attempt(tracker: &SqliteTracker, issue_id: &str, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE fix_attempts SET heartbeat_at = datetime('now', ?1) WHERE issue_id = ?2",
+                params![format!("-{seconds} seconds"), issue_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_runs_that_still_beat_alone() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "awaiting_approval", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "long_agent_run", "CLOUD-2")
+            .unwrap();
+        age_attempt(&tracker, "awaiting_approval", 2 * 24 * 60 * 60);
+        age_attempt(&tracker, "long_agent_run", 30 * 24 * 60 * 60);
+        beat_attempt(&tracker, "awaiting_approval", 0);
+        beat_attempt(&tracker, "long_agent_run", 0);
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            0,
+            "a run that still shows it is alive is live, however long ago it started"
+        );
+        for issue_id in ["awaiting_approval", "long_agent_run"] {
+            let attempt = tracker.get_attempt("sentry", issue_id).unwrap().unwrap();
+            assert_eq!(attempt.status, FixAttemptStatus::Pending, "{issue_id}");
+            assert!(attempt.error_message.is_none(), "{issue_id}");
+        }
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_frees_runs_that_stopped_beating() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("sentry", "crashed", "CLOUD-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "never_beat", "CLOUD-2")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "retried", "CLOUD-3")
+            .unwrap();
+        age_attempt(&tracker, "crashed", 3 * 60 * 60);
+        beat_attempt(&tracker, "crashed", 2 * 60 * 60);
+        age_attempt(&tracker, "never_beat", 2 * 60 * 60);
+        age_attempt(&tracker, "retried", 3 * 60 * 60);
+        beat_attempt(&tracker, "retried", 2 * 60 * 60);
+        tracker
+            .mark_failed("sentry", "retried", "agent crashed")
+            .unwrap();
+        tracker.prepare_for_retry("sentry", "retried").unwrap();
+
+        assert_eq!(
+            tracker
+                .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+                .unwrap(),
+            2,
+            "runs silent for longer than the window must be released"
+        );
+        let mut retryable: Vec<String> = tracker
+            .get_retryable_issues(2)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.issue_id)
+            .collect();
+        retryable.sort();
+        assert_eq!(
+            retryable,
+            vec!["crashed".to_string(), "never_beat".to_string()],
+            "a run whose heartbeat went stale, or that never sent one since it was recorded \
+             long ago, goes back into the retry queue"
+        );
+        assert_eq!(
+            tracker
+                .get_attempt("sentry", "retried")
+                .unwrap()
+                .unwrap()
+                .status,
+            FixAttemptStatus::Pending,
+            "a retry that just started must not be swept for the heartbeat its previous run \
+             left behind"
+        );
+    }
+
+    #[test]
+    fn test_release_orphaned_pending_attempts_leaves_cascades_resumable() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("discord", "1", "D-1").unwrap();
+        tracker
+            .mark_success("discord", "1", "https://github.com/org/app/pull/1")
+            .unwrap();
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        let cascade = "git@github.com:org/lib.git";
+        let child = tracker
+            .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
+            .unwrap();
+        age_attempt(&tracker, "1", 2 * 60 * 60);
+
+        tracker
+            .release_orphaned_pending_attempts(ORPHANED_RUN_STALE_AFTER)
+            .unwrap();
+
+        assert!(
+            tracker.get_retryable_issues(2).unwrap().is_empty(),
+            "a cascade row must not be pushed into the retry queue, which would rerun the \
+             whole parent issue"
+        );
+        let resumed = tracker
+            .record_cascade_attempt("discord", "1", "D-1", parent.id, cascade)
+            .unwrap();
+        assert_eq!(
+            resumed, child,
+            "the next cascade trigger must resume the same row"
+        );
+        tracker
+            .update_attempt_pr(resumed, "https://github.com/org/lib/pull/7", "org/lib", 7)
+            .unwrap();
+        assert!(tracker
+            .get_pending_prs()
+            .unwrap()
+            .iter()
+            .any(|a| a.id == child));
+    }
+
+    #[test]
+    fn test_mark_cascade_pr_outcome_updates_the_cascade_row_not_the_parent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("discord", "1", "D-1").unwrap();
+        tracker
+            .mark_success("discord", "1", "https://github.com/org/app/pull/1")
+            .unwrap();
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        let child = tracker
+            .record_cascade_attempt(
+                "discord",
+                "1",
+                "D-1",
+                parent.id,
+                "git@github.com:org/lib.git",
+            )
+            .unwrap();
+        tracker
+            .update_attempt_pr(child, "https://github.com/org/lib/pull/120", "org/lib", 120)
+            .unwrap();
+
+        tracker.mark_cascade_pr_outcome(child, true).unwrap();
+
+        // The merged cascade PR stops being polled; the parent's own PR still is
+        let pending: Vec<i64> = tracker
+            .get_pending_prs()
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(pending, vec![parent.id]);
+        let parent = tracker.get_attempt("discord", "1").unwrap().unwrap();
+        assert_eq!(parent.status, FixAttemptStatus::Success);
     }
 
     #[test]
@@ -10773,6 +11782,337 @@ mod tests {
 
         let watch_id = tracker.create_regression_watch(&watch).unwrap();
         assert!(watch_id > 0);
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_last_seen_and_no_overwrite() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let mut first = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0");
+        first.published_at = Some("2026-01-01T00:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&first).unwrap();
+
+        let mut second = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.1.0");
+        second.published_at = Some("2026-02-01T00:00:00Z".into());
+        tracker.upsert_deploy_qa_tip(&second).unwrap();
+
+        let last = tracker
+            .get_last_seen_deploy_qa_tip("cloud")
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.tag, "1.1.0");
+
+        // Same tag must not overwrite status.
+        tracker
+            .update_deploy_qa_tip_status(last.id, DeployQaTipStatus::Running, Some(9))
+            .unwrap();
+        let mut again = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.1.0");
+        again.status = DeployQaTipStatus::Pending;
+        let stored = tracker.upsert_deploy_qa_tip(&again).unwrap();
+        assert_eq!(stored.status, DeployQaTipStatus::Running);
+        assert_eq!(stored.attempt_id, Some(9));
+        assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
+        assert_eq!(tracker.list_pending_deploy_qa_tips().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_unknown_status_is_an_error() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let stored = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0"))
+            .unwrap();
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET status = 'unrecognised' WHERE id = ?1",
+                params![stored.id],
+            )
+            .unwrap();
+
+        assert!(tracker.get_deploy_qa_tip("cloud", "1.0.0").is_err());
+        assert!(tracker
+            .get_deploy_qa_tip_by_issue_id(&stored.issue_id)
+            .is_err());
+        assert!(tracker.get_last_seen_deploy_qa_tip("cloud").is_err());
+    }
+
+    #[test]
+    fn test_deploy_qa_tip_issue_id_is_unique() {
+        use claudear_core::types::DeployQaTip;
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let first = DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.0.0");
+        tracker.upsert_deploy_qa_tip(&first).unwrap();
+
+        let mut colliding = DeployQaTip::new("cloud", "appwrite-labs/cloud", "2.0.0");
+        colliding.issue_id = first.issue_id.clone();
+        assert!(tracker.upsert_deploy_qa_tip(&colliding).is_err());
+    }
+
+    #[test]
+    fn test_errored_deploy_qa_tip_round_trips_and_unblocks_track() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let tip = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+            .unwrap();
+
+        tracker
+            .update_deploy_qa_tip_status(tip.id, DeployQaTipStatus::Running, Some(7))
+            .unwrap();
+        assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
+
+        tracker
+            .update_deploy_qa_tip_status(tip.id, DeployQaTipStatus::Errored, None)
+            .unwrap();
+        let stored = tracker
+            .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, DeployQaTipStatus::Errored);
+        assert_eq!(stored.attempt_id, Some(7));
+        assert!(!tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
+    }
+
+    #[test]
+    fn test_update_deploy_qa_tip_status_if_only_applies_to_expected_status() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let stored = |tip: &DeployQaTip| {
+            tracker
+                .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+                .unwrap()
+                .unwrap()
+        };
+        let concluded = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+            .unwrap();
+        tracker
+            .update_deploy_qa_tip_status(concluded.id, DeployQaTipStatus::Running, Some(7))
+            .unwrap();
+        tracker
+            .update_deploy_qa_tip_status(concluded.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+
+        let changed = tracker
+            .update_deploy_qa_tip_status_if(
+                concluded.id,
+                DeployQaTipStatus::Running,
+                DeployQaTipStatus::Errored,
+                None,
+            )
+            .unwrap();
+
+        assert!(!changed, "a tip no longer running must be left alone");
+        assert_eq!(
+            stored(&concluded).status,
+            DeployQaTipStatus::Verified,
+            "a verdict recorded concurrently must not be overwritten"
+        );
+
+        let unfinished = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.4"))
+            .unwrap();
+        tracker
+            .update_deploy_qa_tip_status(unfinished.id, DeployQaTipStatus::Running, Some(8))
+            .unwrap();
+
+        let changed = tracker
+            .update_deploy_qa_tip_status_if(
+                unfinished.id,
+                DeployQaTipStatus::Running,
+                DeployQaTipStatus::Errored,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            changed,
+            "a tip still in the expected status must transition"
+        );
+        let released = stored(&unfinished);
+        assert_eq!(released.status, DeployQaTipStatus::Errored);
+        assert_eq!(released.attempt_id, Some(8));
+        assert!(!tracker
+            .update_deploy_qa_tip_status_if(
+                i64::MAX,
+                DeployQaTipStatus::Running,
+                DeployQaTipStatus::Errored,
+                None,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn test_update_deploy_qa_tip_status_if_claims_once_and_links_attempt() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let tip = tracker
+            .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", "1.2.3"))
+            .unwrap();
+        let stored = || {
+            tracker
+                .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+                .unwrap()
+                .unwrap()
+        };
+        let claim = || {
+            tracker
+                .update_deploy_qa_tip_status_if(
+                    tip.id,
+                    DeployQaTipStatus::Pending,
+                    DeployQaTipStatus::Running,
+                    None,
+                )
+                .unwrap()
+        };
+        let link_attempt = |attempt_id| {
+            tracker
+                .update_deploy_qa_tip_status_if(
+                    tip.id,
+                    DeployQaTipStatus::Running,
+                    DeployQaTipStatus::Running,
+                    Some(attempt_id),
+                )
+                .unwrap()
+        };
+
+        assert!(claim(), "a pending tip should be claimed");
+        assert!(!claim(), "a claimed tip must not be claimed again");
+        assert!(link_attempt(7), "a running tip should take its attempt");
+        let claimed = stored();
+        assert_eq!(claimed.status, DeployQaTipStatus::Running);
+        assert_eq!(claimed.attempt_id, Some(7));
+
+        tracker
+            .update_deploy_qa_tip_status(tip.id, DeployQaTipStatus::Verified, None)
+            .unwrap();
+
+        assert!(!link_attempt(8), "a tip with a verdict must be left alone");
+        let concluded = stored();
+        assert_eq!(
+            concluded.status,
+            DeployQaTipStatus::Verified,
+            "linking an attempt must not overwrite a verdict"
+        );
+        assert_eq!(
+            concluded.attempt_id,
+            Some(7),
+            "a tip that left the expected status must keep its attempt"
+        );
+    }
+
+    fn age_deploy_qa_tip(tracker: &SqliteTracker, id: i64, seconds: u64) {
+        tracker
+            .acquire_lock()
+            .unwrap()
+            .execute(
+                "UPDATE deploy_qa_tips SET updated_at = datetime('now', ?1) WHERE id = ?2",
+                params![format!("-{seconds} seconds"), id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_release_stale_running_deploy_qa_tips_errors_only_stale_running_tips() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let stale_after = Duration::from_secs(1800);
+        let seeded = [
+            ("cloud", "1.0.0", DeployQaTipStatus::Pending),
+            ("cloud", "1.1.0", DeployQaTipStatus::Running),
+            ("cloud", "1.2.0", DeployQaTipStatus::Verified),
+            ("cloud", "1.3.0", DeployQaTipStatus::Unverified),
+            ("cloud", "1.4.0", DeployQaTipStatus::Failed),
+            ("cloud", "1.5.0", DeployQaTipStatus::Errored),
+            ("edge", "2.0.0", DeployQaTipStatus::Running),
+        ];
+        for (track, tag, status) in seeded {
+            let mut tip = DeployQaTip::new(track, "appwrite-labs/cloud", tag);
+            tip.status = status;
+            tip.attempt_id = Some(3);
+            let stored = tracker.upsert_deploy_qa_tip(&tip).unwrap();
+            age_deploy_qa_tip(&tracker, stored.id, 3600);
+        }
+
+        assert_eq!(
+            tracker
+                .release_stale_running_deploy_qa_tips(stale_after)
+                .unwrap(),
+            2,
+            "only running tips past the threshold should be released"
+        );
+
+        for (track, tag, status) in seeded {
+            let expected = match status {
+                DeployQaTipStatus::Running => DeployQaTipStatus::Errored,
+                other => other,
+            };
+            let stored = tracker.get_deploy_qa_tip(track, tag).unwrap().unwrap();
+            assert_eq!(stored.status, expected, "{track} {tag}");
+            assert_eq!(stored.attempt_id, Some(3), "{track} {tag}");
+        }
+        assert!(
+            !tracker.track_has_in_flight_deploy_qa("edge").unwrap(),
+            "a released tip must no longer block its track"
+        );
+        assert_eq!(
+            tracker
+                .release_stale_running_deploy_qa_tips(stale_after)
+                .unwrap(),
+            0,
+            "a second sweep must find nothing left to release"
+        );
+    }
+
+    #[test]
+    fn test_release_stale_running_deploy_qa_tips_leaves_live_runs_alone() {
+        use claudear_core::types::{DeployQaTip, DeployQaTipStatus};
+
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let stale_after = Duration::from_secs(1800);
+        let claim = |tag: &str| {
+            let tip = tracker
+                .upsert_deploy_qa_tip(&DeployQaTip::new("cloud", "appwrite-labs/cloud", tag))
+                .unwrap();
+            assert!(tracker
+                .update_deploy_qa_tip_status_if(
+                    tip.id,
+                    DeployQaTipStatus::Pending,
+                    DeployQaTipStatus::Running,
+                    Some(5),
+                )
+                .unwrap());
+            tip
+        };
+        let just_claimed = claim("1.0.0");
+        let within_threshold = claim("1.1.0");
+        age_deploy_qa_tip(&tracker, within_threshold.id, 1700);
+
+        assert_eq!(
+            tracker
+                .release_stale_running_deploy_qa_tips(stale_after)
+                .unwrap(),
+            0,
+            "a run younger than the threshold may still be live in another process"
+        );
+        for tip in [&just_claimed, &within_threshold] {
+            let stored = tracker
+                .get_deploy_qa_tip_by_issue_id(&tip.issue_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.status, DeployQaTipStatus::Running, "{}", tip.tag);
+            assert_eq!(stored.attempt_id, Some(5), "{}", tip.tag);
+        }
+        assert!(tracker.track_has_in_flight_deploy_qa("cloud").unwrap());
     }
 
     #[test]
@@ -12118,6 +13458,53 @@ mod tests {
             .unwrap();
         let user = tracker.get_session_user(&token).unwrap();
         assert!(user.is_none());
+    }
+
+    #[test]
+    fn test_api_token_expiry_is_enforced_on_lookup() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("tok@test.com", "hash", "Tok", "viewer")
+            .unwrap();
+
+        // Past expiry → not resolvable.
+        tracker
+            .create_api_token(
+                user_id,
+                "past",
+                "hash_past",
+                "cldr_p",
+                Some("2000-01-01 00:00:00"),
+            )
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_past")
+            .unwrap()
+            .is_none());
+
+        // Future expiry → resolvable.
+        tracker
+            .create_api_token(
+                user_id,
+                "future",
+                "hash_future",
+                "cldr_f",
+                Some("2099-12-31 23:59:59"),
+            )
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_future")
+            .unwrap()
+            .is_some());
+
+        // No expiry → resolvable.
+        tracker
+            .create_api_token(user_id, "forever", "hash_forever", "cldr_x", None)
+            .unwrap();
+        assert!(tracker
+            .get_user_by_api_token_hash("hash_forever")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -16730,6 +18117,110 @@ mod tests {
         assert_eq!(fetched.status, "merged");
         assert_eq!(fetched.approvals_count, 2);
         assert_eq!(fetched.comments_count, 5);
+    }
+
+    #[test]
+    fn test_upsert_pr_keeps_counted_review_cycles() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        tracker.upsert_pr(&pr).unwrap();
+        let mut stale = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+        stale.status = "merged".to_string();
+        tracker.upsert_pr(&stale).unwrap();
+
+        let fetched = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+        assert_eq!(fetched.status, "merged");
+        assert_eq!(
+            fetched.review_cycles, 1,
+            "a stale copy of the record must not undo a counted review cycle"
+        );
+    }
+
+    #[test]
+    fn test_charge_pr_review_cycle_creates_a_missing_record() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = claudear_core::types::PrRecord::for_issue(
+            "https://github.com/org/repo/pull/1",
+            "org/repo",
+            1,
+            "linear",
+            "ISSUE-1",
+        );
+
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+
+        let fetched = tracker.get_pr(&pr.pr_url).unwrap().unwrap();
+        assert_eq!(fetched.scm_repo, "org/repo");
+        assert_eq!(fetched.pr_number, 1);
+        assert_eq!(fetched.issue_source.as_deref(), Some("linear"));
+        assert_eq!(fetched.issue_id.as_deref(), Some("ISSUE-1"));
+        assert_eq!(fetched.status, "open");
+        assert_eq!(fetched.review_cycles, 1);
+        assert!(fetched.last_review_at.is_some());
+    }
+
+    #[test]
+    fn test_charge_pr_review_cycle_counts_nothing_past_the_cap() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let cap = 2;
+
+        for _ in 0..cap {
+            assert!(tracker.charge_pr_review_cycle(&pr, cap).unwrap());
+        }
+
+        assert!(
+            !tracker.charge_pr_review_cycle(&pr, cap).unwrap(),
+            "a PR that used every review cycle must not be charged another"
+        );
+        assert_eq!(
+            tracker.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles,
+            cap
+        );
+    }
+
+    #[test]
+    fn test_refund_pr_review_cycle_gives_back_one_cycle_and_stops_at_zero() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+        let review_cycles = || tracker.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles;
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+        assert!(tracker.charge_pr_review_cycle(&pr, 3).unwrap());
+
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert_eq!(review_cycles(), 1);
+
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        tracker.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert_eq!(
+            review_cycles(),
+            0,
+            "a refund must never take the count below zero"
+        );
+    }
+
+    #[test]
+    fn test_review_cycles_are_shared_by_processes_on_one_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claudear.db");
+        let daemon = SqliteTracker::new(&path).unwrap();
+        let webhook = SqliteTracker::new(path).unwrap();
+        let pr = make_pr_record("https://github.com/org/repo/pull/1", "org/repo", 1);
+
+        assert!(daemon.charge_pr_review_cycle(&pr, 1).unwrap());
+        assert!(
+            !webhook.charge_pr_review_cycle(&pr, 1).unwrap(),
+            "a cycle the daemon counted must count against the webhook process's cap"
+        );
+
+        daemon.refund_pr_review_cycle(&pr.pr_url).unwrap();
+        assert!(
+            webhook.charge_pr_review_cycle(&pr, 1).unwrap(),
+            "a cycle the daemon gave back must be free for the webhook process"
+        );
+        assert_eq!(daemon.get_pr(&pr.pr_url).unwrap().unwrap().review_cycles, 1);
     }
 
     #[test]

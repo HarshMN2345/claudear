@@ -3,6 +3,9 @@ name = "claudear-config"
 version = "1.0.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 claudear-core = { workspace = true }
 
