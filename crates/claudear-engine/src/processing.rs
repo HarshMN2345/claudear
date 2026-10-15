@@ -179,12 +179,15 @@ pub(crate) fn qa_scratch_directory() -> std::path::PathBuf {
 /// directory, never a symbolic link that could lead anywhere, and on Unix is
 /// [restricted to its owner](restrict_to_owner), who must be the current user.
 fn create_private_directory(directory: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(LIVE_QA_DIRECTORY_MODE);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     if let Err(error) = builder.create(directory) {
         if error.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(error);

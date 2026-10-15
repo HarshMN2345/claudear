@@ -15,7 +15,6 @@ pub use lock::Lock;
 pub use protocol::{IpcCommand, IpcData, IpcResponse, WatcherState};
 pub use server::IpcServer;
 
-use claudear_core::platform;
 use std::path::{Path, PathBuf};
 
 /// Returns a private runtime directory for IPC files, scoped to the current user.
@@ -66,7 +65,7 @@ fn ipc_runtime_dir() -> PathBuf {
                 );
                 return std::env::temp_dir();
             }
-            if let Err(e) = platform::set_dir_permissions_secure(&dir) {
+            if let Err(e) = claudear_core::platform::set_dir_permissions_secure(&dir) {
                 tracing::warn!("Failed to set IPC runtime dir permissions: {}", e);
             }
         }
