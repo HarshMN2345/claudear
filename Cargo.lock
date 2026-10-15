@@ -44,6 +44,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "abnegate-learn"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97ab66e1f511f8856f536b19e6fff638a262acd9eb022c70687def033859e20d"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "abnegate-secret"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -962,6 +972,7 @@ version = "1.0.0"
 dependencies = [
  "abnegate-http",
  "abnegate-index",
+ "abnegate-learn",
  "abnegate-vcs",
  "async-trait",
  "base64 0.22.1",
@@ -1027,6 +1038,7 @@ name = "claudear-core"
 version = "1.0.0"
 dependencies = [
  "abnegate-http",
+ "abnegate-learn",
  "aes-gcm 0.10.3",
  "anyhow",
  "async-trait",
