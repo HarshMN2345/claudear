@@ -1035,6 +1035,7 @@ dependencies = [
  "claudear-core",
  "claudear-integrations",
  "claudear-storage",
+ "dirs 6.0.0",
  "futures",
  "hex",
  "http-body-util",

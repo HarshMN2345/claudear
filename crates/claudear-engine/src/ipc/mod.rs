@@ -20,28 +20,21 @@ use std::path::{Path, PathBuf};
 /// Returns a private runtime directory for IPC files, scoped to the current user.
 ///
 /// * **Linux** — prefers `XDG_RUNTIME_DIR` (already user-private, mode 0700).
-/// * **Windows** — uses `%LOCALAPPDATA%\claudear` or falls back to `%TEMP%\claudear`.
+/// * **Windows** — uses `claudear` in the per-user local application data folder.
 /// * **macOS / other** — creates `claudear-{uid}` under the system temp dir with
 ///   mode 0700.
 fn ipc_runtime_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        // Prefer %LOCALAPPDATA%\claudear (user-private on Windows)
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let dir = PathBuf::from(local_app_data).join("claudear");
-            if !dir.exists() {
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    tracing::error!(
-                        "Failed to create IPC runtime dir {:?}: {} — falling back to temp dir",
-                        dir,
-                        e
-                    );
-                    return windows_temp_dir();
-                }
-            }
-            return dir;
+        // No fallback to %TEMP%: it can be shared between accounts, and the port file there
+        // would hand the daemon secret to all of them.
+        let dir = dirs::data_local_dir()
+            .expect("Windows has a per-user local application data folder")
+            .join("claudear");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::error!("Failed to create IPC runtime dir {:?}: {}", dir, e);
         }
-        windows_temp_dir()
+        dir
     }
 
     #[cfg(not(windows))]
@@ -71,27 +64,6 @@ fn ipc_runtime_dir() -> PathBuf {
         }
         dir
     }
-}
-
-/// The Windows fallback runtime directory, created if it does not exist.
-///
-/// It has to exist before it is returned: every caller writes into it, and a
-/// first run on a machine where it is missing would otherwise fail with
-/// NotFound the moment the daemon writes its pid file.
-#[cfg(windows)]
-fn windows_temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("claudear");
-    if !dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::error!(
-                "Failed to create the fallback IPC runtime dir {:?}: {}",
-                dir,
-                e
-            );
-            return std::env::temp_dir();
-        }
-    }
-    dir
 }
 
 /// Default socket path for the IPC server (Unix) or port file path (Windows).
@@ -218,6 +190,17 @@ mod tests {
         assert!(!transport::secret_matches("", secret));
         assert!(!transport::secret_matches("0123456789abcdee", secret));
         assert!(!transport::secret_matches("0123456789abcdef0", secret));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_ipc_runtime_dir_is_in_the_per_user_local_application_data_folder() {
+        let local_application_data = dirs::data_local_dir().expect("local application data");
+        assert_eq!(
+            ipc_runtime_dir(),
+            local_application_data.join("claudear"),
+            "the port file and its secret must never land in a directory other accounts can read"
+        );
     }
 
     #[test]

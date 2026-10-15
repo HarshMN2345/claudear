@@ -22,8 +22,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 /// Default maximum number of activity entries to keep (can be overridden via config).
@@ -31,6 +31,13 @@ const DEFAULT_MAX_ACTIVITY_ENTRIES: usize = 10_000;
 
 /// Maximum number of concurrent IPC connections.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+/// How long a connection has to present the daemon secret before it is dropped, so peers
+/// that never authenticate cannot hold every connection permit.
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most a connection may send before the end of its secret line.
+const AUTHENTICATION_LIMIT: u64 = 256;
 
 const SHUTDOWN_INITIATED: &str = "Shutdown initiated";
 const SHUTDOWN_IN_PROGRESS: &str = "Shutdown already in progress";
@@ -345,6 +352,17 @@ impl IpcServer {
     }
 }
 
+/// Whether the first line on `reader`, sent within [`AUTHENTICATION_TIMEOUT`] and
+/// [`AUTHENTICATION_LIMIT`], is the `expected` secret.
+async fn authenticate<R: AsyncBufRead + Unpin>(reader: &mut R, expected: &str) -> bool {
+    let mut line = String::new();
+    let mut limited = reader.take(AUTHENTICATION_LIMIT);
+    match tokio::time::timeout(AUTHENTICATION_TIMEOUT, limited.read_line(&mut line)).await {
+        Ok(Ok(_)) => line.ends_with('\n') && transport::secret_matches(line.trim(), expected),
+        _ => false,
+    }
+}
+
 /// Handle a single IPC connection (platform-agnostic via [`IpcStream`]).
 async fn handle_connection(
     stream: IpcStream,
@@ -363,13 +381,10 @@ async fn handle_connection(
     // Windows), the first line must be the secret from the endpoint file, which
     // only this user can read. Unix sockets answer None and skip this.
     if let Some(expected) = transport::expected_secret() {
-        if reader.read_line(&mut line).await? == 0
-            || !transport::secret_matches(line.trim(), expected)
-        {
+        if !authenticate(&mut reader, expected).await {
             tracing::warn!("Rejected an IPC connection that did not present the daemon secret");
             return Ok(());
         }
-        line.clear();
     }
 
     while reader.read_line(&mut line).await? > 0 {
@@ -2813,5 +2828,54 @@ mod tests {
             "the server should answer on the socket it replaced"
         );
         abort(started.task).await;
+    }
+    const AUTHENTICATION_SECRET: &str = "0123456789abcdef";
+
+    #[tokio::test]
+    async fn test_authenticate_accepts_the_secret_and_leaves_the_command() {
+        let input = format!("{AUTHENTICATION_SECRET}\n{{}}\n");
+        let mut reader = BufReader::new(input.as_bytes());
+
+        assert!(authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+
+        let mut command = String::new();
+        reader.read_line(&mut command).await.unwrap();
+        assert_eq!(
+            command, "{}\n",
+            "the command after the secret must still be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_refuses_a_wrong_secret() {
+        let mut reader = BufReader::new("0123456789abcdee\n".as_bytes());
+
+        assert!(!authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_refuses_a_line_past_the_limit() {
+        let flood = "0".repeat(AUTHENTICATION_LIMIT as usize * 4);
+        let mut reader = flood.as_bytes();
+
+        assert!(!authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+        assert_eq!(
+            reader.len(),
+            flood.len() - AUTHENTICATION_LIMIT as usize,
+            "authentication must stop reading at the limit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_authenticate_gives_up_on_a_peer_that_sends_nothing() {
+        let (_peer, server) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(server);
+        let started = tokio::time::Instant::now();
+
+        assert!(!authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+        assert!(
+            started.elapsed() >= AUTHENTICATION_TIMEOUT,
+            "a silent peer must hold its connection permit until the timeout, and no longer"
+        );
     }
 }
