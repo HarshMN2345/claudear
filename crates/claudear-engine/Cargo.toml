@@ -94,5 +94,6 @@ libc = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]
+abnegate-http = { workspace = true }
 http-body-util = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
