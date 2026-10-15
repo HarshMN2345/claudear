@@ -30,6 +30,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 
 # HTTP
+abnegate-http = { workspace = true }
 reqwest = { workspace = true }
 
 # Logging
