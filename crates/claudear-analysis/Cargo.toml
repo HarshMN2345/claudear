@@ -10,9 +10,13 @@ workspace = true
 default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite"]
 cuda = ["ort/cuda"]
+test-support = []
 
 [dependencies]
+abnegate-http = { workspace = true }
 abnegate-index = { workspace = true }
+abnegate-learn = { workspace = true }
+abnegate-vcs = { workspace = true }
 claudear-core = { workspace = true }
 claudear-config = { workspace = true }
 claudear-storage = { workspace = true }
@@ -27,6 +31,9 @@ chrono = { workspace = true }
 # Async
 async-trait = { workspace = true }
 tokio = { workspace = true }
+
+# HTTP
+reqwest = { workspace = true }
 
 # Regex
 regex-lite = { workspace = true }

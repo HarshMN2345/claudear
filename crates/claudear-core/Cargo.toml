@@ -11,6 +11,8 @@ default = []
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+abnegate-learn = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -28,6 +30,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 
 # HTTP
+abnegate-http = { workspace = true }
 reqwest = { workspace = true }
 
 # Logging

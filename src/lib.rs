@@ -27,14 +27,12 @@
 
 // Re-exported from claudear-core
 pub use claudear_core::error;
-pub use claudear_core::http;
 pub use claudear_core::secret;
 pub use claudear_core::templates;
 pub use claudear_core::types;
 
 // Re-exported from claudear-config
 pub use claudear_config::config;
-pub use claudear_config::env_writer;
 pub use claudear_config::users;
 
 // Re-exported from claudear-storage
