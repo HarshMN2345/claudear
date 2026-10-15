@@ -89,6 +89,10 @@ indicatif = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# The per-user IPC runtime directory on Windows
+[target.'cfg(windows)'.dependencies]
+dirs = { workspace = true }
+
 [dev-dependencies]
 abnegate-http = { workspace = true }
 http-body-util = { workspace = true }

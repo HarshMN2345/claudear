@@ -1,26 +1,29 @@
-//! IPC server implementation using Unix sockets.
+//! IPC server implementation.
+//!
+//! Transport details (Unix sockets vs TCP) are abstracted by the
+//! [`super::transport`] module — this file is platform-agnostic.
 
 use super::protocol::{
     ActivityEntry, ActivityType, IpcCommand, IpcData, IpcResponse, WatcherState,
 };
+use super::transport::{self, IpcStream};
 use super::{
     default_pid_path, default_socket_path, is_accepting, read_pid_file, write_pid_file, Lock,
 };
 use crate::watcher::{RetryOutcome, Watcher, MANUAL_TRIGGER};
 use claudear_core::error::{Error, Result};
+use claudear_core::platform;
 use claudear_core::types::{ActivityLogEntry, FixAttemptStatus};
 use claudear_integrations::notifier::Notifier;
 use claudear_integrations::source::IssueSource;
 use claudear_storage::FixAttemptTracker;
 
 use std::collections::VecDeque;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 /// Default maximum number of activity entries to keep (can be overridden via config).
@@ -29,12 +32,19 @@ const DEFAULT_MAX_ACTIVITY_ENTRIES: usize = 10_000;
 /// Maximum number of concurrent IPC connections.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
+/// How long a connection has to present the daemon secret before it is dropped, so peers
+/// that never authenticate cannot hold every connection permit.
+const AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most a connection may send before the end of its secret line.
+const AUTHENTICATION_LIMIT: u64 = 256;
+
 const SHUTDOWN_INITIATED: &str = "Shutdown initiated";
 const SHUTDOWN_IN_PROGRESS: &str = "Shutdown already in progress";
 const NEW_RUNS_REFUSED: &str = "Daemon is shutting down; not starting new runs";
 const ALREADY_LISTENING: &str = "Another claudear daemon is already listening on";
 
-/// IPC server that listens on a Unix socket.
+/// IPC server that listens on a Unix socket (or TCP on Windows).
 pub struct IpcServer {
     socket_path: PathBuf,
     pid_path: PathBuf,
@@ -283,18 +293,13 @@ impl IpcServer {
             std::fs::remove_file(&self.socket_path)?;
         }
 
-        let listener = UnixListener::bind(&self.socket_path)?;
-        // Must drop before the listener: while it is open the socket's inode cannot be
-        // reused, so a socket another daemon binds at this path never passes for ours.
+        let listener = transport::bind(&self.socket_path)?;
+        // Must drop before the listener: while it is open the endpoint cannot be reused, so an
+        // endpoint another daemon binds at this path never passes for ours.
         let _files = OwnedFiles::claim(&self.socket_path, &self.pid_path)?;
         tracing::info!("IPC server listening on {:?}", self.socket_path);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&self.socket_path, permissions)?;
-        }
+        platform::set_file_permissions_secure(&self.socket_path)?;
 
         let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
@@ -347,9 +352,20 @@ impl IpcServer {
     }
 }
 
-/// Handle a single IPC connection.
+/// Whether the first line on `reader`, sent within [`AUTHENTICATION_TIMEOUT`] and
+/// [`AUTHENTICATION_LIMIT`], is the `expected` secret.
+async fn authenticate<R: AsyncBufRead + Unpin>(reader: &mut R, expected: &str) -> bool {
+    let mut line = String::new();
+    let mut limited = reader.take(AUTHENTICATION_LIMIT);
+    match tokio::time::timeout(AUTHENTICATION_TIMEOUT, limited.read_line(&mut line)).await {
+        Ok(Ok(_)) => line.ends_with('\n') && transport::secret_matches(line.trim(), expected),
+        _ => false,
+    }
+}
+
+/// Handle a single IPC connection (platform-agnostic via [`IpcStream`]).
 async fn handle_connection(
-    stream: UnixStream,
+    stream: IpcStream,
     tracker: Arc<dyn FixAttemptTracker>,
     sources: Vec<Arc<dyn IssueSource>>,
     notifier: Arc<dyn Notifier>,
@@ -360,6 +376,16 @@ async fn handle_connection(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+
+    // Where the transport cannot restrict who connects (a loopback TCP port on
+    // Windows), the first line must be the secret from the endpoint file, which
+    // only this user can read. Unix sockets answer None and skip this.
+    if let Some(expected) = transport::expected_secret() {
+        if !authenticate(&mut reader, expected).await {
+            tracing::warn!("Rejected an IPC connection that did not present the daemon secret");
+            return Ok(());
+        }
+    }
 
     while reader.read_line(&mut line).await? > 0 {
         let command: IpcCommand = match serde_json::from_str(line.trim()) {
@@ -569,7 +595,7 @@ async fn process_retries(
 /// started afterwards keeps its own.
 struct OwnedFiles {
     socket_path: PathBuf,
-    socket_inode: u64,
+    socket_identity: transport::Identity,
     pid_path: PathBuf,
 }
 
@@ -579,15 +605,11 @@ impl OwnedFiles {
     fn claim(socket_path: &Path, pid_path: &Path) -> std::io::Result<Self> {
         let files = Self {
             socket_path: socket_path.to_path_buf(),
-            socket_inode: Self::inode(socket_path)?,
+            socket_identity: transport::identity(socket_path)?,
             pid_path: pid_path.to_path_buf(),
         };
         write_pid_file(pid_path)?;
         Ok(files)
-    }
-
-    fn inode(path: &Path) -> std::io::Result<u64> {
-        Ok(std::fs::symlink_metadata(path)?.ino())
     }
 }
 
@@ -596,7 +618,7 @@ impl Drop for OwnedFiles {
         if read_pid_file(&self.pid_path) == Some(std::process::id()) {
             let _ = std::fs::remove_file(&self.pid_path);
         }
-        if Self::inode(&self.socket_path).ok() == Some(self.socket_inode) {
+        if transport::identity(&self.socket_path).ok().as_ref() == Some(&self.socket_identity) {
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
@@ -2724,7 +2746,7 @@ mod tests {
         let directory = short_temporary_directory();
         let started = start_in(directory.path()).await;
         std::fs::remove_file(&started.socket_path).unwrap();
-        let _replacement = UnixListener::bind(&started.socket_path).unwrap();
+        let _replacement = transport::bind(&started.socket_path).unwrap();
 
         abort(started.task).await;
 
@@ -2763,8 +2785,8 @@ mod tests {
         let directory = short_temporary_directory();
         let socket_path = directory.path().join("claudear.sock");
         let pid_path = directory.path().join("claudear.pid");
-        let _daemon = UnixListener::bind(&socket_path).unwrap();
-        let socket_inode = OwnedFiles::inode(&socket_path).unwrap();
+        let _daemon = transport::bind(&socket_path).unwrap();
+        let socket_identity = transport::identity(&socket_path).unwrap();
         let other_pid = std::process::id() + 1;
         std::fs::write(&pid_path, other_pid.to_string()).unwrap();
         let server = IpcServer::builder(mock_tracker(), mock_sources(), mock_notifier())
@@ -2783,8 +2805,8 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(
-            OwnedFiles::inode(&socket_path).ok(),
-            Some(socket_inode),
+            transport::identity(&socket_path).ok(),
+            Some(socket_identity),
             "the other daemon's socket must survive"
         );
         assert_eq!(
@@ -2797,7 +2819,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_replaces_a_socket_nobody_listens_on() {
         let directory = short_temporary_directory();
-        drop(UnixListener::bind(directory.path().join("claudear.sock")).unwrap());
+        drop(transport::bind(&directory.path().join("claudear.sock")).unwrap());
 
         let started = start_in(directory.path()).await;
 
@@ -2806,5 +2828,54 @@ mod tests {
             "the server should answer on the socket it replaced"
         );
         abort(started.task).await;
+    }
+    const AUTHENTICATION_SECRET: &str = "0123456789abcdef";
+
+    #[tokio::test]
+    async fn test_authenticate_accepts_the_secret_and_leaves_the_command() {
+        let input = format!("{AUTHENTICATION_SECRET}\n{{}}\n");
+        let mut reader = BufReader::new(input.as_bytes());
+
+        assert!(authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+
+        let mut command = String::new();
+        reader.read_line(&mut command).await.unwrap();
+        assert_eq!(
+            command, "{}\n",
+            "the command after the secret must still be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_refuses_a_wrong_secret() {
+        let mut reader = BufReader::new("0123456789abcdee\n".as_bytes());
+
+        assert!(!authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_refuses_a_line_past_the_limit() {
+        let flood = "0".repeat(AUTHENTICATION_LIMIT as usize * 4);
+        let mut reader = flood.as_bytes();
+
+        assert!(!authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+        assert_eq!(
+            reader.len(),
+            flood.len() - AUTHENTICATION_LIMIT as usize,
+            "authentication must stop reading at the limit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_authenticate_gives_up_on_a_peer_that_sends_nothing() {
+        let (_peer, server) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(server);
+        let started = tokio::time::Instant::now();
+
+        assert!(!authenticate(&mut reader, AUTHENTICATION_SECRET).await);
+        assert!(
+            started.elapsed() >= AUTHENTICATION_TIMEOUT,
+            "a silent peer must hold its connection permit until the timeout, and no longer"
+        );
     }
 }

@@ -2117,6 +2117,9 @@ fn daemonize() -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Install ring as the global TLS crypto provider (must happen before any HTTPS calls)
+    claudear::init_tls();
+
     // Resolve the user's login shell PATH so that user-local binaries
     // (e.g. claude via nvm/node) are discoverable when started via systemd.
     enrich_path_from_login_shell();
@@ -4832,8 +4835,11 @@ mod tests {
     use claudear::types::MatchResult;
     use futures::channel::mpsc::unbounded;
     use std::collections::HashMap;
+    #[cfg(unix)]
     use std::process::Stdio;
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+    #[cfg(unix)]
     use tokio::process::{Child, ChildStdout, Command};
     #[cfg(unix)]
     use tokio::signal::unix::{signal, SignalKind};
@@ -4844,20 +4850,27 @@ mod tests {
 
     /// An agent CLI that exits with [`INTERRUPTED_CLI_STATUS`] on SIGINT. Perl, because a shell
     /// cannot trap a signal it inherited as ignored, as a test runner a script backgrounds does.
+    #[cfg(unix)]
     const INTERRUPTIBLE_CLI: &str =
         r#"$| = 1; $SIG{INT} = sub { exit 7 }; print "ready\n"; sleep 1 while 1"#;
+    #[cfg(unix)]
     const INTERRUPTED_CLI_STATUS: i32 = 7;
 
     /// An agent CLI that reports SIGINT with [`CLI_INTERRUPTED`] and keeps running.
+    #[cfg(unix)]
     const STUBBORN_CLI: &str =
         r#"$| = 1; $SIG{INT} = sub { print "interrupted\n" }; print "ready\n"; sleep 1 while 1"#;
+    #[cfg(unix)]
     const CLI_READY: &str = "ready";
+    #[cfg(unix)]
     const CLI_INTERRUPTED: &str = "interrupted";
 
     /// How long an interrupted run takes to record how it ended.
+    #[cfg(unix)]
     const RECORDING_TIME: Duration = Duration::from_millis(200);
 
     /// Generous, because CI runs the tests under `cargo tarpaulin`'s ptrace.
+    #[cfg(unix)]
     const WRAP_UP_DEADLINE: Duration = Duration::from_secs(30);
 
     /// A source whose `get_issue` signals its arrival and then never returns.
@@ -4964,6 +4977,7 @@ mod tests {
 
     /// Spawn `script` as an agent CLI leading a process group registered in `registry`,
     /// returning once it is ready, with the rest of its output.
+    #[cfg(unix)]
     async fn spawn_cli<'r>(
         script: &str,
         registry: &'r process_group::Registry,
@@ -4985,6 +4999,7 @@ mod tests {
         (cli, guard, output)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn wrap_up_interrupts_agent_clis_and_waits_for_their_runs_to_end() {
         let tracker = in_memory_tracker();
@@ -5040,6 +5055,7 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn second_signal_during_the_wrap_up_forces_the_shutdown() {
         let watcher = idle_watcher();
@@ -5077,6 +5093,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn signals_interrupt_the_agent_clis_as_the_shutdown_begins() {
         for reason in [Reason::Terminated, Reason::Interrupted] {
@@ -5118,6 +5135,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn claudear_stop_lets_the_agent_clis_run_through_the_drain() {
         let watcher = idle_watcher();
@@ -5152,6 +5170,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_service_ending_lets_the_agent_clis_run_through_the_drain() {
         let watcher = idle_watcher();

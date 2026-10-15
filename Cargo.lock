@@ -437,9 +437,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.0"
+version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9a7b350e3bb1767102698302bc37256cbd48422809984b98d292c40e2579aa9"
+checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -447,14 +447,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.37.1"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b092fe214090261288111db7a2b2c2118e5a7f30dc2569f1732c4069a6840549"
+checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -922,6 +923,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rusqlite",
  "rust-embed",
+ "rustls",
  "rustls-acme",
  "semver",
  "sentry",
@@ -1052,6 +1054,7 @@ dependencies = [
  "regex-lite",
  "reqwest 0.13.2",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1075,6 +1078,7 @@ dependencies = [
  "chrono",
  "clap",
  "claudear",
+ "claudear-core",
  "regex-lite",
  "reqwest 0.13.2",
  "rusqlite",
@@ -1101,6 +1105,7 @@ dependencies = [
  "claudear-core",
  "claudear-integrations",
  "claudear-storage",
+ "dirs 6.0.0",
  "futures",
  "hex",
  "http-body-util",
@@ -4203,8 +4208,8 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
- "aws-lc-rs",
  "pem",
+ "ring",
  "rustls-pki-types",
  "time",
  "yasna",
@@ -4523,7 +4528,6 @@ dependencies = [
  "async-io",
  "async-trait",
  "async-web-client",
- "aws-lc-rs",
  "axum-server",
  "base64 0.22.1",
  "blocking",
@@ -4534,6 +4538,7 @@ dependencies = [
  "log",
  "pem",
  "rcgen",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4704,7 +4709,6 @@ dependencies = [
  "cfg_aliases",
  "httpdate",
  "reqwest 0.13.2",
- "rustls",
  "sentry-anyhow",
  "sentry-backtrace",
  "sentry-contexts",
@@ -4714,7 +4718,6 @@ dependencies = [
  "sentry-tower",
  "sentry-tracing",
  "tokio",
- "ureq 3.2.0",
 ]
 
 [[package]]

@@ -384,7 +384,7 @@ fn print_results(results: &[TestResult]) {
 /// Run the self-test against a running webhook server.
 pub async fn run(port: u16, config: &Config) -> anyhow::Result<()> {
     let base_url = format!("http://127.0.0.1:{}", port);
-    let client = Client::new();
+    let client = claudear_core::tls::client();
 
     tracing::info!("Waiting for webhook server to be healthy...");
     wait_for_healthy(&client, &base_url).await?;
