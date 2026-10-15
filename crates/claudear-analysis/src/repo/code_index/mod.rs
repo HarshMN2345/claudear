@@ -17,16 +17,15 @@ use crate::feedback::EmbeddingClient;
 use claudear_core::error::Result;
 use claudear_storage::FixAttemptTracker;
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use walkdir::WalkDir;
 
 /// Maximum file size to index (default: 1 MB).
-const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024;
+const DEFAULT_MAX_FILE_SIZE: u64 = abnegate_index::LARGEST_FILE;
 /// Default embedding batch size.
-const DEFAULT_BATCH_SIZE: usize = 32;
+const DEFAULT_BATCH_SIZE: usize = abnegate_index::EMBED_BATCH;
 
 /// Bump this when the indexing pipeline changes (parser, chunker, analyzer,
 /// embedding context format, etc.) to force a full re-index on the next run.
@@ -147,11 +146,7 @@ impl CodeIndexer {
             let file_results: Vec<FileProcessResult> = file_group
                 .par_iter()
                 .map(|(path, language)| {
-                    let rel_path = path
-                        .strip_prefix(rpo)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .to_string();
+                    let rel_path = abnegate_index::relative_to(rpo, path);
 
                     // Read file content.
                     let content = match std::fs::read_to_string(path) {
@@ -547,9 +542,7 @@ pub fn format_code_search_context(results: &[CodeSearchResult]) -> String {
 }
 
 fn sha256_hex(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hex::encode(hasher.finalize())
+    abnegate_index::file_hash(content)
 }
 
 #[cfg(test)]

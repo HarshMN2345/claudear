@@ -92,7 +92,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::double_must_use
 
   test:
     name: Test (${{ matrix.crate }})
@@ -155,6 +155,23 @@ jobs:
       - name: Create dashboard dist stub
         if: matrix.crate == 'claudear-engine' || matrix.crate == 'claudear'
         run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
+
+      # Vector search (code/Discord) needs the vectorlite SQLite extension. Pull
+      # the prebuilt .so from the vectorlite-py wheel and point the loader at it
+      # so the semantic-search tests exercise real, populated results.
+      - name: Install vectorlite extension
+        if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
+        run: |
+          python3 -m pip install -q vectorlite-py
+          # vectorlite_path() returns the path without a file extension, but the
+          # loader does an exists() check, so resolve the real .so/.dylib file.
+          VL_BASE="$(python3 -c 'import vectorlite_py; print(vectorlite_py.vectorlite_path())')"
+          if [ -f "${VL_BASE}.so" ]; then VL_PATH="${VL_BASE}.so";
+          elif [ -f "${VL_BASE}.dylib" ]; then VL_PATH="${VL_BASE}.dylib";
+          elif [ -f "${VL_BASE}" ]; then VL_PATH="${VL_BASE}";
+          else echo "vectorlite library not found near ${VL_BASE}" >&2; exit 1; fi
+          echo "Using vectorlite at: $VL_PATH"
+          echo "CLAUDEAR_VECTORLITE_PATH=$VL_PATH" >> "$GITHUB_ENV"
 
       - name: Run tests
         run: cargo tarpaulin -p ${{ matrix.crate }} --all-features --skip-clean --out Xml

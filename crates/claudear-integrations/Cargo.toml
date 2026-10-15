@@ -3,6 +3,9 @@ name = "claudear-integrations"
 version = "1.0.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite", "claudear-analysis/sqlite"]

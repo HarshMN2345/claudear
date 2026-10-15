@@ -17,6 +17,30 @@ pub struct UserRow {
     pub updated_at: String,
 }
 
+/// A personal access token row. The secret is never stored or serialized; only
+/// its hash (kept server-side) and a short display prefix.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiTokenRow {
+    pub id: String,
+    pub user_id: i64,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub token_hash: String,
+    pub token_prefix: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// An API token joined with its owner's email/name, for the admin usage view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiTokenWithOwner {
+    #[serde(flatten)]
+    pub token: ApiTokenRow,
+    pub user_email: String,
+    pub user_name: String,
+}
+
 /// An indexed repository stored in the database.
 #[derive(Debug, Clone, Serialize)]
 pub struct StoredIndexedRepo {

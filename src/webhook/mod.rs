@@ -3,6 +3,8 @@
 //! Handlers and types are provided by `claudear_integrations::webhook`.
 //! The webhook server (which orchestrates processing) lives here.
 
+mod cf_access;
+mod mcp;
 pub mod self_test;
 mod server;
 
