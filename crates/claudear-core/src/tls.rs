@@ -1,11 +1,12 @@
 //! The process-wide rustls crypto provider.
 //!
-//! axum-server and rustls-acme are built without a provider of their own, and
-//! reqwest uses whichever provider is installed when a client is built, so
-//! ring is installed once per process. Installing it from `main` covers the
-//! binary and nothing else — every unit test that builds a client runs in a
-//! process that never saw `main` — so the install lives here, next to the
-//! client factory that library code goes through.
+//! reqwest, axum-server and rustls-acme are built without a provider of their
+//! own. reqwest falls back to aws-lc only when another crate in the build turns
+//! on its default TLS, so a client built before a provider is installed can
+//! panic with "No provider set". Installing ring from `main` covers the binary
+//! and nothing else — every unit test that builds a client runs in a process
+//! that never saw `main` — so the install lives here, next to the client
+//! factory that library code goes through.
 
 use std::sync::Once;
 
@@ -23,8 +24,10 @@ pub fn ensure_crypto_provider() {
 
 /// Build a reqwest client, with the provider installed first.
 ///
-/// A client built with `reqwest::Client::new` before anything installed ring
-/// would fall back to reqwest's own provider instead.
+/// Clients claudear builds itself go through here or [`client_builder`];
+/// calling `reqwest::Client::new` directly, before ring is installed, can
+/// panic. abnegate-http's clients cannot, because that crate turns on
+/// reqwest's aws-lc fallback wherever it is built.
 pub fn client() -> reqwest::Client {
     ensure_crypto_provider();
     reqwest::Client::new()
