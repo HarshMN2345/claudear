@@ -25,8 +25,19 @@
 //! claudear webhook
 //! ```
 
+/// Install the ring crypto provider for all rustls consumers (reqwest,
+/// axum-server, rustls-acme).
+///
+/// Library code reaches the same installer through
+/// `claudear_core::tls::ensure_crypto_provider`; this is the entry point for
+/// the binary, which also serves TLS.
+pub fn init_tls() {
+    claudear_core::tls::ensure_crypto_provider();
+}
+
 // Re-exported from claudear-core
 pub use claudear_core::error;
+pub use claudear_core::platform;
 pub use claudear_core::secret;
 pub use claudear_core::templates;
 pub use claudear_core::types;
@@ -679,12 +690,15 @@ mod tests {
         assert_eq!(sources.len(), 2);
     }
 
+    #[cfg(unix)]
     /// Environment variable naming the directory agent runs log to.
     const LOG_DIRECTORY_VARIABLE: &str = "CLAUDEAR_LOG_DIR";
 
+    #[cfg(unix)]
     /// Held by every test that sets a process-wide environment variable.
     static ENVIRONMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[cfg(unix)]
     /// Sets an environment variable until dropped, then restores its previous
     /// value.
     struct EnvironmentVariableGuard {
@@ -692,6 +706,7 @@ mod tests {
         original: Option<std::ffi::OsString>,
     }
 
+    #[cfg(unix)]
     impl EnvironmentVariableGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let original = std::env::var_os(key);
@@ -700,6 +715,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvironmentVariableGuard {
         fn drop(&mut self) {
             match self.original.take() {

@@ -246,11 +246,11 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 async fn exchange_code_for_credentials(code: &str) -> Result<ManifestConversionResponse> {
     let url = format!("https://api.github.com/app-manifests/{}/conversions", code);
 
-    let client = reqwest::Client::builder()
+    let client = claudear_core::tls::client_builder()
         .timeout(std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
         .connect_timeout(std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| claudear_core::tls::client());
 
     let response = client
         .post(&url)
@@ -286,12 +286,7 @@ fn save_credentials(credentials: &ManifestConversionResponse, base_url: &str) ->
         ))
     })?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(pem_path, permissions).ok();
-    }
+    claudear_core::platform::set_file_permissions_secure(Path::new(pem_path)).ok();
 
     let updates = BTreeMap::from([
         (

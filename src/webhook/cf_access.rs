@@ -99,7 +99,7 @@ impl CfAccessVerifier {
             issuer: format!("https://{team_domain}"),
             audience: cfg.audience.trim().to_string(),
             team_domain,
-            http: reqwest::Client::builder()
+            http: claudear_core::tls::client_builder()
                 .timeout(FETCH_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
